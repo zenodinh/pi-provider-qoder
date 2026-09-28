@@ -1,0 +1,124 @@
+data: {"choices":[{"delta":{"reasoning_content":"Let","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":" me think","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":" carefully","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":" about this","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+
+
+data: {"choices":[{"delta":{"reasoning_con
+tent":" start writing","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":" feature code","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":"? The","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":" project is","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":" at","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":" seed stage","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":", and","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":" the AG","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":"ENTS.md","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":" already points","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":" to three","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":" folders","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":" (background","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":"/, requirements","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":"/, system","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":"-analysis","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":"/) with","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":" existing doc","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_
+content":" links","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":" (current","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":"-state-p","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":"i","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":"-pretty","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":"-tui","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":", pr","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":"d-p","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":"i-","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":"pretty-t","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+data: {"choices":[{"delta":{"reasoning_content":"ui,","role":"assistant"},"index":0}],"created":1790605739,"
+id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+
+data: 
+{"choices":[{"delta":{"reasoning_content":" at ~/.","role":"assistant"},"index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk"}
+
+
+
+data: {"choices":[{"delta":{"reasoning_content":" observable acceptance","role":"assistant"},"index":0}],"created":1790605773,"id":"20260928222933f35e826aae094429","model":"gmodel","object":"chat.completi
+on.chunk"}
+
+
+
+data: {"choices":[{"delta":{"reasoning_content":" reason about","role":"assistant"},"index":0}],"created":1790605773,"id":"20260928222933f35e826aae094429","model":"gmodel","object":"chat.completion.chunk"
+}
+
+data: {"choices":[{"delta":{"content":"","role":"assistant"},"finish_reason":"tool_calls","index":0}],"created":1790605739,"id":"2026092822285941106a767a044312","model":"gmodel","object":"chat.completion.chunk","raw_usage":{"account_discount":0,"data":{"completion_tokens":2074,"completion_tokens_details":{"reasoning_tokens":1530},"prompt_tokens"
+:17476,"prompt_tokens_details":{"cached_tokens":0},"total_tokens":19550},"model":"oem-glm-5","model_account":"","model_context":{"client_type":"","data_policy_preferred_count":0,"from_model":"oem-glm-5","has_data":true,"image_count":0,"intention":"","router_strategy_name":"","router_strategy_type":"","scheduler_times":1,"target_id":"glm-oem-glm-5","task_mode":"","time_of_scheduler":2,"use_bailian_safe_mode":false
+,"use_data_mask":false,"workspace_code_language":[],"workspace_file_count":0},"model_level":"none","provider_model":"glm-5","supply_account":"","supply_model":"glm-5","supply_region":"global","target":"glm-oem-glm-5","task_mode":"unknown","ttft":1883},"sub_usages":[],"usage":{"completion_tokens":2074,"completion_tokens_details":{"reasoning_tokens":1530},"prompt_tokens":17476,"prompt_tokens_details":{"cached_tokens":0},"total_tokens":19550}}
+
+data: [DONE]
+

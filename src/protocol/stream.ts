@@ -61,7 +61,7 @@ type QoderStreamEvent = Parameters<AssistantMessageEventStream["push"]>[0];
 type QoderDeltaEvent = Extract<QoderStreamEvent, { type: "text_delta" | "thinking_delta" | "toolcall_delta" }>;
 
 const QODER_STREAM_IDLE_TIMEOUT_MS = 120_000;
-const MAX_SSE_BUFFER_LENGTH = 8 * 1024 * 1024;
+export const MAX_SSE_BUFFER_LENGTH = 8 * 1024 * 1024;
 
 function mapFinishReason(reason: string): "stop" | "length" | "toolUse" {
   switch (reason) {

@@ -16,6 +16,7 @@ import type { QoderModelEntry } from "../catalog.js";
 import { debugLog } from "../debug.js";
 import type { QoderMode } from "../region.js";
 import { markLegacyOnly } from "./routing.js";
+import { createReframedFetch } from "./sse-reframe.js";
 import { streamQoder } from "./stream.js";
 
 interface V2Route {
@@ -194,7 +195,13 @@ export function streamQoderV2(
     return body;
   };
 
-  const inner = openAICompletionsApi().streamSimple(v2Model, context, { ...options, onPayload: wrappedOnPayload });
+  // The gateway intermittently splits event JSON across lines (recorded
+  // 2026-09-28); repair the framing before the SDK's strict SSE parser sees it.
+  const inner = openAICompletionsApi().streamSimple(v2Model, context, {
+    ...options,
+    fetch: createReframedFetch(options?.fetch ?? globalThis.fetch),
+    onPayload: wrappedOnPayload,
+  });
 
   const fallbackEnabled = envValue(options, "QODER_FALLBACK") === "1";
   if (!fallbackEnabled) return inner;

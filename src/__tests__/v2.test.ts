@@ -1,7 +1,9 @@
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   type Api,
+  type AssistantMessage,
   type AssistantMessageEvent,
   type Model,
   normalizeContext,
@@ -193,6 +195,77 @@ describe("v2 field injector", () => {
     expect(terminal?.type).toBe("error");
     expect(String((terminal as { error?: { errorMessage?: string } }).error?.errorMessage)).toContain("protocol=v2");
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("fragmented SSE repair", () => {
+  // recorded-from: api2-v2.qoder.sh GLM-5.3 turn, 2026-09-28, session 01a0e86b;
+  // trimmed from raw wire captures 1790605741332-1.sse (35/1117 events malformed)
+  // and 1790605774370-2.sse (11/340). Malformed events keep their exact bytes:
+  // 36/33/102-char mid-JSON splits, a zero-length first fragment, 198-char splits.
+  // The terminal pair (finish_reason tool_calls + usage) is the recorded one —
+  // the captured turns were an agentic tool loop, so the contract they pin is
+  // pi-ai's "toolUse" mapping, not "stop".
+  const fixture = readFileSync(fileURLToPath(new URL("../__fixtures__/v2-fragmented.sse", import.meta.url)), "utf8");
+  // Concatenation of every delta's reasoning text in the fixture, via the
+  // repaired form — the answer text a consumer must observe after the turn.
+  const EXPECTED_TEXT =
+    "Let me think carefully about this start writing feature code? The project is at seed stage, and the AGENTS.md already points to three folders (background/, requirements/, system-analysis/) with existing doc links (current-state-pi-pretty-tui, prd-pi-pretty-tui, at ~/. observable acceptance reason about";
+
+  function sseResponse(body: string, chunkSize?: number): Response {
+    const headers = { "content-type": "text/event-stream" };
+    if (!chunkSize) return new Response(body, { headers });
+    const encoder = new TextEncoder();
+    const chunks: Uint8Array[] = [];
+    for (let i = 0; i < body.length; i += chunkSize) chunks.push(encoder.encode(body.slice(i, i + chunkSize)));
+    return new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const chunk of chunks) controller.enqueue(chunk);
+          controller.close();
+        },
+      }),
+      { headers },
+    );
+  }
+
+  function answerText(result: AssistantMessage): string {
+    return result.content
+      .map((block) => (block.type === "thinking" ? block.thinking : block.type === "text" ? block.text : ""))
+      .join("");
+  }
+
+  it("repairs a recorded fragmented stream and completes the turn", async () => {
+    seedCatalogWithTiers();
+    const fetch = vi.fn(async () => sseResponse(fixture)) as unknown as typeof globalThis.fetch;
+    const result = await streamQoderRouter(modelNamed("Ultimate"), context, { apiKey: "fake", fetch }).result();
+    expect(result.stopReason).toBe("toolUse");
+    expect(answerText(result)).toBe(EXPECTED_TEXT);
+  });
+
+  it("repairs the same stream when delivered in 7-byte chunks", async () => {
+    seedCatalogWithTiers();
+    const fetch = vi.fn(async () => sseResponse(fixture, 7)) as unknown as typeof globalThis.fetch;
+    const result = await streamQoderRouter(modelNamed("Ultimate"), context, { apiKey: "fake", fetch }).result();
+    expect(result.stopReason).toBe("toolUse");
+    expect(answerText(result)).toBe(EXPECTED_TEXT);
+  });
+
+  it("passes non-event-stream responses through untouched", async () => {
+    seedCatalogWithTiers();
+    const fetch = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ error: { type: "invalid_model_error", message: "model not supported" } }), {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        }),
+    ) as unknown as typeof globalThis.fetch;
+    const events: AssistantMessageEvent[] = [];
+    const stream = streamQoderRouter(modelNamed("Ultimate"), context, { apiKey: "fake", fetch });
+    for await (const event of stream) events.push(event);
+    const terminal = events.at(-1) as { type: string; error?: { errorMessage?: string } };
+    expect(terminal.type).toBe("error");
+    expect(String(terminal.error?.errorMessage)).toContain("invalid_model_error");
   });
 });
 
