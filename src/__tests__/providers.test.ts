@@ -60,7 +60,8 @@ describe("provider region binding", () => {
         new Response(
           JSON.stringify({
             userQuota: { total: 100, used: 1, remaining: 99, percentage: 1, unit: "requests" },
-            orgResourcePackage: { total: 0, used: 0, remaining: 0, percentage: 0, unit: "requests" },
+            // live shape reports `cap`, not `total` (recorded 2026-09-28).
+            orgResourcePackage: { used: 0, remaining: 0, percentage: 0, unit: "requests", cap: 0 },
             totalUsagePercentage: 1,
             isQuotaExceeded: false,
             expiresAt: Date.now() + 3600_000,

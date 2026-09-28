@@ -1,3 +1,5 @@
+// shape: fixed-shape record for the region table (trigger #7, fields known
+//   statically) plus straight-line URL builders (none — no discriminator).
 export type QoderMode = "global" | "cn";
 
 export interface QoderRegionConfig {
@@ -7,6 +9,8 @@ export interface QoderRegionConfig {
   openApiUrl: string;
   centerUrl: string;
   manageUrl: string;
+  /** Account usage page — the "View details" target of `/qoder-quota`. */
+  usageUrl: string;
   patManageUrl: string;
   deviceLoginUrl?: string;
   modelCacheFile: string;
@@ -26,6 +30,7 @@ const QODER_REGIONS: Record<QoderMode, QoderRegionConfig> = {
     openApiUrl: "https://openapi.qoder.sh",
     centerUrl: "https://center.qoder.sh",
     manageUrl: "https://qoder.com",
+    usageUrl: "https://qoder.com/account/usage",
     patManageUrl: "https://qoder.com/account/integrations",
     deviceLoginUrl: "https://qoder.com/device/selectAccounts",
     modelCacheFile: "qoder-models-cache.json",
@@ -43,6 +48,7 @@ const QODER_REGIONS: Record<QoderMode, QoderRegionConfig> = {
     openApiUrl: "https://openapi.qoder.com.cn",
     centerUrl: "https://gateway.qoder.com.cn",
     manageUrl: "https://qoder.com.cn",
+    usageUrl: "https://qoder.com.cn/account/usage",
     patManageUrl: "https://qoder.com.cn/account/integrations",
     modelCacheFile: "qoder-cn-models-cache.json",
     patEnvNames: ["QODERCN_API_KEY", "QODERCN_PERSONAL_ACCESS_TOKEN", "QODERCN_PAT"],
@@ -86,6 +92,13 @@ export function getQoderUserInfoURL(mode: QoderMode): string {
 
 export function getQoderUsageURL(mode: QoderMode): string {
   return `${getQoderRegionConfig(mode).openApiUrl}/api/v2/quota/usage`;
+}
+
+/** "View details" link: the account usage page, tagged the way the desktop app tags it. */
+export function getQoderUsagePageURL(mode: QoderMode): string {
+  const url = new URL(getQoderRegionConfig(mode).usageUrl);
+  url.searchParams.set("client", "qoder");
+  return url.toString();
 }
 
 export function getQoderRefreshURL(mode: QoderMode): string {

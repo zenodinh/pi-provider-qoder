@@ -33,7 +33,7 @@ pi --provider qoder-cn --model Qwen3.7-Plus
 - **Effort-aware thinking** — pi's thinking levels are mapped onto each model's `enable_thinking` / `reasoning_effort` support.
 - **Agentic tool use** — native tool calls, plus DSML markup embedded in the text stream, parsed into clean `toolCall` blocks.
 - **Robust streaming** — handles Qoder's double-`[DONE]` SSE envelope, hidden `<thinking>` markup, idle timeouts, and orphaned/compacted tool history.
-- **Usage reporting** — `/qoder-quota` shows remaining Credits (user quota + org resource package) on demand, with a 60 s cache.
+- **Usage reporting** — `/qoder-quota` opens an interactive panel (plan + add-on credits, remaining amounts, renewal date, usage-page link) in the TUI, and prints the same report everywhere else — on demand, with a 60 s cache.
 - **WAF bypass / COSY signatures** — every request is signed with the same RSA/AES machine-bound headers Qoder expects.
 
 ## Providers
@@ -129,13 +129,14 @@ Chat POST requests are not automatically retried, even when `maxRetries` is supp
 
 ## Usage reporting
 
-Run `/qoder-quota` inside pi — on demand, never on the turn path. It fetches the subscription quota and renders:
+Run `/qoder-quota` inside pi — on demand, never on the turn path. In the TUI it opens a compact panel (`esc`/`q` closes, `r` refreshes); every other mode prints the same report as a notification. It fetches the subscription quota and renders, in the Qoder desktop app's wording:
 
-- **User Quota** — used / total / remaining in Qoder Credits and the reset time.
-- **Org Resource Package** — the same shape, shown when present.
-- An exceeded state plus a link to the account page when the quota is exhausted.
+- **Plan Credits** — used / total, used %, remaining, and the renewal date.
+- **Shared Add-on Credits** — the organization package (`cap`-shaped, with the legacy `total` fallback); shown as `Unavailable` when the org has suspended distribution.
+- **Add-on Credits** / **Dedicated Credits** — rendered when the account's payload carries them.
+- **View details** — a link to the account usage page (plus the payload's upgrade link when the quota is exhausted).
 
-Repeat runs within 60 seconds are served from a cache; concurrent runs share a single request. Failures print a reason ("quota unavailable") instead of numbers.
+Repeat runs within 60 seconds are served from a cache; concurrent runs share a single request; `r` in the panel forces a refresh. Failures print a reason ("quota unavailable") instead of numbers.
 
 ## Development
 
