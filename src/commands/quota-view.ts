@@ -79,7 +79,7 @@ function createPanel(deps: PanelDeps) {
     return theme.fg("accent", "█".repeat(filled)) + theme.fg("dim", "░".repeat(BAR_CELLS - filled));
   };
 
-  const renderBucketRow = (bucket: QoderUsageBucket, theme: Theme): string => {
+  const renderBucketRow = (bucket: QoderUsageBucket, innerWidth: number, theme: Theme): string => {
     if (bucket.available === false) {
       return `${padTo(bucket.label, LABEL_COLUMN)}${" ".repeat(COLUMN_GAP)}${theme.fg("muted", "Unavailable")}`;
     }
@@ -87,15 +87,26 @@ function createPanel(deps: PanelDeps) {
       bucket.limitDisplay !== undefined ? `${bucket.usedDisplay} / ${bucket.limitDisplay}` : bucket.usedDisplay;
     const percent = bucket.usedPercentDisplay !== undefined ? `(used ${bucket.usedPercentDisplay})` : "";
     const remaining = bucket.remainingDisplay !== undefined ? `Remaining ${bucket.remainingDisplay}` : "";
-    return [
-      padTo(bucket.label, LABEL_COLUMN),
-      padTo(amount, AMOUNT_COLUMN),
-      renderBar(bucket.usedFraction, theme),
-      padTo(percent, PERCENT_COLUMN),
-      remaining,
-    ]
-      .filter((part) => part.length > 0)
-      .join(" ".repeat(COLUMN_GAP));
+    const join = (parts: string[]) => parts.filter((part) => part.length > 0).join(" ".repeat(COLUMN_GAP));
+    const bar = renderBar(bucket.usedFraction, theme);
+    // Rows degrade in priority order when the host renders narrower than the full
+    // panel: the remaining figure is the reason this view exists, so the
+    // decorative columns yield before it ever gets clipped.
+    const candidates = [
+      join([
+        padTo(bucket.label, LABEL_COLUMN),
+        padTo(amount, AMOUNT_COLUMN),
+        bar,
+        padTo(percent, PERCENT_COLUMN),
+        remaining,
+      ]),
+      join([padTo(bucket.label, LABEL_COLUMN), padTo(amount, AMOUNT_COLUMN), bar, remaining]),
+      join([padTo(bucket.label, LABEL_COLUMN), padTo(amount, AMOUNT_COLUMN), remaining]),
+    ];
+    for (const row of candidates) {
+      if (visibleWidth(row) <= innerWidth) return row;
+    }
+    return candidates[candidates.length - 1] ?? "";
   };
 
   const renderHeader = (left: string, right: string, theme: Theme, innerWidth: number): string => {
@@ -124,7 +135,7 @@ function createPanel(deps: PanelDeps) {
       content.push(renderHeader(left, right, theme, innerWidth));
       if (usage.exceeded)
         content.push(theme.fg("warning", "Quota exceeded: new requests are blocked until the reset date"));
-      for (const bucket of usage.usageBuckets ?? []) content.push(renderBucketRow(bucket, theme));
+      for (const bucket of usage.usageBuckets ?? []) content.push(renderBucketRow(bucket, innerWidth, theme));
       if (usage.usageUrl !== undefined) {
         content.push(
           `${theme.fg("muted", "View details: ")}${hyperlink(stripProtocol(usage.usageUrl), usage.usageUrl)}`,
@@ -169,7 +180,8 @@ export async function showQuotaPanel(ctx: ExtensionCommandContext, input: QuotaP
   await ctx.ui.custom<void>(
     (tui, theme, _keybindings, done) =>
       createPanel({ tui, theme, sections: input.sections, refresh: input.refresh, done }),
-    // Default overlay options centre the panel and size it to the component's lines.
-    { overlay: true },
+    // Centre the panel; `width` asks the host for the full-size layout, and
+    // renderBucketRow degrades gracefully when the terminal is narrower.
+    { overlay: true, overlayOptions: { width: PANEL_WIDTH, minWidth: MIN_PANEL_WIDTH } },
   );
 }

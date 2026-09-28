@@ -200,6 +200,27 @@ describe("qoder-quota command (F4)", () => {
     expect(text).toContain("Remaining 750");
   });
 
+  it("fits the rows when the host renders the panel narrower", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => payloadResponse(TEAM_PAYLOAD)),
+    );
+    let capture: PanelCapture | undefined;
+    const { ctx } = buildCtx({
+      token: "fake-token",
+      mode: "tui",
+      onPanel: (c) => {
+        capture = c;
+      },
+    });
+    await handleQuotaCommand("", ctx);
+    const text = requireCapture(capture).panel.render(80).join("\n");
+    expect(text).toContain("Remaining 15,823");
+    expect(text).toContain("(used 100%)");
+    expect(text).not.toContain("(used 32%)");
+    expect(text).not.toContain("...");
+  });
+
   it("marks a suspended org package instead of inventing numbers", async () => {
     vi.stubGlobal(
       "fetch",
