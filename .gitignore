@@ -4,3 +4,11 @@ dist/
 .DS_Store
 .pi/
 .qoder/
+
+# Local debug captures (raw SSE/wire dumps, request dumps, probe logs) must never
+# be committed — curated test fixtures under src/__fixtures__ stay trackable.
+*.sse
+!src/__fixtures__/*.sse
+raw-requests/
+request-dump/
+reasoning-strip/
