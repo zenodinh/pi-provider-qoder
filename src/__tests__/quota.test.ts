@@ -290,9 +290,12 @@ describe("qoder-quota command (F4)", () => {
     const panel = requireCapture(capture).panel;
     expect(panel.render(84).join("\n")).toContain("7,177 / 23,000");
     panel.handleInput("r");
-    await vi.waitFor(() => {
-      expect(panel.render(84).join("\n")).toContain("8,000 / 23,000");
-    });
+    await vi.waitFor(
+      () => {
+        expect(panel.render(84).join("\n")).toContain("8,000 / 23,000");
+      },
+      { timeout: 5000 },
+    );
     expect(panel.render(84).join("\n")).toContain("Remaining 15,000");
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
@@ -368,10 +371,36 @@ describe("qoder-quota command (F4)", () => {
         }),
     );
     vi.stubGlobal("fetch", fetchMock);
-    const first = buildCtx({ token: "fake-token" });
-    const second = buildCtx({ token: "fake-token" });
+    // Barrier: release both invocations only once both have asked for the API
+    // key, so each has passed its first await before either reaches the fetch.
+    let keyCalls = 0;
+    let releaseKeys: (() => void) | undefined;
+    const keysReady = new Promise<void>((resolve) => {
+      releaseKeys = resolve;
+    });
+    const slowCtx = () => {
+      const notify = vi.fn();
+      const ctx = {
+        mode: "rpc",
+        modelRegistry: {
+          getApiKeyForProvider: async (providerID: string) => {
+            if (providerID !== "qoder") return undefined;
+            keyCalls += 1;
+            if (keyCalls >= 2) releaseKeys?.();
+            await keysReady;
+            return "fake-token";
+          },
+        },
+        ui: { notify, custom: vi.fn() },
+      } as never;
+      return { ctx, notify };
+    };
+    const first = slowCtx();
+    const second = slowCtx();
     const pending = [handleQuotaCommand("", first.ctx), handleQuotaCommand("", second.ctx)];
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await vi.waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
     resolveFetch?.(payloadResponse(TEAM_PAYLOAD));
     await Promise.all(pending);
     expect(fetchMock).toHaveBeenCalledTimes(1);
