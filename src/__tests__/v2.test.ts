@@ -213,7 +213,7 @@ describe("fragmented SSE repair", () => {
   // Concatenation of every delta's reasoning text in the fixture, via the
   // repaired form — the answer text a consumer must observe after the turn.
   const EXPECTED_TEXT =
-    "Let me think carefully about this start writing feature code? The project is at seed stage, and the AGENTS.md already points to three folders (background/, requirements/, system-analysis/) with existing doc links (current-state-pi-pretty-tui, prd-pi-pretty-tui, at ~/. observable acceptance reason about \"";
+    'Let me think carefully about this start writing feature code? The project is at seed stage, and the AGENTS.md already points to three folders (background/, requirements/, system-analysis/) with existing doc links (current-state-pi-pretty-tui, prd-pi-pretty-tui, at ~/. observable acceptance reason about "';
 
   function sseResponse(body: string, chunkSize?: number): Response {
     const headers = { "content-type": "text/event-stream" };
