@@ -36,7 +36,7 @@ function isThinkingRequested(reasoning: unknown): boolean {
 }
 
 const SSE_LINES_PER_YIELD = 32;
-const MAX_PROMPT_CACHE_KEY_LENGTH = 64;
+export const MAX_PROMPT_CACHE_KEY_LENGTH = 64;
 
 /**
  * Minimum wall-clock interval between coalesced delta pushes. Hosts (pi) rebuild

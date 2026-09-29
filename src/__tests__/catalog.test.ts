@@ -57,6 +57,12 @@ describe("staticModels", () => {
     expect(staticModels.find((m) => m.upstreamKey === "kmodel")?.contextWindow).toBe(256000);
   });
 
+  it("declares the prompt-cache lifetime so pi can warm it", () => {
+    for (const m of [...staticModels, ...staticCnModels]) {
+      expect(m.promptCache).toEqual({ short: 300 });
+    }
+  });
+
   it("maps friendly ids to static upstream keys without raw-key aliases", () => {
     expect(getCachedModelConfig("Lite", "global")?.key).toBe("lite");
     expect(getCachedModelConfig("Qwen3.8-Max", "global")?.key).toBe("qmodel_preview");

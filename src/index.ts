@@ -9,7 +9,14 @@ import {
   refreshQoderTokenForMode,
 } from "./auth/oauth.js";
 import { fetchQoderUsageForMode } from "./auth/usage.js";
-import { getCachedModels, isCacheStale, staticCnModels, staticModels, updateQoderModelsCache } from "./catalog.js";
+import {
+  getCachedModels,
+  isCacheStale,
+  MODEL_PROMPT_CACHE,
+  staticCnModels,
+  staticModels,
+  updateQoderModelsCache,
+} from "./catalog.js";
 import { handleQuotaCommand } from "./commands/quota.js";
 import { debugLog } from "./debug.js";
 import { getPiAgentDir } from "./home.js";
@@ -50,6 +57,9 @@ function modelsForProvider(mode: QoderMode, providerID: string): QoderProviderMo
     ...m,
     provider: providerID,
     baseUrl: getQoderBaseUrl(mode),
+    // A catalog parsed from disk may predate the declared lifetime; without it
+    // pi treats the cache as unknown and never warms.
+    promptCache: m.promptCache ?? MODEL_PROMPT_CACHE,
   }));
 }
 
@@ -186,6 +196,23 @@ export default async function (pi: ExtensionAPI) {
         }
       }),
     );
+  });
+
+  // Cache warming is inert for these models by default: pi prices them at $0
+  // (Qoder bills in Credits, which pi's monetary cost cannot express), so the
+  // "$0.05 expected savings" floor can never be cleared and pi stops every
+  // refresh before sending it. QODER_CACHE_WARM=1 approves the refresh anyway;
+  // each one costs a cache read plus one output token, ~50x cheaper than the
+  // idle re-bill it prevents. Warming still requires the model's declared
+  // promptCache tier (catalog.ts) and pi's `cacheWarming: "idle"` setting, and
+  // the override is scoped to this extension's two providers so it never
+  // spends another provider's tokens.
+  // shape: none — dispatch object does not apply: one env gate over pi's own decision.
+  pi.on("cache_warming_decision", (event, ctx) => {
+    if (process.env.QODER_CACHE_WARM !== "1") return undefined;
+    const provider = ctx.model?.provider;
+    if (provider !== "qoder" && provider !== "qoder-cn") return undefined;
+    return event.action === "stop" ? { action: "warm" } : undefined;
   });
 
   pi.registerCommand("qoder-quota", {

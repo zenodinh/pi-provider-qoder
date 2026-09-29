@@ -62,11 +62,11 @@ const v2Success = [
 ].join("\n\n");
 
 function v2FetchCapture() {
-  const calls: { url: unknown; body?: Record<string, unknown> }[] = [];
+  const calls: { url: unknown; body?: Record<string, unknown>; headers?: HeadersInit }[] = [];
   const fetch = vi.fn(async (input: unknown, init?: RequestInit) => {
     const url = String(input);
     if (url.includes("chat/completions")) {
-      calls.push({ url: input, body: JSON.parse(String(init?.body)) });
+      calls.push({ url: input, body: JSON.parse(String(init?.body)), headers: init?.headers });
       return new Response(v2Success, { headers: { "content-type": "text/event-stream" } });
     }
     calls.push({ url: input });
@@ -152,6 +152,43 @@ describe("v2 field injector", () => {
       cacheRetention: "none",
     } as SimpleStreamOptions).result();
     expect(bodyOf(calls).skipCacheWrite).toBe(true);
+  });
+
+  it("sends the session-derived prompt_cache_key and affinity headers", async () => {
+    const { calls, fetch } = v2FetchCapture();
+    await streamQoderRouter(modelNamed("Ultimate"), context, {
+      apiKey: "fake",
+      fetch,
+      sessionId: "session-1",
+    }).result();
+    expect(bodyOf(calls).prompt_cache_key).toBe("session-1");
+    const headers = new Headers(calls[0]?.headers);
+    expect(headers.get("session_id")).toBe("session-1");
+    expect(headers.get("x-client-request-id")).toBe("session-1");
+    expect(headers.get("x-session-affinity")).toBe("session-1");
+  });
+
+  it("bounds prompt_cache_key to the upstream 64-character limit", async () => {
+    const { calls, fetch } = v2FetchCapture();
+    await streamQoderRouter(modelNamed("Ultimate"), context, {
+      apiKey: "fake",
+      fetch,
+      sessionId: `session-${"x".repeat(80)}`,
+    }).result();
+    const key = String(bodyOf(calls).prompt_cache_key);
+    expect(key).toHaveLength(64);
+    expect(key.startsWith("session-")).toBe(true);
+  });
+
+  it("omits prompt_cache_key when cacheRetention is none", async () => {
+    const { calls, fetch } = v2FetchCapture();
+    await streamQoderRouter(modelNamed("Ultimate"), context, {
+      apiKey: "fake",
+      fetch,
+      sessionId: "session-1",
+      cacheRetention: "none",
+    } as SimpleStreamOptions).result();
+    expect("prompt_cache_key" in bodyOf(calls)).toBe(false);
   });
 
   it("chains the caller onPayload after injecting, honoring its replacement", async () => {

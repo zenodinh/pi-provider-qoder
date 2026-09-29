@@ -17,7 +17,7 @@ import { debugLog } from "../debug.js";
 import type { QoderMode } from "../region.js";
 import { markLegacyOnly } from "./routing.js";
 import { createReframedFetch } from "./sse-reframe.js";
-import { streamQoder } from "./stream.js";
+import { MAX_PROMPT_CACHE_KEY_LENGTH, streamQoder } from "./stream.js";
 
 interface V2Route {
   mode: QoderMode;
@@ -60,6 +60,13 @@ function osType(): string {
   return "linux";
 }
 
+// shape: none — dispatch object does not apply: a single length guard on one value.
+// Truncation (not hashing) mirrors pi-ai's clampOpenAIPromptCacheKey; this is
+// the same 64-character prompt_cache_key bound the legacy path enforces in stream.ts.
+function clampPromptCacheKey(id: string): string {
+  return id.length <= MAX_PROMPT_CACHE_KEY_LENGTH ? id : id.slice(0, MAX_PROMPT_CACHE_KEY_LENGTH);
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -88,11 +95,12 @@ function injectQoderFields(
 ): void {
   // metadata.context — required envelope; session_id keys prompt caching.
   const metadata = isRecord(body.metadata) ? body.metadata : {};
+  const sessionId = options?.sessionId ?? processFallbackSessionId;
   body.metadata = {
     ...metadata,
     context: {
       request_id: crypto.randomUUID(),
-      session_id: options?.sessionId ?? processFallbackSessionId,
+      session_id: sessionId,
       os_type: osType(),
       task_id: "common",
       client_type: "5",
@@ -105,7 +113,13 @@ function injectQoderFields(
   if (tier !== undefined) body.context_length = tier;
   body.preserve_thinking = true;
   body.parallel_tool_calls = true;
+  // pi-ai sends prompt_cache_key only for api.openai.com or long retention
+  // (openai-completions buildParams), so the OpenAI-convention affinity key is
+  // absent from v2 requests unless added here. qodercli sets the same field
+  // from its session id in its OpenAI-protocol requests, and the server already
+  // receives this exact identity as metadata.context.session_id.
   if (options?.cacheRetention === "none") body.skipCacheWrite = true;
+  else body.prompt_cache_key = clampPromptCacheKey(sessionId);
 }
 
 function resolveReasoningLevel(model: Model<Api>, options?: SimpleStreamOptions): string | undefined {
@@ -181,6 +195,11 @@ export function streamQoderV2(
       ...(model.compat as Record<string, unknown> | undefined),
       thinkingTokenBudgetField: "reasoning_budget_tokens",
       supportsLongCacheRetention: false,
+      // Replica affinity for prompt-cache routing: pi-ai then sends
+      // session_id / x-client-request-id / x-session-affinity from sessionId,
+      // matching the OpenAI-protocol convention qodercli follows.
+      sendSessionAffinityHeaders: true,
+      sessionAffinityFormat: "openai",
     } as Model<Api>["compat"],
   };
 

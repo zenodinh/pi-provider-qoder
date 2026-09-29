@@ -111,6 +111,7 @@ The streamed response is normalized into pi thinking blocks regardless of how th
 | `QODER_FALLBACK` | Set to `1` to retry a turn once on the legacy transport when the v2 model-server rejects a model key (stale routing); the correction is cached for the session. Off by default. |
 | `QODER_PROTOCOL` | Force `v2` or `legacy` for every request, overriding the routing table. |
 | `QODER_MODEL_SERVER_HOST` | Override the v2 model-server base URL (for example to reach a v2 host from the China region). |
+| `QODER_CACHE_WARM` | Set to `1` to approve pi's cache-warming refreshes (requires pi's `cacheWarming` setting; refreshes spend Credits). |
 
 ## How it works (protocol notes)
 
@@ -118,7 +119,8 @@ The streamed response is normalized into pi thinking blocks regardless of how th
 - **SSE gateway.** Chat streams from the Qoder `/algo/.../agent_chat_generation` endpoint. Qoder wraps events in an outer envelope with a JSON-string `body`, and can send the `[DONE]` sentinel both bare and wrapped — both are handled, plus a body that stays open after the sentinel.
 - **Agentic "runs".** Qoder groups billing/records per agentic run. The provider infers run boundaries from the message tail and reuses a run-scoped `request_set_id` + `business` (stable id/name, advancing `init` → `start` → `processing`) across tool rounds, so the credit ledger shows one aggregated entry per user prompt instead of many tiny ones.
 - **Tool calls.** Native structured `tool_calls` and DSML tool markup embedded in the text stream are both parsed into pi tool calls. Images returned by tools (e.g. screenshots, `read`) are forwarded to the model as data-URL image parts.
-- **Prompt cache.** A stable session id derived from your user id + model keeps prompt-cache affinity across consecutive requests in a session.
+- **Prompt cache.** A stable session id derived from your user id + model keeps prompt-cache affinity across consecutive requests in a session: the legacy envelope carries it as `session_id`, and v2 carries it both in `metadata.context.session_id` and — matching qodercli's OpenAI-protocol convention — as `prompt_cache_key` plus `session_id` / `x-client-request-id` / `x-session-affinity` headers. Recorded traffic shows the server-side lifetime is minutes (no large re-bill was observed at a 1-5 minute idle gap; the first deaths appear at ~6 minutes), so the provider declares `promptCache.short` = 300 s and can keep a session warm across short idle gaps (next bullet).
+- **Cache warming (opt-in).** With pi's `"cacheWarming": "idle"` setting plus `QODER_CACHE_WARM=1`, pi re-sends the last request with a one-token output cap before the declared lifetime expires, for up to 30 minutes of idle. Each refresh bills a cache read — measured ~50x cheaper than the re-billed input tokens it prevents (DeepSeek-Flash Credit usage, 2026-09-29) — and warming stops on context changes, the 30-minute idle cap, or anything pi considers unsafe to replay.
 - **History repair.** Before sending, orphaned tool results, dropped (error/aborted) assistant turns, and placeholderless tool-call messages are repaired so Qoder never rejects a request with "tool must follow a message with tool_calls".
 
 ## Host request compatibility

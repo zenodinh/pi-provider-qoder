@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { ThinkingLevel, ThinkingLevelMap } from "@earendil-works/pi-ai";
+import type { ModelPromptCache, ThinkingLevel, ThinkingLevelMap } from "@earendil-works/pi-ai";
 import { buildAuthHeaders } from "./cosy.js";
 import { debugLog } from "./debug.js";
 import { getHomeDir } from "./home.js";
@@ -9,6 +9,23 @@ import { parseQoderPriceFactor } from "./protocol/usage.js";
 import { getQoderBaseUrl, getQoderModelListURL, getQoderRegionConfig, type QoderMode } from "./region.js";
 
 export const ZERO_COST = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+
+/**
+ * Best-effort server-side prompt-cache lifetime for Qoder's implicit prefix
+ * cache, in seconds, as pi's `promptCache.short` tier.
+ *
+ * Evidence (owner telemetry, 2026-09-29; raw captures + per-turn usage across
+ * recorded sessions): no large re-bill occurred at a 1-5 minute idle gap,
+ * while observed cache deaths start at ~5.8 minutes and cluster from 5-15
+ * minutes upward. 300 s is the conservative end of that range — pi refreshes
+ * at 90% of it (270 s), and under-declaring costs only a cache-read refresh
+ * (measured ~2.8e-7 credits/token, ~50x cheaper than the input-rate miss it
+ * prevents), whereas over-declaring would refresh after expiry, i.e. pay for
+ * a full-price re-write. Declaring a lifetime is what makes the models
+ * eligible for pi's cache warming; actually sending refreshes is opt-in
+ * (QODER_CACHE_WARM=1 plus pi's `cacheWarming: "idle"`).
+ */
+export const MODEL_PROMPT_CACHE: ModelPromptCache = Object.freeze({ short: 300 });
 
 /**
  * Maximum output tokens sent per request. Aliyun Model Studio (the upstream
@@ -62,6 +79,12 @@ export interface QoderModelDef {
   thinkingLevelMap?: ThinkingLevelMap;
   input: ("text" | "image")[];
   cost: typeof ZERO_COST;
+  /**
+   * Best-effort server-side prompt-cache lifetime (pi's `promptCache` tier).
+   * Optional because a parsed on-disk catalog written by an earlier version
+   * has no value; providers fall back to MODEL_PROMPT_CACHE.
+   */
+  promptCache?: ModelPromptCache;
   contextWindow: number;
   maxTokens: number;
   description?: string;
@@ -181,6 +204,7 @@ function buildStaticModels(mode: QoderMode, rows: readonly StaticModelRow[]): Qo
     supportsEffort: row.supportsEffort ?? false,
     input: row.vision ? ["text", "image"] : ["text"],
     cost: ZERO_COST,
+    promptCache: MODEL_PROMPT_CACHE,
     contextWindow: row.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
     maxTokens: MAX_OUTPUT_TOKENS,
     ...(row.description ? { description: row.description } : {}),
@@ -568,6 +592,7 @@ async function fetchAndCacheModelList(
         thinkingLevelMap,
         input: isVL ? ["text", "image"] : ["text"],
         cost: ZERO_COST,
+        promptCache: MODEL_PROMPT_CACHE,
         contextWindow: ctxLen,
         maxTokens: MAX_OUTPUT_TOKENS,
         ...(priceFactor !== undefined ? { priceFactor } : {}),
