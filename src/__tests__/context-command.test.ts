@@ -9,6 +9,7 @@ import {
   effectiveWindow,
   findQoderModel,
   parseContextArgs,
+  parsePercent,
   percentToTokens,
   renderContextReport,
   tokensToPercent,
@@ -43,6 +44,20 @@ function seedCatalog(defaultTier200K: boolean): void {
 
 beforeEach(() => seedCatalog(false));
 afterEach(() => clearQoderModelsMemCache());
+
+describe("parsePercent", () => {
+  it("accepts bare and %-suffixed percentages inside (0,100)", () => {
+    expect(parsePercent("10")).toBe(10);
+    expect(parsePercent("10%")).toBe(10);
+    expect(parsePercent("2.5")).toBe(2.5);
+  });
+  it("rejects blank, non-numeric, and out-of-range input", () => {
+    expect(parsePercent("")).toBeUndefined();
+    expect(parsePercent("abc")).toBeUndefined();
+    expect(parsePercent("0")).toBeUndefined();
+    expect(parsePercent("120%")).toBeUndefined();
+  });
+});
 
 describe("parseContextArgs", () => {
   it("parses model, window tiers, and percentages", () => {

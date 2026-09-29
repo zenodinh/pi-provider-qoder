@@ -144,7 +144,8 @@ describe("qoder-quota command (F4)", () => {
     });
     await handleQuotaCommand("", ctx);
     const panel = requireCapture(capture);
-    expect(panel.overlay).toBe(true);
+    // Full-area (no overlay) per the /model-parity directive; overlay omitted => undefined.
+    expect(panel.overlay).toBeUndefined();
     const text = panel.panel.render(84).join("\n");
     expect(text).toContain("Plan Credits");
     expect(text).toContain("3,000 / 3,000");

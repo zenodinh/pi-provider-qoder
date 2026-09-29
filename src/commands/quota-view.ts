@@ -7,8 +7,7 @@ import { hyperlink, Key, matchesKey, type TUI, truncateToWidth, visibleWidth } f
 import type { QoderUsageBucket } from "../auth/usage.js";
 import { formatRenewalDate, type QuotaSection } from "./quota.js";
 
-const PANEL_WIDTH = 84;
-const MIN_PANEL_WIDTH = 48;
+const MIN_INNER_WIDTH = 40;
 const BAR_CELLS = 10;
 const LABEL_COLUMN = 21;
 const AMOUNT_COLUMN = 14;
@@ -152,36 +151,28 @@ function createPanel(deps: PanelDeps) {
     return content;
   };
 
-  const renderPanel = (panelWidth: number): string[] => {
+  const renderFull = (width: number): string[] => {
     const theme = deps.theme;
-    const innerWidth = panelWidth - 4;
+    const innerWidth = Math.max(width - 2, MIN_INNER_WIDTH);
     const content = renderContent(innerWidth, theme);
-    const lines = [theme.fg("border", `╭${"─".repeat(panelWidth - 2)}╮`)];
-    for (const line of content) {
-      lines.push(`${theme.fg("border", "│")} ${padTo(line, innerWidth)} ${theme.fg("border", "│")}`);
-    }
-    lines.push(theme.fg("border", `╰${"─".repeat(panelWidth - 2)}╯`));
-    return lines;
+    return [theme.fg("border", "─".repeat(width)), "", ...content, theme.fg("border", "─".repeat(width))];
   };
 
   const render = (width: number): string[] => {
-    const panelWidth = Math.max(Math.min(width, PANEL_WIDTH), MIN_PANEL_WIDTH);
-    if (cache && cache.width === panelWidth) return cache.lines;
-    const lines = renderPanel(panelWidth);
-    cache = { width: panelWidth, lines };
+    if (cache && cache.width === width) return cache.lines;
+    const lines = renderFull(width);
+    cache = { width, lines };
     return lines;
   };
 
   return { render, handleInput, invalidate };
 }
 
-/** Open the compact quota panel; resolves when the user closes it. */
+/** Open the quota panel; resolves when the user closes it. */
 export async function showQuotaPanel(ctx: ExtensionCommandContext, input: QuotaPanelInput): Promise<void> {
-  await ctx.ui.custom<void>(
-    (tui, theme, _keybindings, done) =>
-      createPanel({ tui, theme, sections: input.sections, refresh: input.refresh, done }),
-    // Centre the panel; `width` asks the host for the full-size layout, and
-    // renderBucketRow degrades gracefully when the terminal is narrower.
-    { overlay: true, overlayOptions: { width: PANEL_WIDTH, minWidth: MIN_PANEL_WIDTH } },
+  // No `overlay` option: the panel owns the editor area, matching how /model
+  // renders. renderBucketRow still degrades when the terminal is narrow.
+  await ctx.ui.custom<void>((tui, theme, _keybindings, done) =>
+    createPanel({ tui, theme, sections: input.sections, refresh: input.refresh, done }),
   );
 }

@@ -12,6 +12,7 @@ import {
   staticCnModels,
   staticModels,
 } from "../catalog.js";
+import { debugLog } from "../debug.js";
 import { getPiAgentDir } from "../home.js";
 import { getQoderRegionConfig, QODER_MODES, type QoderMode } from "../region.js";
 
@@ -32,6 +33,15 @@ export interface ContextArgs {
   reservePct?: number;
   keepPct?: number;
   reset?: boolean;
+}
+
+// shape: none — straight-line regex parse plus a range guard; no discriminator to dispatch on.
+/** "10" or "10%" → 10; blank, non-numeric, or outside (0,100) → undefined (never coerce blind). */
+export function parsePercent(raw: string): number | undefined {
+  const match = /^([0-9]+(?:\.[0-9]+)?)%?$/.exec(raw.trim());
+  if (!match) return undefined;
+  const pct = Number(match[1]);
+  return pct > 0 && pct < 100 ? pct : undefined;
 }
 
 export function parseContextArgs(args: string): { ok: true; value: ContextArgs } | { ok: false; error: string } {
@@ -63,10 +73,10 @@ export function parseContextArgs(args: string): { ok: true; value: ContextArgs }
       continue;
     }
     if (key === "reserve" || key === "keep") {
-      const match = /^([0-9]+(?:\.[0-9]+)?)%?$/.exec(raw);
-      if (!match) return { ok: false, error: `${key}= expects a percentage like 10% (got “${raw}”).` };
-      const pct = Number(match[1]);
-      if (!(pct > 0 && pct < 100)) return { ok: false, error: `${key}= must be between 0 and 100 (got ${raw}).` };
+      const pct = parsePercent(raw);
+      if (pct === undefined) {
+        return { ok: false, error: `${key}= expects a percentage between 0 and 100, like 10% (got “${raw}”).` };
+      }
       if (key === "reserve") value.reservePct = pct;
       else value.keepPct = pct;
       continue;
@@ -234,7 +244,7 @@ export function effectiveWindow(
   return { window: location.def.contextWindow, source: "registered" };
 }
 
-function tierList(location: QoderModelLocation): number[] {
+export function tierList(location: QoderModelLocation): number[] {
   const entry = getCachedModelConfig(location.modelId, location.mode);
   const tiers = entry?.context_config ? Object.values(entry.context_config) : [];
   return tiers
@@ -243,24 +253,31 @@ function tierList(location: QoderModelLocation): number[] {
     .sort((a, b) => a - b);
 }
 
+// shape: none — a collect loop over the two regions; no discriminator, no held state.
+/** Every Qoder model across both regions, cached list first with the static list as fallback. */
+export function listQoderModelLocations(): QoderModelLocation[] {
+  const locations: QoderModelLocation[] = [];
+  for (const mode of QODER_MODES) {
+    const cached = getCachedModels(mode);
+    const list = cached.length > 0 ? cached : mode === "cn" ? staticCnModels : staticModels;
+    const providerID = getQoderRegionConfig(mode).providerID;
+    for (const def of list) locations.push({ mode, providerID, modelId: def.id, def });
+  }
+  return locations;
+}
+
 export function renderContextReport(
   modelsJson: Record<string, unknown>,
   settingsJson: Record<string, unknown>,
 ): string {
   const lines: string[] = [];
-  for (const mode of QODER_MODES) {
-    const cached = getCachedModels(mode);
-    const list = cached.length > 0 ? cached : mode === "cn" ? staticCnModels : staticModels;
-    const providerID = getQoderRegionConfig(mode).providerID;
-    for (const def of list) {
-      const location: QoderModelLocation = { mode, providerID, modelId: def.id, def };
-      const { window, source } = effectiveWindow(modelsJson, location);
-      const compaction = effectiveCompaction(settingsJson, `${providerID}/${def.id}`);
-      const tiers = tierList(location);
-      lines.push(
-        `${providerID}/${def.id} · window ${window.toLocaleString("en-US")} (${source}${tiers.length > 0 ? `; tiers ${tiers.map((t) => t.toLocaleString("en-US")).join("/")}` : ""}) · reserve ${tokensToPercent(compaction.reserveTokens, window)} (${compaction.reserveTokens.toLocaleString("en-US")}) · keep ${tokensToPercent(compaction.keepTokens, window)} (${compaction.keepTokens.toLocaleString("en-US")})`,
-      );
-    }
+  for (const location of listQoderModelLocations()) {
+    const { window, source } = effectiveWindow(modelsJson, location);
+    const compaction = effectiveCompaction(settingsJson, `${location.providerID}/${location.modelId}`);
+    const tiers = tierList(location);
+    lines.push(
+      `${location.providerID}/${location.modelId} · window ${window.toLocaleString("en-US")} (${source}${tiers.length > 0 ? `; tiers ${tiers.map((t) => t.toLocaleString("en-US")).join("/")}` : ""}) · reserve ${tokensToPercent(compaction.reserveTokens, window)} (${compaction.reserveTokens.toLocaleString("en-US")}) · keep ${tokensToPercent(compaction.keepTokens, window)} (${compaction.keepTokens.toLocaleString("en-US")})`,
+    );
   }
   lines.push("", USAGE);
   return lines.join("\n");
@@ -274,6 +291,29 @@ export function renderContextReport(
  * `compaction.modelOverrides["<provider>/<id>"]` (raw token thresholds,
  * entered here as percentages of the effective window).
  */
+export interface PiConfigStore {
+  modelsPath: string;
+  settingsPath: string;
+  read(): { modelsJson: Record<string, unknown>; settingsJson: Record<string, unknown> };
+  write(modelsJson: Record<string, unknown>, settingsJson: Record<string, unknown>): void;
+}
+
+// shape: closure returning an object literal — trigger #4, the two config paths
+//   are held state with read/write methods; no subclassing or instanceof needed.
+export function openConfigStore(): PiConfigStore {
+  const modelsPath = join(getPiAgentDir(), "models.json");
+  const settingsPath = join(getPiAgentDir(), "settings.json");
+  return {
+    modelsPath,
+    settingsPath,
+    read: () => ({ modelsJson: readJsonObject(modelsPath), settingsJson: readJsonObject(settingsPath) }),
+    write: (modelsJson, settingsJson) => {
+      writeJsonObject(modelsPath, modelsJson);
+      writeJsonObject(settingsPath, settingsJson);
+    },
+  };
+}
+
 export async function handleContextCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
   const parsed = parseContextArgs(args);
   if (!parsed.ok) {
@@ -281,20 +321,29 @@ export async function handleContextCommand(args: string, ctx: ExtensionCommandCo
     return;
   }
   const change = parsed.value;
-  const modelsPath = join(getPiAgentDir(), "models.json");
-  const settingsPath = join(getPiAgentDir(), "settings.json");
+  const store = openConfigStore();
 
   let modelsJson: Record<string, unknown>;
   let settingsJson: Record<string, unknown>;
   try {
-    modelsJson = readJsonObject(modelsPath);
-    settingsJson = readJsonObject(settingsPath);
+    ({ modelsJson, settingsJson } = store.read());
   } catch (error) {
     ctx.ui.notify(`Could not read pi config: ${error instanceof Error ? error.message : String(error)}`, "warning");
     return;
   }
 
   if (change.model === undefined) {
+    if (ctx.mode === "tui") {
+      try {
+        const { showContextPanel } = await import("./context-view.js");
+        await showContextPanel(ctx);
+        return;
+      } catch (error) {
+        // The pi-tui virtual module is only guaranteed on TUI-capable hosts; a
+        // panel that cannot load must not swallow the report.
+        debugLog("qoder context panel unavailable; falling back to text output", error);
+      }
+    }
     ctx.ui.notify(renderContextReport(modelsJson, settingsJson), "info");
     return;
   }
@@ -318,8 +367,12 @@ export async function handleContextCommand(args: string, ctx: ExtensionCommandCo
       modelId: location.modelId,
       reset: true,
     });
-    writeJsonObject(modelsPath, modelsJson);
-    writeJsonObject(settingsPath, settingsJson);
+    try {
+      store.write(modelsJson, settingsJson);
+    } catch (error) {
+      ctx.ui.notify(`Could not write pi config: ${error instanceof Error ? error.message : String(error)}`, "warning");
+      return;
+    }
     ctx.ui.notify(`Cleared window and compaction overrides for ${location.providerID}/${location.modelId}.`, "info");
     return;
   }
@@ -353,8 +406,7 @@ export async function handleContextCommand(args: string, ctx: ExtensionCommandCo
   }
 
   try {
-    writeJsonObject(modelsPath, modelsJson);
-    writeJsonObject(settingsPath, settingsJson);
+    store.write(modelsJson, settingsJson);
   } catch (error) {
     ctx.ui.notify(`Could not write pi config: ${error instanceof Error ? error.message : String(error)}`, "warning");
     return;
@@ -366,7 +418,7 @@ export async function handleContextCommand(args: string, ctx: ExtensionCommandCo
     `window ${effectiveAfter.toLocaleString("en-US")}`,
     `reserve ${tokensToPercent(compaction.reserveTokens, effectiveAfter)} (${compaction.reserveTokens.toLocaleString("en-US")})`,
     `keep ${tokensToPercent(compaction.keepTokens, effectiveAfter)} (${compaction.keepTokens.toLocaleString("en-US")})`,
-    `— written to ${modelsPath} and ${settingsPath}; takes effect on the next turn`,
+    `— written to ${store.modelsPath} and ${store.settingsPath}; takes effect on the next turn`,
   ].join(" · ");
   ctx.ui.notify(summary, "info");
 }
