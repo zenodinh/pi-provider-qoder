@@ -30,6 +30,9 @@ const v2Success = [
 ].join("\n\n");
 
 beforeEach(() => {
+  // Neutralize any developer-shell QODER_PROTOCOL so this suite asserts the
+  // shipped default routing, not the local override (hermeticity, PUB).
+  vi.stubEnv("QODER_PROTOCOL", "");
   cacheQoderIdentityForTest("qoder:fake", {
     access: "fake",
     refresh: "",

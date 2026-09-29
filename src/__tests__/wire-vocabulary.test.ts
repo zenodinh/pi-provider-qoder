@@ -83,6 +83,10 @@ function v2FetchCapture() {
 }
 
 beforeEach(() => {
+  // Neutralize any developer-shell QODER_PROTOCOL so each describe gets the
+  // transport the shipped table assigns its keys (v2 vs legacy-only); an
+  // override here would reroute both describes and rewrite decision `source`.
+  vi.stubEnv("QODER_PROTOCOL", "");
   cacheQoderIdentityForTest("qoder:fake", {
     access: "fake",
     refresh: "",

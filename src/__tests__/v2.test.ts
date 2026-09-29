@@ -76,6 +76,10 @@ function v2FetchCapture() {
 }
 
 beforeEach(() => {
+  // Neutralize any developer-shell QODER_PROTOCOL so routing follows the shipped
+  // table (v2 for allowlisted keys); an override here would also rewrite the
+  // decision `source` these assertions pin (hermeticity).
+  vi.stubEnv("QODER_PROTOCOL", "");
   cacheQoderIdentityForTest("qoder:fake", {
     access: "fake",
     refresh: "",
