@@ -45,8 +45,10 @@ export const MAX_OUTPUT_TOKENS = 131072;
  *
  * Qoder's `/model/list` often ships `max_input_tokens` as a stale 180K floor
  * even for models that accept 1M-token prompts (verified against global `lite`
- * through 1,000K tokens). When `context_config` is present we use its largest
- * `token_count` instead, so models that truly advertise 200K/256K stay there.
+ * through 1,000K tokens). When `context_config` is present, its `is_default`
+ * tier governs the registered window — Qoder's own default, never a
+ * provider-side "largest" guess (owner direction 2026-09-29) — with the
+ * largest tier used only when the catalog marks no default.
  */
 export const DEFAULT_CONTEXT_WINDOW = 1000000;
 
@@ -414,9 +416,7 @@ function getConfigIndex(mode: QoderMode): Map<string, QoderModelEntry> {
       if (!entry || typeof entry !== "object" || !entry.display_name) continue;
       const displayId = toQoderModelId(entry.display_name);
       if (displayId && displayId !== "QoderModel" && !index.has(displayId)) {
-        // Fold in the max-context default once, at index build time, instead of
-        // rebuilding context_config on every request in getCachedModelConfig.
-        index.set(displayId, withMaxContextAsDefault(entry as QoderModelEntry));
+        index.set(displayId, entry as QoderModelEntry);
       }
     }
   }
@@ -454,26 +454,27 @@ function maxContextTokenCount(contextConfig: QoderModelEntry["context_config"]):
   return max;
 }
 
-/** Resolve contextWindow from a catalog entry. Exported for tests. */
-export function contextWindowFromCatalog(entry: QoderModelEntry): number {
-  return maxContextTokenCount(entry.context_config) || DEFAULT_CONTEXT_WINDOW;
+/** `token_count` of the tier Qoder marks `is_default`, when present. */
+function defaultContextTokenCount(contextConfig: QoderModelEntry["context_config"]): number | undefined {
+  if (!contextConfig || typeof contextConfig !== "object") return undefined;
+  for (const config of Object.values(contextConfig)) {
+    if (config && typeof config === "object" && config.is_default === true && typeof config.token_count === "number") {
+      return config.token_count;
+    }
+  }
+  return undefined;
 }
 
-/** Prefer the largest context option when Qoder exposes selectable contexts. */
-function withMaxContextAsDefault(entry: QoderModelEntry): QoderModelEntry {
-  const contextConfig = entry.context_config;
-  const maxTokenCount = maxContextTokenCount(contextConfig);
-  if (maxTokenCount <= 0 || !contextConfig) return entry;
-
-  return {
-    ...entry,
-    context_config: Object.fromEntries(
-      Object.entries(contextConfig).map(([name, config]) => [
-        name,
-        { ...config, is_default: config.token_count === maxTokenCount },
-      ]),
-    ),
-  };
+/**
+ * Resolve contextWindow from a catalog entry. Qoder's `is_default` tier wins;
+ * the largest advertised tier is the fallback only when nothing is marked.
+ * Exported for tests.
+ */
+export function contextWindowFromCatalog(entry: QoderModelEntry): number {
+  return (
+    defaultContextTokenCount(entry.context_config) ??
+    (maxContextTokenCount(entry.context_config) || DEFAULT_CONTEXT_WINDOW)
+  );
 }
 
 export function isCacheStale(mode: QoderMode, userID?: string): boolean {

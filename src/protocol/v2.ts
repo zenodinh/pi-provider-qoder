@@ -54,6 +54,20 @@ function isAllowedV2Host(baseUrl: string, options?: SimpleStreamOptions): boolea
 // resolution is legacy-local by design).
 const processFallbackSessionId = crypto.randomUUID();
 
+// Run-scope id: qodercli keeps ONE request_set_id per logical run and
+// propagates it to every nested call via AsyncLocalStorage / parentRequestSetId
+// (decoded from its bundled JS, 2026-09-29) — it is not per HTTP call. The pi
+// session is our run scope, so one uuid per session is reused for all its calls.
+const requestSetIds = new Map<string, string>();
+function requestSetIdFor(sessionId: string): string {
+  let id = requestSetIds.get(sessionId);
+  if (id === undefined) {
+    id = crypto.randomUUID();
+    requestSetIds.set(sessionId, id);
+  }
+  return id;
+}
+
 function osType(): string {
   if (process.platform === "darwin") return "macos";
   if (process.platform === "win32") return "windows";
@@ -71,14 +85,28 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function maxAdvertisedTier(contextConfig: QoderModelEntry["context_config"]): number | undefined {
-  if (!contextConfig) return undefined;
-  let max: number | undefined;
-  for (const tier of Object.values(contextConfig)) {
-    const count = tier?.token_count;
-    if (typeof count === "number" && Number.isFinite(count) && (max === undefined || count > max)) max = count;
-  }
-  return max;
+/**
+ * Effective `context_length` for one request. The model's window as pi resolved
+ * it — `models.json` `provider.modelOverrides.<modelId>.contextWindow` included —
+ * wins when it matches one of the catalog's available windows; otherwise the
+ * catalog's `is_default` tier (Qoder's own default). No largest-tier fallback:
+ * an unmatched window omits the field and the server default governs (owner
+ * direction 2026-09-29 — a hidden max can spend more than the user intended).
+ * Mirrors qodercli's window validation (its `$6`/`Gf` helpers, decoded
+ * 2026-09-29: an invalid selection falls back to the default window).
+ */
+function resolveContextLength(
+  contextConfig: QoderModelEntry["context_config"],
+  requested: number | undefined,
+): number | undefined {
+  if (requested === undefined) return undefined;
+  const tiers = Object.values(contextConfig ?? {});
+  const windows = tiers
+    .map((tier) => tier?.token_count)
+    .filter((count): count is number => typeof count === "number" && Number.isFinite(count));
+  if (windows.length === 0 || windows.includes(requested)) return requested;
+  const fallback = tiers.find((tier) => tier?.is_default)?.token_count;
+  return typeof fallback === "number" && Number.isFinite(fallback) ? fallback : undefined;
 }
 
 /**
@@ -94,25 +122,41 @@ function injectQoderFields(
   options?: SimpleStreamOptions,
 ): void {
   // metadata.context — required envelope; session_id keys prompt caching.
+  // qodercli's bundled JS (decoded 2026-09-29) additionally sends
+  // request_set_id (run-scoped, see requestSetIdFor), source_session_id, and
+  // context_length INSIDE this metadata object (string-valued); the top-level
+  // context_length number alone proved ineffective against the ~60K-token
+  // wall, so the envelope is mirrored here.
   const metadata = isRecord(body.metadata) ? body.metadata : {};
   const sessionId = options?.sessionId ?? processFallbackSessionId;
+  const tier = resolveContextLength(route.modelConfig.context_config, model.contextWindow);
   body.metadata = {
     ...metadata,
     context: {
       request_id: crypto.randomUUID(),
+      request_set_id: requestSetIdFor(sessionId),
       session_id: sessionId,
+      source_session_id: sessionId,
       os_type: osType(),
       task_id: "common",
       client_type: "5",
+      ...(tier !== undefined ? { context_length: String(tier) } : {}),
     },
   };
   // Explicit-send set (owner direction 2026-09-25; probes are acceptance
   // checks, server default is never trusted silently).
   body.enable_thinking = resolveReasoningLevel(model, options) !== undefined;
-  const tier = maxAdvertisedTier(route.modelConfig.context_config);
   if (tier !== undefined) body.context_length = tier;
   body.preserve_thinking = true;
   body.parallel_tool_calls = true;
+  // qodercli carries top_k inside `extras`, not top-level (decoded 2026-09-29);
+  // pi-ai assigns samplingParams top-level, so mirror its placement when set.
+  if (typeof body.top_k === "number") {
+    body.extras = { ...(isRecord(body.extras) ? body.extras : {}), top_k: body.top_k };
+  }
+  // `business` (account-scoped id) and `custom_model` (user-defined models) are
+  // sent by qodercli only when its runtime holds them; both stay omitted here
+  // rather than synthesized — this extension never receives those values.
   // pi-ai sends prompt_cache_key only for api.openai.com or long retention
   // (openai-completions buildParams), so the OpenAI-convention affinity key is
   // absent from v2 requests unless added here. qodercli sets the same field

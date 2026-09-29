@@ -252,7 +252,7 @@ describe("Qoder model cache", () => {
     expect(cache.models[0].contextWindow).toBe(200000);
   });
 
-  it("resolves the largest context option as default through getCachedModelConfig", async () => {
+  it("preserves the catalog’s own is_default flags through getCachedModelConfig", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue({
@@ -276,10 +276,9 @@ describe("Qoder model cache", () => {
 
     await updateQoderModelsCache("access-token", "user-id", "Test User", "test@example.com", "global");
 
-    // The transform is memoized on the config index; assert it still applies.
     const config = getCachedModelConfig("GLM5.2", "global");
-    expect(config?.context_config?.large?.is_default).toBe(true);
-    expect(config?.context_config?.small?.is_default).toBe(false);
+    expect(config?.context_config?.small?.is_default).toBe(true);
+    expect(config?.context_config?.large?.is_default).toBe(false);
   });
 
   it("exposes the catalog price_factor as model metadata", async () => {

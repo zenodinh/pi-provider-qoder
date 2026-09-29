@@ -39,7 +39,7 @@ function seedCatalogWithTiers() {
           enable: true,
           display_name: "Ultimate",
           context_config: {
-            "200K": { token_count: 200_000 },
+            "200K": { token_count: 200_000, is_default: true },
             "400K": { token_count: 400_000 },
             "1M": { token_count: 1_000_000 },
           },
@@ -127,11 +127,53 @@ describe("v2 field injector", () => {
     expect(metadata.context.os_type).toBe(expectedOsType);
     expect(metadata.context.task_id).toBe("common");
     expect(metadata.context.client_type).toBe("5");
+    expect(metadata.context.request_set_id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(metadata.context.source_session_id).toBe("session-1");
+    expect(metadata.context.context_length).toBe("1000000");
     expect(body.enable_thinking).toBe(true);
     expect(body.context_length).toBe(1_000_000);
     expect(body.preserve_thinking).toBe(true);
     expect(body.parallel_tool_calls).toBe(true);
     expect("skipCacheWrite" in body).toBe(false);
+  });
+
+  it("keeps request_set_id stable per session and distinct across sessions", async () => {
+    seedCatalogWithTiers();
+    const a = v2FetchCapture();
+    await streamQoderRouter(modelNamed("Ultimate"), context, {
+      apiKey: "fake",
+      fetch: a.fetch,
+      sessionId: "session-a",
+    }).result();
+    await streamQoderRouter(modelNamed("Ultimate"), context, {
+      apiKey: "fake",
+      fetch: a.fetch,
+      sessionId: "session-a",
+    }).result();
+    const b = v2FetchCapture();
+    await streamQoderRouter(modelNamed("Ultimate"), context, {
+      apiKey: "fake",
+      fetch: b.fetch,
+      sessionId: "session-b",
+    }).result();
+    const metaAt = (calls: { url: unknown; body?: Record<string, unknown> }[], i: number) =>
+      bodyOf(calls, i).metadata as { context: Record<string, unknown> };
+    expect(metaAt(a.calls, 1).context.request_set_id).toBe(metaAt(a.calls, 0).context.request_set_id);
+    expect(metaAt(b.calls, 0).context.request_set_id).not.toBe(metaAt(a.calls, 0).context.request_set_id);
+  });
+
+  it("honors a models.json contextWindow override for context_length", async () => {
+    seedCatalogWithTiers();
+    const overridden = { ...modelNamed("Ultimate"), contextWindow: 400000 } as Model<Api>;
+    const a = v2FetchCapture();
+    await streamQoderRouter(overridden, context, { apiKey: "fake", fetch: a.fetch, sessionId: "session-a" }).result();
+    const meta = bodyOf(a.calls, 0).metadata as { context: Record<string, unknown> };
+    expect(bodyOf(a.calls, 0).context_length).toBe(400000);
+    expect(meta.context.context_length).toBe("400000");
+    const mismatched = { ...modelNamed("Ultimate"), contextWindow: 123456 } as Model<Api>;
+    const b = v2FetchCapture();
+    await streamQoderRouter(mismatched, context, { apiKey: "fake", fetch: b.fetch, sessionId: "session-b" }).result();
+    expect(bodyOf(b.calls, 0).context_length).toBe(200000);
   });
 
   it("sends enable_thinking:false when the level is unset or clamps to off", async () => {

@@ -127,15 +127,26 @@ describe("staticCnModels", () => {
 });
 
 describe("contextWindowFromCatalog", () => {
-  it("uses the largest advertised context_config token_count", () => {
+  it("prefers Qoder's is_default tier over the largest advertised window", () => {
+    expect(
+      contextWindowFromCatalog({
+        context_config: {
+          small: { token_count: 200000, is_default: true },
+          large: { token_count: 1000000 },
+        },
+      }),
+    ).toBe(200000);
+  });
+
+  it("uses the largest advertised token_count when no default is marked", () => {
     expect(
       contextWindowFromCatalog({
         context_config: {
           small: { token_count: 200000 },
-          large: { token_count: 1000000, is_default: true },
+          large: { token_count: 400000 },
         },
       }),
-    ).toBe(1000000);
+    ).toBe(400000);
   });
 
   it("keeps an advertised 200K window instead of the 1M fallback", () => {

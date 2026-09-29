@@ -17,6 +17,7 @@ import {
   staticModels,
   updateQoderModelsCache,
 } from "./catalog.js";
+import { handleContextCommand } from "./commands/context.js";
 import { handleQuotaCommand } from "./commands/quota.js";
 import { debugLog } from "./debug.js";
 import { getPiAgentDir } from "./home.js";
@@ -218,6 +219,11 @@ export default async function (pi: ExtensionAPI) {
   pi.registerCommand("qoder-quota", {
     description: "Show Qoder subscription quota (remaining and reset date), on demand",
     handler: handleQuotaCommand,
+  });
+
+  pi.registerCommand("qoder-context", {
+    description: "Show or set Qoder model context window and compaction thresholds (percent-based), on demand",
+    handler: handleContextCommand,
   });
 
   for (const mode of QODER_MODES) registerQoderProvider(pi, mode);
