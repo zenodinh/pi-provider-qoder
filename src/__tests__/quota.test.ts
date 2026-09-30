@@ -1,5 +1,6 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { fetchQoderUsageForMode } from "../auth/usage.js";
 import { clearQoderQuotaCache, handleQuotaCommand } from "../commands/quota.js";
 
 // recorded-from: live GET https://openapi.qoder.sh/api/v2/quota/usage, 2026-09-28
@@ -54,6 +55,22 @@ const UNAVAILABLE_ORG_PAYLOAD = {
 // invented: the recorded exceeded state is expressed by the flag alone; the
 // same account exhausted its plan (used == total == 3,000).
 const EXCEEDED_PAYLOAD = { ...TEAM_PAYLOAD, isQuotaExceeded: true };
+
+// invented: no recorded payload carried a 1,500-Credit plan balance; the shape
+// mirrors TEAM_PAYLOAD's userQuota branch. 1,500 ÷ 75 = $20.00 exactly (spec T-10/T-11).
+const PLAN_1500_PAYLOAD = {
+  userType: "personal",
+  isQuotaExceeded: false,
+  expiresAt: 1792378270595,
+  userQuota: { total: 2000, used: 500, remaining: 1500, percentage: 0.25, unit: "credits" },
+};
+
+// invented: a quota bucket with no numeric amounts, pinning “no USD string is invented”.
+const NO_AMOUNTS_PAYLOAD = {
+  userType: "personal",
+  isQuotaExceeded: false,
+  userQuota: { used: 10, unit: "credits" },
+};
 
 type PanelFactory = (
   tui: unknown,
@@ -329,7 +346,9 @@ describe("qoder-quota command (F4)", () => {
     expect(custom).not.toHaveBeenCalled();
     const text = String(notify.mock.calls[0]?.[0]);
     expect(text).toContain("[Qoder (Browser OAuth / PAT)] · teams");
-    expect(text).toContain("Plan Credits: 3,000 / 3,000 credits (used 100%) — Remaining 0 — Renews on Oct 19, 2026");
+    expect(text).toContain(
+      "Plan Credits: 3,000 / 3,000 credits (used 100%) — Remaining 0 — $0.00 — Renews on Oct 19, 2026",
+    );
     expect(text).toContain("Shared Add-on Credits: 7,177 / 23,000 credits (used 32%) — Remaining 15,823");
     expect(text).toContain("View details: https://qoder.com/account/usage?client=qoder");
     expect(notify.mock.calls[0]?.[1]).toBe("info");
@@ -420,5 +439,70 @@ describe("qoder-quota command (F4)", () => {
     expect(text).toContain("Quota exceeded");
     expect(text).toContain("Upgrade plan: https://qoder.com/pricing?client=qoder");
     expect(notify.mock.calls[0]?.[1]).toBe("warning");
+  });
+});
+
+describe("quota dollars at the shared basis (F2)", () => {
+  it("attaches $20.00 to the 1,500-Credit plan balance and floors the limit to cents (spec T-10/AC-06)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => payloadResponse(PLAN_1500_PAYLOAD)),
+    );
+    const usage = await fetchQoderUsageForMode({ access: "fake", refresh: "", expires: 0 }, "global");
+    expect(usage.usageBuckets).toHaveLength(1);
+    const plan = usage.usageBuckets?.[0];
+    expect(plan?.remainingDisplay).toBe("1,500");
+    expect(plan?.remainingUsdDisplay).toBe("$20.00");
+    // 2,000 ÷ 75 = 26.666… → floored to $26.66, never rounded up.
+    expect(plan?.limitDisplay).toBe("2,000");
+    expect(plan?.limitUsdDisplay).toBe("$26.66");
+  });
+
+  it("appends dollars to the Credits figure in text output and renders the basis once per section (spec T-10/AC-06)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => payloadResponse(PLAN_1500_PAYLOAD)),
+    );
+    const { ctx, notify } = buildCtx({ token: "fake-token" });
+    await handleQuotaCommand("", ctx);
+    const text = String(notify.mock.calls[0]?.[0]);
+    expect(text).toContain("Remaining 1,500 — $20.00");
+    expect(text).toContain("Cost basis: 75 Credits/USD");
+  });
+
+  it("invents no USD string for a bucket without numeric amounts", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => payloadResponse(NO_AMOUNTS_PAYLOAD)),
+    );
+    const usage = await fetchQoderUsageForMode({ access: "fake", refresh: "", expires: 0 }, "global");
+    const bucket = usage.usageBuckets?.[0];
+    expect(bucket?.remainingDisplay).toBeUndefined();
+    expect(bucket?.remainingUsdDisplay).toBeUndefined();
+    expect(bucket?.limitDisplay).toBeUndefined();
+    expect(bucket?.limitUsdDisplay).toBeUndefined();
+  });
+
+  it("shows dollars next to the panel's remaining figure and clips dollars first when narrow (spec T-11/AC-06, AC-08)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => payloadResponse(PLAN_1500_PAYLOAD)),
+    );
+    let capture: PanelCapture | undefined;
+    const { ctx } = buildCtx({
+      token: "fake-token",
+      mode: "tui",
+      onPanel: (c) => {
+        capture = c;
+      },
+    });
+    await handleQuotaCommand("", ctx);
+    const panel = requireCapture(capture).panel;
+    const wide = panel.render(100).join("\n");
+    expect(wide).toContain("Remaining 1,500");
+    expect(wide).toContain("$20.00");
+    const narrow = panel.render(80).join("\n");
+    expect(narrow).toContain("Remaining 1,500");
+    expect(narrow).not.toContain("$20.00");
   });
 });

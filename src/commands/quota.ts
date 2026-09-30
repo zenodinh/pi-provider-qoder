@@ -94,6 +94,7 @@ function renderBucketText(bucket: QoderUsageBucket, renewal?: string): string {
   const percent = bucket.usedPercentDisplay !== undefined ? ` (used ${bucket.usedPercentDisplay})` : "";
   const pieces = [`${bucket.label}: ${amount}${percent}`];
   if (bucket.remainingDisplay !== undefined) pieces.push(`Remaining ${bucket.remainingDisplay}`);
+  if (bucket.remainingUsdDisplay !== undefined) pieces.push(bucket.remainingUsdDisplay);
   if (renewal !== undefined) pieces.push(`Renews on ${renewal}`);
   return pieces.join(" — ");
 }
@@ -113,6 +114,7 @@ export function renderQuotaText(sections: QuotaSection[]): string {
     (usage.usageBuckets ?? []).forEach((bucket, index) => {
       lines.push(renderBucketText(bucket, index === 0 ? renewal : undefined));
     });
+    if ((usage.usageBuckets ?? []).length > 0) lines.push("Cost basis: 75 Credits/USD");
     if (usage.usageUrl) lines.push(`View details: ${usage.usageUrl}`);
     if (usage.exceeded && usage.upgradeUrl) lines.push(`Upgrade plan: ${usage.upgradeUrl}`);
     if (servedFromCache) lines.push(`(cached ${Math.round(cacheAgeMs / 1000)}s ago)`);

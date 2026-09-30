@@ -119,6 +119,14 @@ async function consume(stream: AssistantMessageEventStream): Promise<AssistantMe
   return events;
 }
 
+/** The stored usage row as pi persists it: pi-ai Usage plus the Qoder extras this extension adds. */
+type StoredUsage = AssistantMessage["usage"] & {
+  credits?: number;
+  original_credits?: number;
+  billable?: boolean;
+  rateSource?: "credits" | "rate-table" | "fallback";
+};
+
 describe("streamQoder", () => {
   const originalFetch = globalThis.fetch;
   const originalCnPat = process.env.QODERCN_PERSONAL_ACCESS_TOKEN;
@@ -408,6 +416,110 @@ describe("streamQoder", () => {
     expect("credits" in msg.usage).toBe(false);
     expect("original_credits" in msg.usage).toBe(false);
     expect("billable" in msg.usage).toBe(false);
+  });
+
+  // ── cost transparency (spec CU-02, T-04..T-08) ───────────────────────────
+
+  it("prices a 100.0-Credit turn at the shared basis and marks it credits (spec T-04/AC-01)", async () => {
+    // recorded-from: the envelope format and finishChunk shape mirror the live
+    // legacy SSE captures (SUCCESS_SSE); the Credits amount is the spec's T-04 value.
+    const sse =
+      sseEnvelope(chunk({ content: "OK", role: "assistant" })) +
+      sseEnvelope(
+        finishChunk("stop", {
+          usage: { prompt_tokens: 250_000, completion_tokens: 1_000, total_tokens: 251_000, credits: 100.0 },
+        }),
+      ) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+    const events = await consume(
+      streamQoder(makeModel("qoder", "DeepSeek-V4-Flash"), makeContext(), { apiKey: "fake" }),
+    );
+    const msg = (events.find((e) => e.type === "done") as { message: AssistantMessage }).message;
+    const cost = msg.usage.cost;
+    expect(cost.total).toBeCloseTo(1.3333333, 6);
+    expect(Math.abs(cost.input + cost.output + cost.cacheRead + cost.cacheWrite - cost.total)).toBeLessThanOrEqual(
+      1e-9,
+    );
+    expect(cost.input).toBeGreaterThan(cost.output);
+    expect(cost.output).toBeGreaterThan(0);
+    expect((msg.usage as StoredUsage).rateSource).toBe("credits");
+  });
+
+  it("prices the charged amount, not the list amount, on a discounted turn (spec T-05/AC-02)", async () => {
+    // invented: the charged/list pair (0.4 / 1.0) is pinned by spec T-05.
+    const sse =
+      sseEnvelope(chunk({ content: "OK", role: "assistant" })) +
+      sseEnvelope(
+        finishChunk("stop", {
+          usage: {
+            prompt_tokens: 1_000,
+            completion_tokens: 100,
+            total_tokens: 1_100,
+            credits: 0.4,
+            original_credits: 1.0,
+            billable: true,
+          },
+        }),
+      ) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+    const events = await consume(streamQoder(makeModel("qoder", "Lite"), makeContext(), { apiKey: "fake" }));
+    const usage = (events.find((e) => e.type === "done") as { message: AssistantMessage }).message.usage as StoredUsage;
+    expect(usage.cost.total).toBeCloseTo(0.0053333333, 6);
+    // The list amount (1.0 → 0.0133333) must not be the stored price.
+    expect(Math.abs(usage.cost.total - 0.0133333)).toBeGreaterThan(1e-3);
+  });
+
+  it("stores zero cost with a fallback marker when an unmeasured model reports no Credits (spec T-06/AC-04, AC-09)", async () => {
+    // invented: finishChunk's default usage carries no Qoder billing fields (spec T-06).
+    const sse = sseEnvelope(chunk({ content: "OK", role: "assistant" })) + sseEnvelope(finishChunk("stop")) + DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+    const events = await consume(streamQoder(makeModel("qoder", "Lite"), makeContext(), { apiKey: "fake" }));
+    const usage = (events.find((e) => e.type === "done") as { message: AssistantMessage }).message.usage as StoredUsage;
+    expect(usage.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 });
+    expect(usage.rateSource).toBe("fallback");
+    expect("credits" in usage).toBe(false);
+    expect("original_credits" in usage).toBe(false);
+    expect("billable" in usage).toBe(false);
+  });
+
+  it("prices an uncharged measured turn from the rate table and marks it rate-table (spec T-07/AC-04)", async () => {
+    // invented: token counts are pinned by spec T-07 (100,000 in / 1,000 out on dfmodel).
+    const sse =
+      sseEnvelope(chunk({ content: "OK", role: "assistant" })) +
+      sseEnvelope(
+        finishChunk("stop", { usage: { prompt_tokens: 100_000, completion_tokens: 1_000, total_tokens: 101_000 } }),
+      ) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+    const events = await consume(
+      streamQoder(makeModel("qoder", "DeepSeek-V4-Flash"), makeContext(), { apiKey: "fake" }),
+    );
+    const usage = (events.find((e) => e.type === "done") as { message: AssistantMessage }).message.usage as StoredUsage;
+    expect(usage.cost.input).toBeCloseTo(0.0126984, 6);
+    expect(usage.cost.output).toBeCloseTo(0.000507936, 6);
+    expect(usage.cost.total).toBeCloseTo(0.013206336, 6);
+    expect(usage.rateSource).toBe("rate-table");
+  });
+
+  it("prices a warm-shaped request (maxTokens 1) like any other charged turn (spec T-08/AC-07)", async () => {
+    // invented: warm-row Credits (0.423) and token counts mirror SA §9.1 T-5's refresh example.
+    const sse =
+      sseEnvelope(chunk({ content: "OK", role: "assistant" })) +
+      sseEnvelope(
+        finishChunk("stop", {
+          usage: { prompt_tokens: 4_000, completion_tokens: 10, total_tokens: 4_010, credits: 0.423 },
+        }),
+      ) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+    const events = await consume(
+      streamQoder(makeModel("qoder", "DeepSeek-V4-Flash"), makeContext(), { apiKey: "fake", maxTokens: 1 }),
+    );
+    const usage = (events.find((e) => e.type === "done") as { message: AssistantMessage }).message.usage as StoredUsage;
+    expect(usage.cost.total).toBeCloseTo(0.00564, 6);
+    expect(usage.rateSource).toBe("credits");
   });
 
   it("coalesces consecutive text deltas without changing the final content", async () => {

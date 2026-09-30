@@ -17,6 +17,7 @@ import { resolveQoderIdentity } from "../auth/oauth.js";
 import { getCachedModelConfig, MAX_OUTPUT_TOKENS } from "../catalog.js";
 import { buildAuthHeaders, getMachineId } from "../cosy.js";
 import { readResponseText, withAbort } from "../http.js";
+import { priceTurnCost, type RateSource, rateForUpstreamKey } from "../pricing.js";
 import { getQoderChatURL, getQoderRegionConfig } from "../region.js";
 import { yieldToEventLoop } from "../yield.js";
 import { type DsmlParserEvent, DsmlToolCallParser } from "./dsml.js";
@@ -28,7 +29,7 @@ import { ToolCallAccumulator } from "./tool-calls.js";
 import { contentToText, transformMessagesForQoder, transformTools } from "./transform.js";
 import { parseQoderCreditsUsage, type QoderCreditsUsage } from "./usage.js";
 
-type QoderAssistantUsage = AssistantMessage["usage"] & QoderCreditsUsage;
+type QoderAssistantUsage = AssistantMessage["usage"] & QoderCreditsUsage & { rateSource?: RateSource };
 
 /** False only when the host explicitly disabled thinking for this request. */
 function isThinkingRequested(reasoning: unknown): boolean {
@@ -648,11 +649,30 @@ export function streamQoder(
                 output.usage.reasoning = u.completion_tokens_details.reasoning_tokens;
               }
 
-              // Qoder Credits are not USD and pi-ai 0.80 has no native Credits
-              // field. Preserve the official optional names on the runtime
-              // usage object so hosts can read them without corrupting
-              // usage.cost. Missing fields remain absent, not zero.
-              Object.assign(output.usage as QoderAssistantUsage, parseQoderCreditsUsage(inner.usage));
+              // Qoder Credits are metadata, not USD: preserve the official
+              // optional names on the runtime usage object, with missing
+              // fields absent (never zero). The derived USD cost is written
+              // separately below — pi reads usage.cost as money.
+              const qoderUsage = output.usage as QoderAssistantUsage;
+              Object.assign(qoderUsage, parseQoderCreditsUsage(inner.usage));
+
+              // Price the turn once, at the shared assembly: charged Credits
+              // win; without them a measured upstream key prices from the
+              // rate table; anything else stays zero with a fallback marker.
+              // pi's HTML export sums the four buckets, so the split — not
+              // just the total — must carry the cost.
+              const priced = priceTurnCost(
+                qoderUsage.credits,
+                {
+                  input: qoderUsage.input,
+                  output: qoderUsage.output,
+                  cacheRead: qoderUsage.cacheRead,
+                  cacheWrite: qoderUsage.cacheWrite,
+                },
+                rateForUpstreamKey(qoderModel),
+              );
+              qoderUsage.cost = priced.cost;
+              qoderUsage.rateSource = priced.rateSource;
             }
             if (inner.choices && inner.choices.length > 0) {
               const choice = inner.choices[0];

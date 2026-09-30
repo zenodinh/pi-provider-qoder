@@ -1,14 +1,15 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { ModelPromptCache, ThinkingLevel, ThinkingLevelMap } from "@earendil-works/pi-ai";
+import type { ModelCost, ModelPromptCache, ThinkingLevel, ThinkingLevelMap } from "@earendil-works/pi-ai";
 import { buildAuthHeaders } from "./cosy.js";
 import { debugLog } from "./debug.js";
 import { getHomeDir } from "./home.js";
 import { fetchQoderJson } from "./http.js";
+import { rateForUpstreamKey } from "./pricing.js";
 import { parseQoderPriceFactor } from "./protocol/usage.js";
 import { getQoderBaseUrl, getQoderModelListURL, getQoderRegionConfig, type QoderMode } from "./region.js";
 
-export const ZERO_COST = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+export const ZERO_COST: ModelCost = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 
 /**
  * Best-effort server-side prompt-cache lifetime for Qoder's implicit prefix
@@ -205,7 +206,9 @@ function buildStaticModels(mode: QoderMode, rows: readonly StaticModelRow[]): Qo
     reasoning: row.reasoning,
     supportsEffort: row.supportsEffort ?? false,
     input: row.vision ? ["text", "image"] : ["text"],
-    cost: ZERO_COST,
+    // Measured rates join on the upstream key only (dfmodel/gmodel/qmodel_38max);
+    // a display-name match could price an unknown upstream, so misses stay zero.
+    cost: rateForUpstreamKey(row.upstreamKey) ?? ZERO_COST,
     promptCache: MODEL_PROMPT_CACHE,
     contextWindow: row.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
     maxTokens: MAX_OUTPUT_TOKENS,
@@ -592,7 +595,8 @@ async function fetchAndCacheModelList(
         supportsEffort,
         thinkingLevelMap,
         input: isVL ? ["text", "image"] : ["text"],
-        cost: ZERO_COST,
+        // The model object carries no upstreamKey; the loop's entry.key is the join key.
+        cost: rateForUpstreamKey(key) ?? ZERO_COST,
         promptCache: MODEL_PROMPT_CACHE,
         contextWindow: ctxLen,
         maxTokens: MAX_OUTPUT_TOKENS,

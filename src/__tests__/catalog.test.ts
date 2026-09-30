@@ -1,13 +1,30 @@
-import { describe, expect, it } from "vitest";
+import { readFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  clearQoderModelsMemCache,
   contextWindowFromCatalog,
   DEFAULT_CONTEXT_WINDOW,
   getCachedModelConfig,
   staticCnModels,
   staticModels,
   toQoderModelId,
+  updateQoderModelsCache,
   ZERO_COST,
 } from "../catalog.js";
+
+const cachePath = (): string => join(process.env.HOME as string, ".pi", "agent", "qoder-models-cache.json");
+
+beforeEach(() => {
+  clearQoderModelsMemCache();
+  rmSync(cachePath(), { force: true });
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  rmSync(cachePath(), { force: true });
+  clearQoderModelsMemCache();
+});
 
 // ── staticModels ──────────────────────────────────────────────────────────
 
@@ -31,7 +48,14 @@ describe("staticModels", () => {
       expect(typeof m.reasoning).toBe("boolean");
       expect(typeof m.supportsEffort).toBe("boolean");
       expect(Array.isArray(m.input)).toBe(true);
-      expect(m.cost).toBe(ZERO_COST);
+      expect(m.cost).toEqual(
+        expect.objectContaining({
+          input: expect.any(Number),
+          output: expect.any(Number),
+          cacheRead: expect.any(Number),
+          cacheWrite: expect.any(Number),
+        }),
+      );
       expect(m.contextWindow).toBeGreaterThan(0);
       expect(m.maxTokens).toBeGreaterThan(0);
     }
@@ -69,6 +93,24 @@ describe("staticModels", () => {
     expect(getCachedModelConfig("lite", "global")).toBeNull();
     expect(getCachedModelConfig("qmodel_preview", "global")).toBeNull();
   });
+
+  it("prices measured upstream keys from the rate table and keeps display-name divergences at ZERO_COST (spec T-09)", () => {
+    // recorded-from: SA §5.2 measured rate table (owner ledger fits, 2026-09-30).
+    expect(staticModels.find((m) => m.upstreamKey === "dfmodel")?.cost).toEqual({
+      input: 0.126984,
+      cacheRead: 0.00253968,
+      output: 0.507936,
+      cacheWrite: 0.126984,
+    });
+    // Qwen3.8-Max's static upstream key is qmodel_preview (the live catalog says
+    // qmodel_38max) — a display-name match must never price it.
+    const qwen38Max = staticModels.find((m) => m.id === "Qwen3.8-Max");
+    expect(qwen38Max?.upstreamKey).toBe("qmodel_preview");
+    expect(qwen38Max?.cost).toBe(ZERO_COST);
+    for (const m of staticModels) {
+      if (m.upstreamKey !== "dfmodel") expect(m.cost).toBe(ZERO_COST);
+    }
+  });
 });
 
 // ── staticCnModels ────────────────────────────────────────────────────────
@@ -94,10 +136,28 @@ describe("staticCnModels", () => {
       expect(typeof m.reasoning).toBe("boolean");
       expect(typeof m.supportsEffort).toBe("boolean");
       expect(Array.isArray(m.input)).toBe(true);
-      expect(m.cost).toBe(ZERO_COST);
+      expect(m.cost).toEqual(
+        expect.objectContaining({
+          input: expect.any(Number),
+          output: expect.any(Number),
+          cacheRead: expect.any(Number),
+          cacheWrite: expect.any(Number),
+        }),
+      );
       expect(m.contextWindow).toBeGreaterThan(0);
       expect(m.maxTokens).toBeGreaterThan(0);
     }
+  });
+
+  it("applies the measured rate table to CN rows whose upstream key is measured (dfmodel)", () => {
+    // The rate join is by upstream key, so the CN catalog's DeepSeek-V4-Flash
+    // (upstreamKey dfmodel) carries the same measured rates as the global row.
+    expect(staticCnModels.find((m) => m.upstreamKey === "dfmodel")?.cost).toEqual({
+      input: 0.126984,
+      cacheRead: 0.00253968,
+      output: 0.507936,
+      cacheWrite: 0.126984,
+    });
   });
 
   it("has unique IDs", () => {
@@ -172,6 +232,54 @@ describe("toQoderModelId", () => {
   it("uses a stable fallback when the display name is absent", () => {
     expect(toQoderModelId()).toBe("QoderModel");
     expect(toQoderModelId("")).toBe("QoderModel");
+  });
+});
+
+describe("live catalog builder rates (spec T-09)", () => {
+  it("assigns the measured table by upstream key and ZERO_COST to the rest", async () => {
+    // invented: entries mirror the recorded /model/list chat shape (catalog-cache.test.ts fixtures);
+    // the keys pin the measured/unmeasured split.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            chat: [
+              { key: "dfmodel", enable: true, display_name: "DeepSeek-V4-Flash" },
+              { key: "gmodel", enable: true, display_name: "GLM-5.3" },
+              { key: "qmodel_38max", enable: true, display_name: "Qwen3.8-Max" },
+              { key: "qwmodel", enable: true, display_name: "Qwen3.8-Flash" },
+            ],
+          }),
+      }),
+    );
+
+    await updateQoderModelsCache("access-token", "user-id", "Test User", "test@example.com", "global");
+
+    const cache = JSON.parse(readFileSync(cachePath(), "utf8"));
+    const byId: Record<string, { cost: unknown }> = Object.fromEntries(
+      cache.models.map((model: { id: string; cost: unknown }) => [model.id, model]),
+    );
+    expect(byId["DeepSeek-V4-Flash"].cost).toEqual({
+      input: 0.126984,
+      cacheRead: 0.00253968,
+      output: 0.507936,
+      cacheWrite: 0.126984,
+    });
+    expect(byId["GLM-5.3"].cost).toEqual({
+      input: 1.01592,
+      cacheRead: 0.25398,
+      output: 3.55572,
+      cacheWrite: 1.01592,
+    });
+    expect(byId["Qwen3.8-Max"].cost).toEqual({
+      input: 1.428571,
+      cacheRead: 0.114286,
+      output: 3.428571,
+      cacheWrite: 1.428571,
+    });
+    expect(byId["Qwen3.8-Flash"].cost).toEqual(ZERO_COST);
   });
 });
 

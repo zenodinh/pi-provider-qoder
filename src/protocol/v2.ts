@@ -4,6 +4,7 @@
 import {
   type Api,
   type AssistantMessage,
+  type AssistantMessageEvent,
   type AssistantMessageEventStream,
   clampThinkingLevel,
   createAssistantMessageEventStream,
@@ -14,6 +15,7 @@ import {
 import { openAICompletionsApi } from "@earendil-works/pi-ai/compat";
 import type { QoderModelEntry } from "../catalog.js";
 import { debugLog } from "../debug.js";
+import { type RateSource, rateForUpstreamKey } from "../pricing.js";
 import type { QoderMode } from "../region.js";
 import { markLegacyOnly } from "./routing.js";
 import { createReframedFetch } from "./sse-reframe.js";
@@ -211,6 +213,35 @@ function errorStream(model: Model<Api>, message: string): AssistantMessageEventS
   return stream;
 }
 
+type V2QoderUsage = AssistantMessage["usage"] & { rateSource?: RateSource };
+
+/** Stamp the pricing source on a terminal event's message; the cost fields stay pi-ai's. */
+function stampRateSource(event: AssistantMessageEvent, rateSource: RateSource): void {
+  const message = event.type === "done" ? event.message : event.type === "error" ? event.error : undefined;
+  if (message) (message.usage as V2QoderUsage).rateSource = rateSource;
+}
+
+/**
+ * Pass-through wrapper that stamps `rateSource` on the terminal message without
+ * touching pi-ai's computed cost. Every event is otherwise forwarded unchanged.
+ */
+function withRateSourceStamp(inner: AssistantMessageEventStream, rateSource: RateSource): AssistantMessageEventStream {
+  const out = createAssistantMessageEventStream();
+  void (async () => {
+    for await (const event of inner) {
+      stampRateSource(event, rateSource);
+      out.push(event);
+    }
+    out.end();
+  })().catch((error: unknown) => {
+    debugLog(`provider.v2 rate-source stamp failed: ${error instanceof Error ? error.message : String(error)}`);
+    try {
+      out.end();
+    } catch {}
+  });
+  return out;
+}
+
 /**
  * v2 transport: delegate the turn to pi-ai's OpenAI Completions implementation
  * so pi contract correctness is inherited on every upgrade, with the Qoder
@@ -267,7 +298,11 @@ export function streamQoderV2(
   });
 
   const fallbackEnabled = envValue(options, "QODER_FALLBACK") === "1";
-  if (!fallbackEnabled) return inner;
+  // pi-ai priced the turn from the registered rates; stamp where those rates
+  // came from without touching the cost fields. A legacy self-heal forwards its
+  // own events, whose cost stream.ts already stamped at its assembly site.
+  const rateSource: RateSource = rateForUpstreamKey(route.upstreamKey) ? "rate-table" : "fallback";
+  if (!fallbackEnabled) return withRateSourceStamp(inner, rateSource);
 
   // Self-heal (opt-in): on a pre-start 400 invalid_model_error, the routing
   // row is wrong — retry exactly once on legacy with the UNWRAPPED options and
@@ -287,6 +322,7 @@ export function streamQoderV2(
           return;
         }
       }
+      stampRateSource(event, rateSource);
       out.push(event);
     }
     out.end();

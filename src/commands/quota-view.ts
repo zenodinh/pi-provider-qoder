@@ -86,12 +86,21 @@ function createPanel(deps: PanelDeps) {
       bucket.limitDisplay !== undefined ? `${bucket.usedDisplay} / ${bucket.limitDisplay}` : bucket.usedDisplay;
     const percent = bucket.usedPercentDisplay !== undefined ? `(used ${bucket.usedPercentDisplay})` : "";
     const remaining = bucket.remainingDisplay !== undefined ? `Remaining ${bucket.remainingDisplay}` : "";
+    const remainingUsd = bucket.remainingUsdDisplay ?? "";
     const join = (parts: string[]) => parts.filter((part) => part.length > 0).join(" ".repeat(COLUMN_GAP));
     const bar = renderBar(bucket.usedFraction, theme);
     // Rows degrade in priority order when the host renders narrower than the full
-    // panel: the remaining figure is the reason this view exists, so the
-    // decorative columns yield before it ever gets clipped.
+    // panel: the remaining figure is the reason this view exists, so the USD
+    // complement and the decorative columns yield before it ever gets clipped.
     const candidates = [
+      join([
+        padTo(bucket.label, LABEL_COLUMN),
+        padTo(amount, AMOUNT_COLUMN),
+        bar,
+        padTo(percent, PERCENT_COLUMN),
+        remaining,
+        remainingUsd,
+      ]),
       join([
         padTo(bucket.label, LABEL_COLUMN),
         padTo(amount, AMOUNT_COLUMN),
@@ -147,7 +156,7 @@ function createPanel(deps: PanelDeps) {
       }
       content.push("");
     }
-    content.push(theme.fg("muted", "esc/q close · r refresh"));
+    content.push(theme.fg("muted", "esc/q close · r refresh · 75 Credits/USD"));
     return content;
   };
 

@@ -15,6 +15,7 @@ import { clearQoderModelsMemCache, staticModels } from "../catalog.js";
 import { streamQoderRouter } from "../protocol/router.js";
 import { clearQoderFallbackCache, clearQoderRoutingMemCache, isMarkedLegacyOnly } from "../protocol/routing.js";
 import { clearQoderFilterMemCache } from "../protocol/sampling.js";
+import { streamQoderV2 } from "../protocol/v2.js";
 
 const context = normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: 0 }] });
 // v2.ts maps the host platform the way osType() does; CI runs linux, so derive it.
@@ -437,5 +438,50 @@ describe("self-heal", () => {
     expect(events.at(-1)?.type).toBe("error");
     expect(urls).toHaveLength(1);
     expect(isMarkedLegacyOnly("ultimate")).toBe(false);
+  });
+});
+
+describe("v2 cost rate source (spec CU-07, T-12/T-13)", () => {
+  // invented: chunk shape mirrors the recorded v2 fixture bytes; token counts are the spec's T-12 values.
+  function v2UsageSuccess(usage: Record<string, number>): string {
+    return [
+      `data: ${JSON.stringify({ id: "x", model: "dfmodel", choices: [{ delta: { content: "OK" }, index: 0 }] })}`,
+      `data: ${JSON.stringify({ id: "x", model: "dfmodel", choices: [{ delta: {}, finish_reason: "stop", index: 0 }], usage })}`,
+      "data: [DONE]",
+    ].join("\n\n");
+  }
+
+  function usageFetch(usage: Record<string, number>): typeof globalThis.fetch {
+    return vi.fn(
+      async () => new Response(v2UsageSuccess(usage), { headers: { "content-type": "text/event-stream" } }),
+    ) as unknown as typeof globalThis.fetch;
+  }
+
+  it("prices a measured v2 turn from the registered rates and marks it rate-table (spec T-12/AC-03)", async () => {
+    const result = await streamQoderV2(
+      modelNamed("DeepSeek-V4-Flash"),
+      context,
+      {
+        apiKey: "fake",
+        fetch: usageFetch({ prompt_tokens: 100_000, completion_tokens: 1_000, total_tokens: 101_000 }),
+      },
+      { mode: "global", modelConfig: { key: "dfmodel" }, upstreamKey: "dfmodel" },
+    ).result();
+    expect(result.stopReason).toBe("stop");
+    expect(result.usage.cost.input).toBeCloseTo(0.0126984, 6);
+    expect(result.usage.cost.output).toBeCloseTo(0.000507936, 6);
+    expect((result.usage as AssistantMessage["usage"] & { rateSource?: string }).rateSource).toBe("rate-table");
+  });
+
+  it("marks an unmeasured v2 turn fallback with zero cost (spec T-13/AC-04)", async () => {
+    const result = await streamQoderV2(
+      modelNamed("Ultimate"),
+      context,
+      { apiKey: "fake", fetch: usageFetch({ prompt_tokens: 1_000, completion_tokens: 100, total_tokens: 1_100 }) },
+      { mode: "global", modelConfig: { key: "ultimate" }, upstreamKey: "ultimate" },
+    ).result();
+    expect(result.stopReason).toBe("stop");
+    expect(result.usage.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 });
+    expect((result.usage as AssistantMessage["usage"] & { rateSource?: string }).rateSource).toBe("fallback");
   });
 });

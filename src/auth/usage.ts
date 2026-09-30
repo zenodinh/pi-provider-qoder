@@ -3,6 +3,7 @@
 //   mapper into display-ready buckets.
 import type { OAuthCredentials } from "@earendil-works/pi-ai";
 import { fetchQoderJson, type QoderRequestOptions } from "../http.js";
+import { CREDITS_PER_USD } from "../pricing.js";
 import { getQoderRegionConfig, getQoderUsagePageURL, getQoderUsageURL, type QoderMode } from "../region.js";
 
 /** One quota bucket as the command and the panel render it; display fields are preformatted. */
@@ -11,9 +12,13 @@ export interface QoderUsageBucket {
   label: string;
   usedDisplay: string;
   limitDisplay?: string;
+  /** Limit value in USD at the shared 75-Credits-per-USD basis, floored to cents. */
+  limitUsdDisplay?: string;
   unit?: string;
   resetAt?: string;
   remainingDisplay?: string;
+  /** Remaining value in USD at the shared basis, floored to cents. */
+  remainingUsdDisplay?: string;
   /** "100%" — the desktop app's "(used N%)" value. */
   usedPercentDisplay?: string;
   /** 0..1 fill for the panel bar; absent when the API reports no percentage. */
@@ -43,6 +48,15 @@ const CREDITS_FORMAT = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2
 
 function formatNumber(value: number): string {
   return CREDITS_FORMAT.format(value);
+}
+
+/**
+ * Floor a Credit amount to cents at the shared basis. Display-only: the result
+ * is never fed back into arithmetic, so flooring cannot accumulate error.
+ */
+function formatUsd(credits: number): string {
+  const cents = Math.floor((credits / CREDITS_PER_USD) * 100);
+  return `$${(cents / 100).toFixed(2)}`;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -148,9 +162,11 @@ function toBucket(input: BucketInput): QoderUsageBucket {
     label: input.label,
     usedDisplay: formatNumber(quota.used),
     limitDisplay: limit !== undefined ? formatNumber(limit) : undefined,
+    limitUsdDisplay: limit !== undefined ? formatUsd(limit) : undefined,
     unit: quota.unit,
     resetAt: input.resetAt,
     remainingDisplay: remaining !== undefined ? formatNumber(remaining) : undefined,
+    remainingUsdDisplay: remaining !== undefined ? formatUsd(remaining) : undefined,
     usedPercentDisplay: percent !== undefined ? `${Math.round(percent * 100)}%` : undefined,
     usedFraction: percent !== undefined ? Math.min(1, Math.max(0, percent)) : undefined,
     available: quota.available,
