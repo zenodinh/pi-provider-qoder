@@ -193,7 +193,7 @@ function publishingScan(): LedgerScan {
     const output = 100 + (index % 3) * 41;
     return { input, cacheRead, output, credits: 1e-5 * input + 1e-6 * cacheRead + 3e-5 * output };
   });
-  return { models: { "DeepSeek-V4-Flash": { gaps, turns } }, files: 1, exceededBudget: false };
+  return { models: { "DeepSeek-V4-Flash": { gaps, turns } }, warm: [], files: 1, exceededBudget: false };
 }
 
 // invented: published values for a hand-fitted model (dfmodel lifetime only)

@@ -18,6 +18,7 @@ import {
   staticModels,
   updateQoderModelsCache,
 } from "./catalog.js";
+import { handleCacheCommand } from "./commands/cache.js";
 import { handleContextCommand } from "./commands/context.js";
 import { handleQuotaCommand } from "./commands/quota.js";
 import { debugLog } from "./debug.js";
@@ -309,6 +310,11 @@ export default async function (pi: ExtensionAPI, deps: QoderExtensionDeps = {}) 
   pi.registerCommand("qoder-quota", {
     description: "Show Qoder subscription quota (remaining and reset date), on demand",
     handler: handleQuotaCommand,
+  });
+
+  pi.registerCommand("qoder-cache", {
+    description: "Show cache-warming health: refreshes, spend, cache survival, learned profile",
+    handler: handleCacheCommand,
   });
 
   pi.registerCommand("qoder-context", {

@@ -32,7 +32,13 @@ function usageWith(tokens: TokenSpec, costTotal: number, credits?: number): Usag
 }
 
 /** A real assistant turn (`message` entry); Credits are optional like the ledger's. */
-export function assistantEntry(model: string, timestampMs: number, tokens: TokenSpec, credits?: number): SessionEntry {
+export function assistantEntry(
+  model: string,
+  timestampMs: number,
+  tokens: TokenSpec,
+  credits?: number,
+  provider = "qoder",
+): SessionEntry {
   return {
     type: "message",
     id: `m-${timestampMs}`,
@@ -42,7 +48,7 @@ export function assistantEntry(model: string, timestampMs: number, tokens: Token
       role: "assistant",
       content: [],
       api: "qoder-api",
-      provider: "qoder",
+      provider,
       model,
       usage: usageWith(tokens, 0, credits),
       stopReason: "stop",
@@ -52,14 +58,20 @@ export function assistantEntry(model: string, timestampMs: number, tokens: Token
 }
 
 /** A pi cache-warm refresh row (`usage` entry, kind cache_warm). */
-export function warmEntry(timestampMs: number, tokens: TokenSpec, costTotal = 0, credits?: number): SessionEntry {
+export function warmEntry(
+  timestampMs: number,
+  tokens: TokenSpec,
+  costTotal = 0,
+  credits?: number,
+  provider = "qoder",
+): SessionEntry {
   return {
     type: "usage",
     id: `w-${timestampMs}`,
     parentId: null,
     timestamp: new Date(timestampMs).toISOString(),
     kind: "cache_warm",
-    provider: "qoder",
+    provider,
     model: "auto",
     usage: usageWith(tokens, costTotal, credits),
     note: "extension override",

@@ -34,6 +34,7 @@ pi --provider qoder-cn --model Qwen3.7-Plus
 - **Agentic tool use** — native tool calls, plus DSML markup embedded in the text stream, parsed into clean `toolCall` blocks.
 - **Robust streaming** — handles Qoder's double-`[DONE]` SSE envelope, hidden `<thinking>` markup, idle timeouts, and orphaned/compacted tool history.
 - **Usage reporting** — `/qoder-quota` opens an interactive panel (plan + add-on credits, remaining amounts, renewal date, usage-page link) in the TUI, and prints the same report everywhere else — on demand, with a 60 s cache.
+- **Cache warming health** — `/qoder-cache` reports whether the opt-in warm refreshes are actually keeping the prompt cache alive: refresh count and spend, cache-read share, natural-gap survival, and the learned lifetime/rate profile — read from the always-on session ledger, no debug flag required.
 - **WAF bypass / COSY signatures** — every request is signed with the same RSA/AES machine-bound headers Qoder expects.
 
 ## Providers
@@ -111,7 +112,8 @@ The streamed response is normalized into pi thinking blocks regardless of how th
 | `QODER_FALLBACK` | Set to `1` to retry a turn once on the legacy transport when the v2 model-server rejects a model key (stale routing); the correction is cached for the session. Off by default. |
 | `QODER_PROTOCOL` | Force `v2` or `legacy` for every request, overriding the routing table. |
 | `QODER_MODEL_SERVER_HOST` | Override the v2 model-server base URL (for example to reach a v2 host from the China region). |
-| `QODER_CACHE_WARM` | Set to `1` to approve pi's cache-warming refreshes (requires pi's `cacheWarming` setting; refreshes spend Credits). |
+| `QODER_CACHE_WARM` | Set to `1` to approve pi's cache-warming refreshes (requires pi's `cacheWarming` setting; refreshes spend Credits). With the gate on, refreshes are budget-governed per opportunity (`QODER_WARM_BUDGET`). |
+| `QODER_WARM_BUDGET` | Fraction of the protected cache miss an idle window may spend on refreshes (default `0.5`); `off` disables the cap. Invalid values fall back to `0.5` with one debug entry. |
 
 ## How it works (protocol notes)
 
@@ -120,7 +122,7 @@ The streamed response is normalized into pi thinking blocks regardless of how th
 - **Agentic "runs".** Qoder groups billing/records per agentic run. The provider infers run boundaries from the message tail and reuses a run-scoped `request_set_id` + `business` (stable id/name, advancing `init` → `start` → `processing`) across tool rounds, so the credit ledger shows one aggregated entry per user prompt instead of many tiny ones.
 - **Tool calls.** Native structured `tool_calls` and DSML tool markup embedded in the text stream are both parsed into pi tool calls. Images returned by tools (e.g. screenshots, `read`) are forwarded to the model as data-URL image parts.
 - **Prompt cache.** A stable session id derived from your user id + model keeps prompt-cache affinity across consecutive requests in a session: the legacy envelope carries it as `session_id`, and v2 carries it both in `metadata.context.session_id` and — matching qodercli's OpenAI-protocol convention — as `prompt_cache_key` plus `session_id` / `x-client-request-id` / `x-session-affinity` headers. Recorded traffic shows the server-side lifetime is minutes (no large re-bill was observed at a 1-5 minute idle gap; the first deaths appear at ~6 minutes), so the provider declares `promptCache.short` = 300 s and can keep a session warm across short idle gaps (next bullet).
-- **Cache warming (opt-in).** With pi's `"cacheWarming": "idle"` setting plus `QODER_CACHE_WARM=1`, pi re-sends the last request with a one-token output cap before the declared lifetime expires, for up to 30 minutes of idle. Each refresh bills a cache read — measured ~50x cheaper than the re-billed input tokens it prevents (DeepSeek-Flash Credit usage, 2026-09-29) — and warming stops on context changes, the 30-minute idle cap, or anything pi considers unsafe to replay.
+- **Cache warming (opt-in).** With pi's `"cacheWarming": "idle"` setting plus `QODER_CACHE_WARM=1`, pi re-sends the last request with a one-token output cap before the declared lifetime expires, for up to 30 minutes of idle. Each refresh bills a cache read — measured ~50x cheaper than the re-billed input tokens it prevents (DeepSeek-Flash Credit usage, 2026-09-29) — and warming stops on context changes, the 30-minute idle cap, or anything pi considers unsafe to replay. The provider governs each opportunity: spend since the last real turn (USD, from Qoder's own Credits or priced v2 rows) must stay under `QODER_WARM_BUDGET` × the protected miss, models without a usable rate keep the legacy force-warm, and models with a published learned rate are capped by it. At session start the provider also learns per-model lifetimes (natural idle gaps only) and rate fits (R² ≥ 0.95) from the session ledger, writes them atomically to `~/.pi/agent/qoder-cache-lifetime.json`, and re-registers the learned values. Run `/qoder-cache` for the health readout.
 - **History repair.** Before sending, orphaned tool results, dropped (error/aborted) assistant turns, and placeholderless tool-call messages are repaired so Qoder never rejects a request with "tool must follow a message with tool_calls".
 
 ## Host request compatibility
@@ -139,6 +141,18 @@ Run `/qoder-quota` inside pi — on demand, never on the turn path. In the TUI i
 - **View details** — a link to the account usage page (plus the payload's upgrade link when the quota is exhausted).
 
 Repeat runs within 60 seconds are served from a cache; concurrent runs share a single request; `r` in the panel forces a refresh. Failures print a reason ("quota unavailable") instead of numbers.
+
+## Cache warming health
+
+`/qoder-cache` answers "is warming actually working?" from the data that is always on disk — the session ledger and the learned profile — so no debug flag is needed. It prints the live config plus three evidence sections:
+
+- **Refreshes** — warm-refresh count, spend in USD (Qoder Credits ÷ 75, or the priced v2 total), the median cache-read share (a healthy refresh is a near-pure cache read; a low share means the replay re-wrote the prefix), and how many rows look like re-writes.
+- **Survival** — per model, the median cache-read share of real turns that follow a natural idle gap (warm refreshes excluded) and the count of probable misses. This is the signal that the cache survived the idle window warming was meant to bridge.
+- **Profile** — per model, the published learned lifetime and rate fit with sample count, age, and R², or the declared default when nothing has been published.
+
+The report reads the newest session files first under a 1.5 s scan budget, and flags `INACTIVE` (no refreshes recorded), `WARN` (median refresh share < 0.9, or a model with ≥ 5 gaps and median survival < 0.8), or `OK`.
+
+Per-decision detail — each verdict's reason, rate source, spend, and protected miss — requires `QODER_DEBUG=1`. Guard **stops** are not persisted to the ledger (only approvals materialize as `cache_warm` rows), so the stop rate is a debug-log metric; approvals, spend, and survival are always visible.
 
 ## Development
 

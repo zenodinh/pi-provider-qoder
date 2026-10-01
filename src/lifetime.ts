@@ -86,9 +86,22 @@ export interface LedgerModelSamples {
   turns: LedgerTurn[];
 }
 
+/** One warm-refresh row as pi's CacheWarmer writes it (health-monitoring sample). */
+export interface LedgerWarmSample {
+  /** The row's own model column (often `auto` — never used for attribution). */
+  model: string;
+  timestamp: number;
+  promptTokens: number;
+  cacheRead: number;
+  credits: number | undefined;
+  costTotal: number;
+}
+
 /** One bounded scan of the session ledgers, feeding both estimators. */
 export interface LedgerScan {
   models: Record<string, LedgerModelSamples>;
+  /** Every cache_warm row seen, in scan order (files newest-first). */
+  warm: LedgerWarmSample[];
   files: number;
   exceededBudget: boolean;
 }
@@ -100,6 +113,7 @@ export function clampLifetimeSeconds(seconds: number): number {
 
 interface LedgerAssistantLine {
   kind: "assistant";
+  provider: string;
   model: string;
   timestamp: number;
   input: number;
@@ -109,7 +123,19 @@ interface LedgerAssistantLine {
   credits: number | undefined;
 }
 
-type LedgerLine = LedgerAssistantLine | { kind: "cache_warm" } | { kind: "context_reset" };
+interface LedgerWarmLine {
+  kind: "cache_warm";
+  provider: string;
+  model: string;
+  timestamp: number;
+  input: number;
+  cacheRead: number;
+  cacheWrite: number;
+  credits: number | undefined;
+  costTotal: number;
+}
+
+type LedgerLine = LedgerAssistantLine | LedgerWarmLine | { kind: "context_reset" };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -137,11 +163,34 @@ function parseLedgerLine(line: string): LedgerLine | undefined {
   }
   if (!isRecord(raw)) return undefined;
   if (raw.type === "compaction" || raw.type === "branch_summary") return { kind: "context_reset" };
-  if (raw.type === "usage" && raw.kind === "cache_warm") return { kind: "cache_warm" };
+  if (raw.type === "usage" && raw.kind === "cache_warm") {
+    const provider = typeof raw.provider === "string" ? raw.provider : "unknown";
+    const model = typeof raw.model === "string" ? raw.model : "unknown";
+    const timestamp = typeof raw.timestamp === "string" ? Date.parse(raw.timestamp) : Number.NaN;
+    if (!isRecord(raw.usage) || !Number.isFinite(timestamp)) return undefined;
+    const usage = raw.usage;
+    const input = tokenCount(usage.input);
+    const cacheRead = tokenCount(usage.cacheRead);
+    const cacheWrite = tokenCount(usage.cacheWrite);
+    if (input === undefined || cacheRead === undefined || cacheWrite === undefined) return undefined;
+    const cost = isRecord(usage.cost) ? finiteNumber(usage.cost.total) : undefined;
+    return {
+      kind: "cache_warm",
+      provider,
+      model,
+      timestamp,
+      input,
+      cacheRead,
+      cacheWrite,
+      credits: parseQoderCreditsUsage(usage).credits,
+      costTotal: cost ?? 0,
+    };
+  }
   if (raw.type !== "message" || !isRecord(raw.message)) return undefined;
 
   const message = raw.message;
   if (message.role !== "assistant") return undefined;
+  const provider = typeof message.provider === "string" ? message.provider : "unknown";
   const model = typeof message.model === "string" ? message.model : undefined;
   const timestamp = finiteNumber(message.timestamp);
   if (model === undefined || timestamp === undefined || !isRecord(message.usage)) return undefined;
@@ -156,6 +205,7 @@ function parseLedgerLine(line: string): LedgerLine | undefined {
   }
   return {
     kind: "assistant",
+    provider,
     model,
     timestamp,
     input,
@@ -175,12 +225,17 @@ function samplesFor(scan: LedgerScan, model: string): LedgerModelSamples {
   return samples;
 }
 
+/** This extension owns these two providers; nothing else may enter the profile. */
+const QODER_PROVIDERS = new Set(["qoder", "qoder-cn"]);
+
 /**
  * Walk one session file. A natural gap is a pair of consecutive same-model
  * real turns with no `cache_warm` row and no compaction between them; the
  * later turn's cache-read share measures whether the earlier prompt survived.
  * Warm rows and context resets break a gap — they stop measuring natural
- * survival (a refresh resets the very clock it would be measuring).
+ * survival (a refresh resets the very clock it would be measuring). Rows from
+ * other providers are ignored and break the chain: the sessions directory is
+ * shared, and a foreign `auto` must never be sampled as a Qoder model.
  */
 function scanSessionText(text: string, scan: LedgerScan, budget: { startedAt: number; budgetMs: number }): void {
   let previous: { model: string; timestamp: number } | undefined;
@@ -204,6 +259,21 @@ function scanSessionText(text: string, scan: LedgerScan, budget: { startedAt: nu
       continue;
     }
     if (entry.kind === "cache_warm") {
+      if (!QODER_PROVIDERS.has(entry.provider)) continue;
+      broken = true;
+      scan.warm.push({
+        model: entry.model,
+        timestamp: entry.timestamp,
+        promptTokens: entry.input + entry.cacheRead + entry.cacheWrite,
+        cacheRead: entry.cacheRead,
+        credits: entry.credits,
+        costTotal: entry.costTotal,
+      });
+      continue;
+    }
+
+    if (!QODER_PROVIDERS.has(entry.provider)) {
+      previous = undefined;
       broken = true;
       continue;
     }
@@ -259,7 +329,7 @@ function collectLedgerFiles(roots: readonly string[]): string[] {
 export function scanLedgers(budgetMs: number = LEARNER_BUDGET_MS, dirs?: readonly string[]): LedgerScan {
   const roots = dirs ?? [join(getPiAgentDir(), "sessions")];
   const startedAt = Date.now();
-  const scan: LedgerScan = { models: {}, files: 0, exceededBudget: false };
+  const scan: LedgerScan = { models: {}, warm: [], files: 0, exceededBudget: false };
   for (const file of collectLedgerFiles(roots)) {
     if (Date.now() - startedAt > budgetMs) {
       scan.exceededBudget = true;
@@ -279,8 +349,10 @@ export function scanLedgers(budgetMs: number = LEARNER_BUDGET_MS, dirs?: readonl
   return scan;
 }
 
-/** Median of an ascending-sorted non-empty array. */
-function median(sorted: readonly number[]): number {
+/** Median of the values (any order); undefined for an empty input. */
+export function medianOf(values: readonly number[]): number | undefined {
+  if (values.length === 0) return undefined;
+  const sorted = [...values].sort((a, b) => a - b);
   const middle = Math.floor(sorted.length / 2);
   return sorted.length % 2 === 1 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
 }
@@ -306,7 +378,9 @@ export function estimate(gaps: readonly LedgerGap[]): LifetimeEstimateResult {
       .map((gap) => gap.ratio)
       .sort((a, b) => a - b);
     if (ratios.length === 0) continue;
-    buckets.push({ upperSeconds, medianRatio: median(ratios), samples: ratios.length });
+    const medianRatio = medianOf(ratios);
+    if (medianRatio === undefined) continue;
+    buckets.push({ upperSeconds, medianRatio, samples: ratios.length });
   }
 
   const samples = gaps.length;

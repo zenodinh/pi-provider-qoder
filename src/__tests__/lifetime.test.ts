@@ -109,6 +109,29 @@ describe("scanLedgers / estimate (AC-05)", () => {
     // resets the chain, so only the post-compaction pair counts again.
     expect(scan.models[MODEL]?.gaps).toHaveLength(2);
   });
+
+  it("ignores other providers' rows and never samples a foreign same-named model", () => {
+    const root = sessionsRoot();
+    const start = Date.UTC(2026, 8, 30, 0, 0, 0);
+    writeSession(root, "session.jsonl", [
+      JSON.stringify(assistantEntry("auto", start, TOKENS)),
+      JSON.stringify(assistantEntry("auto", start + 20_000, TOKENS, undefined, "anthropic")),
+      JSON.stringify(assistantEntry("auto", start + 40_000, TOKENS)),
+      JSON.stringify(assistantEntry("auto", start + 60_000, TOKENS)),
+      JSON.stringify(warmEntry(start + 80_000, { input: 1000, cacheRead: 9000, output: 4 }, 0, 3.75, "anthropic")),
+      JSON.stringify(assistantEntry("auto", start + 100_000, TOKENS)),
+      JSON.stringify(warmEntry(start + 120_000, { input: 1000, cacheRead: 9000, output: 4 }, 0, 3.75)),
+      JSON.stringify(assistantEntry("auto", start + 140_000, TOKENS)),
+    ]);
+
+    const scan = scanLedgers(5000, [root]);
+    // The foreign row breaks the chain (no gap across it); the foreign warm
+    // row is ignored (a Qoder gap still forms across it); only the Qoder warm
+    // row breaks a gap and is counted as a refresh.
+    expect(Object.keys(scan.models)).toEqual(["auto"]);
+    expect(scan.models.auto?.gaps.map((gap) => gap.seconds)).toEqual([20, 40]);
+    expect(scan.warm).toHaveLength(1);
+  });
 });
 
 describe("fitRates (AC-07)", () => {
