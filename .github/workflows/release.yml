@@ -1,20 +1,30 @@
 name: Release
 
-# Release intent is a tag, not a diff. Pushing `v*` is the only trigger, and the
-# tag ruleset restricts tag creation to repository admins — so merging a pull
-# request can never publish, no matter what it contains. A version bump on main
-# is inert on its own: it only records the version the next tag must match.
-# This also makes skipped versions normal. Bump 0.0.11 -> 0.99.0 in one pull
-# request, tag v0.99.0, and 0.0.12..0.98.x simply never exist — the same pattern
-# pi follows (npm shows 0.87.1 on 2026-09-22 then 0.99.0 on 2026-09-29, with
-# nothing published in between).
+# Release intent is a tag or a published GitHub Release — never a merge.
+#
+#   - Merging a pull request cannot publish, whatever it contains. A contributor
+#     bumping `package.json` is inert: the version there is not authoritative.
+#   - The tag decides the version. Publish a Release in the web UI with any
+#     `v<major>.<minor>.<patch>` and that is what ships, so skipped versions are
+#     normal (pi does this: npm shows 0.87.1 on 2026-09-22 then 0.99.0 on
+#     2026-09-29, with nothing published in between).
+#   - Only the owner may publish. scripts/release-guard.ts refuses any other
+#     actor, refuses a non-version tag, and refuses a version older than npm's
+#     newest, because publishing one moves the `latest` dist-tag backwards for
+#     every user. It is unit-tested rather than embedded in shell.
+#
+# Both triggers are listed because a Release published through the web UI does
+# not reliably fire `push: tags` — maintainers report both behaviours, so this
+# workflow does not depend on which way GitHub resolves it.
 on:
   push:
     tags: ["v*"]
+  release:
+    types: [published]
 
 # Serialize re-runs of the same tag; never cancel a publish in flight.
 concurrency:
-  group: release-${{ github.ref_name }}
+  group: release-${{ github.event.release.tag_name || github.ref_name }}
   cancel-in-progress: false
 
 permissions:
@@ -28,13 +38,17 @@ jobs:
     name: npm publish + GitHub Release
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout the tagged commit
         # Pinned to a commit SHA: this job holds `id-token: write`, so a mutable
         # tag here is a path to minting an npm provenance token for a tampered
         # tarball. Dependabot (github-actions ecosystem) keeps the SHA current.
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1 (2026-07-17)
         with:
-          # `gh release create --generate-notes` walks history between tags.
+          # For `release` events GITHUB_SHA is documented as the tagged commit,
+          # but actions/checkout has repeatedly resolved release triggers to a
+          # bare commit or detached HEAD (#1431, #2280). Naming the tag means we
+          # publish the code that was released, not main as it looks now.
+          ref: ${{ github.event.release.tag_name || github.ref_name }}
           fetch-depth: 0
 
       - name: Setup Node.js
@@ -43,36 +57,55 @@ jobs:
           node-version: 26
           registry-url: https://registry.npmjs.org
 
-      # Defence in depth behind the tag ruleset: even if tag creation is ever
-      # opened up to someone else, this job refuses to publish for any actor but
-      # the owner, and refuses a tag that disagrees with the version it would
-      # publish. Runs before any dependency is installed.
-      - name: Assert release authority
+      # Runs before anything is installed: a refused release must not even
+      # resolve the dependency tree.
+      - name: Decide whether this tag may be published
+        id: guard
         env:
+          TAG: ${{ github.event.release.tag_name || github.ref_name }}
           ACTOR: ${{ github.actor }}
-          REF: ${{ github.ref_name }}
           RELEASE_OWNER: zenodinh
         run: |
           set -euo pipefail
-          if [ "$ACTOR" != "$RELEASE_OWNER" ]; then
-            echo "::error::Release refused: '$ACTOR' pushed $REF; only '$RELEASE_OWNER' may publish."
+          # An unpublished package makes `npm view` fail; that is a first release,
+          # not an error.
+          LATEST="$(npm view @zenodinh/pi-provider-qoder version 2>/dev/null || true)"
+          PUBLISHED=""
+          if npm view "@zenodinh/pi-provider-qoder@${TAG#v}" version >/dev/null 2>&1; then
+            PUBLISHED="--already-published"
+          fi
+          if [ -n "$LATEST" ]; then
+            node scripts/release-guard.ts --tag "$TAG" --actor "$ACTOR" --owner "$RELEASE_OWNER" \
+              --npm-latest "$LATEST" $PUBLISHED | tee "$RUNNER_TEMP/guard.out"
+          else
+            node scripts/release-guard.ts --tag "$TAG" --actor "$ACTOR" --owner "$RELEASE_OWNER" \
+              $PUBLISHED | tee "$RUNNER_TEMP/guard.out"
+          fi
+          VERSION=""
+          while IFS= read -r line; do
+            case "$line" in RELEASE_VERSION=*) VERSION="${line#RELEASE_VERSION=}" ;; esac
+          done < "$RUNNER_TEMP/guard.out"
+          if [ -z "$VERSION" ]; then
+            echo "::error::release guard produced no version"
             exit 1
           fi
-          case "$REF" in
-            v*) ;;
-            *) echo "::error::Release refused: '$REF' is not a v* tag."; exit 1 ;;
-          esac
-          VERSION="$(node -p "require('./package.json').version")"
-          if [ "v$VERSION" != "$REF" ]; then
-            echo "::error::Release refused: tag '$REF' does not match package.json version '$VERSION'. Bump the version on main first, then tag that commit."
-            exit 1
-          fi
-          echo "Authorized: $ACTOR publishing $REF"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      # Trusted Publishing (OIDC) requires npm >= 11.5.1. Node 26 ships 11.16.0,
-      # so assert the floor instead of installing over it: `npm install -g
-      # npm@latest` would pull whatever npm published most recently into the job
-      # that mints the provenance token.
+      - name: Stamp the version from the tag
+        env:
+          VERSION: ${{ steps.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          # `package.json` on main is not the source of truth — the tag is.
+          # `npm version` validates the string as semver, rewrites package.json
+          # and keeps the lockfile's root version in sync, which `npm ci` needs.
+          npm version --no-git-tag-version "$VERSION"
+          node -p "'will publish ' + require('./package.json').version"
+
+      # Trusted Publishing (OIDC) requires npm >= 11.5.1 (npm docs). Node 26
+      # ships 11.16.0, so assert the floor instead of installing over it —
+      # `npm install -g npm@latest` would pull whatever npm published most
+      # recently into the job that mints the provenance token.
       - name: Assert npm supports Trusted Publishing
         run: |
           set -euo pipefail
@@ -92,22 +125,6 @@ jobs:
               console.log(`npm ${version} meets the >= 11.5.1 Trusted Publishing floor`);
             });'
 
-      # Idempotence: re-running a tag after a partial failure must not attempt a
-      # second publish of the same version.
-      - name: Is this version already on npm?
-        id: npmcheck
-        env:
-          REF: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          VERSION="${REF#v}"
-          if npm view "@zenodinh/pi-provider-qoder@$VERSION" version >/dev/null 2>&1; then
-            echo "published=true" >> "$GITHUB_OUTPUT"
-            echo "$VERSION is already on npm — publish will be skipped."
-          else
-            echo "published=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Install dependencies
         run: npm ci
 
@@ -122,16 +139,25 @@ jobs:
 
       # Publishes via Trusted Publishing (OIDC) — no NPM_TOKEN needed.
       # npm publish runs prepublishOnly (type check) again as a safety net.
+      # Skipped when the guard saw this version already on npm, so re-running a
+      # tag refreshes the GitHub Release without attempting a second publish.
       - name: Publish to npm
-        if: steps.npmcheck.outputs.published == 'false'
-        run: npm publish --provenance --access public
+        env:
+          VERSION: ${{ steps.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          if npm view "@zenodinh/pi-provider-qoder@$VERSION" version >/dev/null 2>&1; then
+            echo "$VERSION is already on npm — skipping publish."
+            exit 0
+          fi
+          npm publish --provenance --access public
 
       - name: Pack and create the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          REF: ${{ github.ref_name }}
+          TAG: ${{ github.event.release.tag_name || github.ref_name }}
         run: |
           set -euo pipefail
           npm pack
-          gh release view "$REF" >/dev/null 2>&1 || gh release create "$REF" --generate-notes --title "$REF"
-          gh release upload "$REF" ./*.tgz --clobber
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --generate-notes --title "$TAG"
+          gh release upload "$TAG" ./*.tgz --clobber

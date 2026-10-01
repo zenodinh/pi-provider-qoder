@@ -7,6 +7,7 @@
       "scripts/diff.ts",
       "scripts/coverage-diff.ts",
       "scripts/security-scan.ts",
+      "scripts/release-guard.ts",
       "test/**",
       "*.ts",
       "*.json"

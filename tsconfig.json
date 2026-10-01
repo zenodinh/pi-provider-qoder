@@ -18,7 +18,8 @@
     "scripts/record-live-fixtures.ts",
     "scripts/diff.ts",
     "scripts/coverage-diff.ts",
-    "scripts/security-scan.ts"
+    "scripts/security-scan.ts",
+    "scripts/release-guard.ts"
   ],
   "exclude": ["node_modules", "dist", "test"]
 }

@@ -306,10 +306,10 @@ export function scanManifest(baseText: string | undefined, headText: string | un
   const findings: Finding[] = [];
   const file = "package.json";
 
-  // Releases are tag-triggered, so a bump publishes nothing by itself: this
-  // advises rather than blocks. It tells the reviewer that the pull request
-  // intends a release, and that this number is the one the next `v*` tag must
-  // match (the release job refuses a tag that disagrees with it).
+  // Releases are tag-triggered and the tag decides the published version, so a
+  // bump in a pull request publishes nothing: this advises rather than blocks.
+  // It exists so the reviewer sees that a contributor touched the version, and
+  // so the number is not mistaken for the next release.
   const baseVersion = readStringField(base, "version");
   const headVersion = readStringField(head, "version");
   if (baseVersion !== undefined && headVersion !== undefined && baseVersion !== headVersion) {
@@ -317,7 +317,7 @@ export function scanManifest(baseText: string | undefined, headText: string | un
       severity: "warn",
       rule: "MANIFEST-VERSION-BUMP",
       file,
-      detail: `root version ${baseVersion} -> ${headVersion}. Publishes nothing on its own; it records the version the next v* tag must match. Confirm the bump is intentional and semver-correct.`,
+      detail: `root version ${baseVersion} -> ${headVersion}. Inert: releases are tag-triggered and the tag decides the published version, so this publishes nothing and package.json on main is not authoritative.`,
     });
   }
 
