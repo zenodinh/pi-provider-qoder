@@ -27,7 +27,12 @@ jobs:
   # secrets on fork PRs, and the ephemeral runner. The `security` job below is
   # the one that must stay clean, and it does not install anything.
   build:
-    name: Lint, typecheck, test & coverage gate
+    # This name is load-bearing: the repo ruleset "Enforce Pull Requests and
+    # Approvals" lists `Lint, typecheck & build` as a required status check. A
+    # rename here stops that context from ever being reported again, and every
+    # pull request then blocks forever waiting for a check that no longer
+    # exists. Rename it and the ruleset in the same change, or not at all.
+    name: Lint, typecheck & build
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
