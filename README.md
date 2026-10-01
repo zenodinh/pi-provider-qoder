@@ -159,11 +159,49 @@ Per-decision detail — each verdict's reason, rate source, spend, and protected
 ```bash
 npm install
 npm test           # run the offline unit suite (replays recorded fixtures)
+npm run test:coverage  # the same suite plus coverage/lcov.info
 npm run test:live  # re-record live protocol fixtures (needs QODER_PAT / QODERCN_PAT)
 pi -e ./src/index.ts  # load the extension from source in pi
 ```
 
 See [`src/__fixtures__/live/README.md`](https://github.com/zenodinh/pi-provider-qoder/blob/main/src/__fixtures__/live/README.md) for the fixture format and how to re-record it.
+
+## CI gates
+
+Every pull request runs two gates on top of lint, types and the test suite. Both are first-party TypeScript under `scripts/` — no third-party action and no SaaS — because a gate that runs on untrusted PR code must not have a supply chain of its own.
+
+**Changed-line coverage (80%).** `scripts/coverage-diff.ts` reads `coverage/lcov.info` and the PR's diff, then asks the only question a reviewer cannot answer by eye: of the *executable* lines this change adds, how many did a test actually run? Below 80% the build fails. Scope is the published artifact (`src/**` minus `__tests__` and `__fixtures__`, matching `package.json`'s `files`), types and comments stay out of the denominator, and a changed file no test ever loaded fails on its own instead of being averaged away. Pushes to `main` report the same number without failing, because by then the merge has happened.
+
+**Security scan.** `scripts/security-scan.ts` fails the build on the patterns that carry real risk for an extension that holds a job token and forges request signatures:
+
+| Family | Blocks on | Advises on |
+| --- | --- | --- |
+| `SRC-*` | dynamic code execution (`eval`, `new Function`, `child_process`), an outbound host that is not a Qoder domain, cleartext `http://`, a credential-shaped `process.env` read | any other `process.env` read, filesystem writes |
+| `WF-*` | `pull_request_target`, a new `secrets.` reference, a write permission, an action not pinned to a 40-hex SHA | |
+| `MANIFEST-*` / `LOCK-*` | an added or changed npm lifecycle script, a `resolved` URL outside `registry.npmjs.org`, a git/file/link source, a changed `integrity` on a known package, a new package with an install script | any dependency-set change, a changed non-lifecycle script, new lock entries, an install script that cannot be compared to a baseline |
+| `PATH-*` | | credential, signing, transport, dependency or CI plumbing touched at all |
+
+The security job installs nothing — Node runs the scanner through its built-in type stripping — so `npm ci` cannot execute a PR's install scripts before the scan sees them. And when a diff touches the scanner or the workflows, the scan runs the **base** revision of the scanner rather than the one the PR supplies, so a change cannot weaken its own judge. Baselines are optional by design: with no base manifest, the base-relative rules degrade to a loud warning instead of reporting every script as newly added.
+
+Run either gate locally:
+
+```bash
+git diff --unified=0 origin/main...HEAD > /tmp/changes.patch
+npm run test:coverage
+npm run coverage:diff -- --diff /tmp/changes.patch --lcov coverage/lcov.info
+
+git show origin/main:package.json > /tmp/base-package.json
+git show origin/main:package-lock.json > /tmp/base-lock.json
+npm run scan -- --diff /tmp/changes.patch \
+  --base-manifest /tmp/base-package.json --head-manifest package.json \
+  --base-lock /tmp/base-lock.json --head-lock package-lock.json
+```
+
+Baselines are ordinary files, not process substitutions: `<(...)` hands the scanner a `/dev/fd/N` path that is already closed by the time npm's child shell runs, and the comparison is then skipped. The scanner says so on stderr rather than exiting green in silence.
+
+`src/__tests__/**` and `src/__fixtures__/**` are out of `SRC-*` scope — a fixture legitimately quotes the text those rules look for, and a per-line bypass comment would be a hole any contributor could use. Contributor test code still runs under `npm test`, so on an untrusted branch read the diff first and let CI run the tests on an ephemeral runner with a read-only token.
+
+Around these gates, the repo also relies on GitHub-side controls that live in settings rather than in files: CodeQL code scanning, secret scanning with push protection, Dependabot alerts (`.github/dependabot.yml` drives the update PRs), and a ruleset on `main` requiring both checks plus a code-owner review — without that ruleset, a direct push to `main` reaches the npm publish path unchecked.
 
 ## Releasing
 

@@ -6,21 +6,44 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege for every job. Nothing in CI needs to write to the repo, and a
+# fork pull request never receives secrets — see also the `security` job, which
+# installs nothing at all.
 permissions:
   contents: read
 
+# A newer push to the same branch/PR supersedes the running job.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "24"
+
 jobs:
+  # Runs the project's own dependency tree, so by definition it executes code
+  # from the pull request (`npm ci` may run install scripts). That is inherent
+  # to running the tests; it is contained by the read-only token, the absence of
+  # secrets on fork PRs, and the ephemeral runner. The `security` job below is
+  # the one that must stay clean, and it does not install anything.
   build:
-    name: Lint, typecheck & build
+    name: Lint, typecheck, test & coverage gate
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        # Pinned to a commit SHA: a mutable tag on a third-party action is a
+        # supply-chain hole. Dependabot (github-actions ecosystem) keeps these
+        # current.
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout v4 (2026-07-16)
+        with:
+          # Both gates diff against the merge base, so real history is needed.
+          fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # actions/setup-node v4 (2025-04-02)
         with:
-          node-version: 24
+          node-version: ${{ env.NODE_VERSION }}
           cache: npm
 
       - name: Install dependencies
@@ -32,5 +55,133 @@ jobs:
       - name: Type check
         run: npm run check
 
-      - name: Test
-        run: npm test
+      - name: Test with coverage
+        run: npm run test:coverage
+
+      # Every value reaching a shell comes through `env:`, never interpolated
+      # straight into the script body — an expression injected into a `run:`
+      # block is a script-injection vector.
+      - name: Resolve diff base
+        id: base
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "ref=origin/$BASE_REF" >> "$GITHUB_OUTPUT"
+            echo "enforce=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # push: compare against the previous tip when it is known. An
+          # all-zero `before` means a new branch, and HEAD~1 may not exist on a
+          # first commit — both fall back to an empty diff (report only).
+          if [ -n "$BEFORE" ] && [ -n "${BEFORE//0/}" ] && git cat-file -e "$BEFORE" 2>/dev/null; then
+            echo "ref=$BEFORE" >> "$GITHUB_OUTPUT"
+          elif git rev-parse --verify --quiet HEAD~1 >/dev/null; then
+            echo "ref=HEAD~1" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=HEAD" >> "$GITHUB_OUTPUT"
+          fi
+          echo "enforce=false" >> "$GITHUB_OUTPUT"
+
+      - name: Changed-line coverage gate (80%)
+        env:
+          BASE: ${{ steps.base.outputs.ref }}
+          ENFORCE: ${{ steps.base.outputs.enforce }}
+        run: |
+          set -euo pipefail
+          git -c core.quotepath=false diff --unified=0 "$BASE"...HEAD > "$RUNNER_TEMP/changes.patch"
+          # Pull requests are gated; a push to main reports the same number
+          # without failing the build, because by then the merge has happened.
+          if [ "$ENFORCE" = "true" ]; then
+            node scripts/coverage-diff.ts --diff "$RUNNER_TEMP/changes.patch" --lcov coverage/lcov.info --threshold 80
+          else
+            node scripts/coverage-diff.ts --diff "$RUNNER_TEMP/changes.patch" --lcov coverage/lcov.info --threshold 80 --report-only
+          fi
+
+  # First-party scan of what the change actually does: new outbound hosts,
+  # dynamic code execution, credential env reads, workflow permission or trigger
+  # escalation, unpinned actions, and dependency/lockfile identity. No
+  # third-party action and no `npm ci`, so the scanner itself has no supply
+  # chain and nothing from the pull request's dependency tree is executed here.
+  security:
+    name: Security scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout v4 (2026-07-16)
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # actions/setup-node v4 (2025-04-02)
+        with:
+          # No `cache: npm` on purpose: this job must not resolve or install
+          # anything. Node runs the TypeScript scanner directly, with no flag and
+          # no tsx — verified on Node 24 (what CI pins) and Node 26, including
+          # native resolution of the `.ts` import specifiers.
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Resolve diff base
+        id: base
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "ref=origin/$BASE_REF" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -n "$BEFORE" ] && [ -n "${BEFORE//0/}" ] && git cat-file -e "$BEFORE" 2>/dev/null; then
+            echo "ref=$BEFORE" >> "$GITHUB_OUTPUT"
+          elif git rev-parse --verify --quiet HEAD~1 >/dev/null; then
+            echo "ref=HEAD~1" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=HEAD" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Choose the scanner revision
+        id: scanner
+        env:
+          BASE: ${{ steps.base.outputs.ref }}
+        run: |
+          set -euo pipefail
+          # A diff that edits the scanner or the workflows must not be judged by
+          # its own edited copy. Use the base revision when it exists.
+          touched="$(git -c core.quotepath=false diff --name-only "$BASE"...HEAD)"
+          if printf '%s\n' "$touched" | grep -qE '^(scripts/(security-scan|diff|coverage-diff)\.ts|\.github/)'; then
+            mkdir -p "$RUNNER_TEMP/trusted/scripts"
+            if git show "$BASE:scripts/security-scan.ts" > "$RUNNER_TEMP/trusted/scripts/security-scan.ts" 2>/dev/null &&
+               git show "$BASE:scripts/diff.ts" > "$RUNNER_TEMP/trusted/scripts/diff.ts" 2>/dev/null; then
+              echo "path=$RUNNER_TEMP/trusted/scripts/security-scan.ts" >> "$GITHUB_OUTPUT"
+              echo "::notice::Scanning with the base revision of the scanner: this diff touches the scanner or the workflows."
+              exit 0
+            fi
+            echo "::warning::The base revision has no scanner yet, so this checkout's copy is used. Review scripts/ and .github/ by hand."
+          fi
+          echo "path=scripts/security-scan.ts" >> "$GITHUB_OUTPUT"
+
+      - name: Scan the change
+        env:
+          BASE: ${{ steps.base.outputs.ref }}
+          SCANNER: ${{ steps.scanner.outputs.path }}
+        run: |
+          set -euo pipefail
+          git -c core.quotepath=false diff --unified=0 "$BASE"...HEAD > "$RUNNER_TEMP/changes.patch"
+          # Base artifacts are optional by design: the scanner degrades to a
+          # loud warning rather than reporting every script as newly added.
+          git show "$BASE:package.json" > "$RUNNER_TEMP/base-package.json" 2>/dev/null || true
+          git show "$BASE:package-lock.json" > "$RUNNER_TEMP/base-lock.json" 2>/dev/null || true
+          # `pipefail` keeps the scanner's exit code through `tee`.
+          node "$SCANNER" \
+            --diff "$RUNNER_TEMP/changes.patch" \
+            --base-manifest "$RUNNER_TEMP/base-package.json" \
+            --head-manifest package.json \
+            --base-lock "$RUNNER_TEMP/base-lock.json" \
+            --head-lock package-lock.json \
+            --format github | tee -a "$GITHUB_STEP_SUMMARY"

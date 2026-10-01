@@ -1,0 +1,42 @@
+# Dependabot: dependency vulnerability alerts are enabled separately in the
+# repo settings (Security tab); this file only drives the *update* pull
+# requests. Both ecosystems matter here — npm for the runtime/dev tree, and
+# github-actions because a workflow action is code that runs with this repo's
+# tokens (release.yml holds `id-token: write` for npm provenance).
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    # Security updates get their own PRs; version updates are grouped so the
+    # review load stays proportional to a personal repo.
+    open-pull-requests-limit: 5
+    groups:
+      pi-ai:
+        patterns:
+          - "@earendil-works/*"
+      dev-tooling:
+        patterns:
+          - "@biomejs/*"
+          - "typescript"
+          - "vitest"
+          - "@vitest/*"
+          - "tsx"
+    labels:
+      - dependencies
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - ci
+    # Actions are pinned to full commit SHAs in the workflows; Dependabot keeps
+    # the SHA current and the `# vN` comment next to it readable.
+    commit-message:
+      prefix: "ci(actions)"
