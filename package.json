@@ -24,6 +24,9 @@
     "lint:fix": "node node_modules/@biomejs/biome/bin/biome check --write .",
     "format": "node node_modules/@biomejs/biome/bin/biome format --write .",
     "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "coverage:diff": "node scripts/coverage-diff.ts",
+    "scan": "node scripts/security-scan.ts",
     "test:live": "tsx scripts/record-live-fixtures.ts",
     "test:watch": "vitest",
     "prepublishOnly": "npm run check"
@@ -38,6 +41,7 @@
     "@earendil-works/pi-ai": "^0.87.1",
     "@earendil-works/pi-coding-agent": "^0.87.1",
     "@earendil-works/pi-tui": "^0.87.1",
+    "@vitest/coverage-v8": "^5.0.1",
     "tsx": "^4.23.13",
     "typescript": "^7.0.2",
     "vitest": "^5.0.1"

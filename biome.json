@@ -1,7 +1,16 @@
 {
   "$schema": "https://biomejs.dev/schemas/2.5.13/schema.json",
   "files": {
-    "includes": ["src/**", "scripts/record-live-fixtures.ts", "test/**", "*.ts", "*.json"]
+    "includes": [
+      "src/**",
+      "scripts/record-live-fixtures.ts",
+      "scripts/diff.ts",
+      "scripts/coverage-diff.ts",
+      "scripts/security-scan.ts",
+      "test/**",
+      "*.ts",
+      "*.json"
+    ]
   },
   "formatter": {
     "enabled": true,

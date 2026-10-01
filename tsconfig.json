@@ -6,11 +6,19 @@
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
     "outDir": "dist",
     "declaration": true,
     "declarationMap": true,
     "sourceMap": true
   },
-  "include": ["src", "scripts/record-live-fixtures.ts"],
+  "include": [
+    "src",
+    "scripts/record-live-fixtures.ts",
+    "scripts/diff.ts",
+    "scripts/coverage-diff.ts",
+    "scripts/security-scan.ts"
+  ],
   "exclude": ["node_modules", "dist", "test"]
 }
