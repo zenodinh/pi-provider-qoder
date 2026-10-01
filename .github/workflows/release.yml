@@ -21,13 +21,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        # Pinned to a commit SHA: this job holds `id-token: write`, so a mutable
+        # tag here is a path to minting an npm provenance token for a tampered
+        # tarball. Dependabot (github-actions ecosystem) keeps the SHA current.
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout v4 (2026-07-16)
         with:
           # The version-diff baseline is github.event.before — needs real history.
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # actions/setup-node v4 (2025-04-02)
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
@@ -35,11 +38,16 @@ jobs:
       # Runs first, so merges without a version bump skip every heavy step.
       - name: Detect version change
         id: detect
+        # Every value reaching the shell arrives through `env:`. Interpolating
+        # an expression straight into `run:` is a script-injection vector, and
+        # this job can publish to npm.
+        env:
+          BEFORE: ${{ github.event.before }}
         run: |
           NEW="$(node -p "require('./package.json').version")"
           OLD=""
-          if git cat-file -e "${{ github.event.before }}:package.json" 2>/dev/null; then
-            OLD="$(git show "${{ github.event.before }}:package.json" | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).version")"
+          if [ -n "$BEFORE" ] && git cat-file -e "$BEFORE:package.json" 2>/dev/null; then
+            OLD="$(git show "$BEFORE:package.json" | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).version")"
           fi
           if [ "$OLD" != "$NEW" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -53,18 +61,24 @@ jobs:
       - name: Is the version already on npm?
         id: npmcheck
         if: steps.detect.outputs.changed == 'true'
+        # The version string comes from package.json, i.e. from whoever last
+        # edited it — never interpolate it into the script body.
+        env:
+          VERSION: ${{ steps.detect.outputs.version }}
         run: |
-          if npm view "@zenodinh/pi-provider-qoder@${{ steps.detect.outputs.version }}" version >/dev/null 2>&1; then
+          if npm view "@zenodinh/pi-provider-qoder@$VERSION" version >/dev/null 2>&1; then
             echo "published=true" >> "$GITHUB_OUTPUT"
           else
             echo "published=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # Trusted Publishing (OIDC) requires npm >= 11.5.1. One inline retry:
+      # Trusted Publishing (OIDC) requires npm >= 11.5.1. Pinned to a major
+      # instead of `latest`, which would pull whatever npm published most
+      # recently into the job that mints the provenance token. One inline retry:
       # registry reads from runners occasionally ECONNRESET.
       - name: Upgrade npm
         if: steps.detect.outputs.changed == 'true'
-        run: npm install -g npm@latest || npm install -g npm@latest
+        run: npm install -g npm@11 || npm install -g npm@11
 
       - name: Install dependencies
         if: steps.detect.outputs.changed == 'true'
@@ -92,8 +106,9 @@ jobs:
         if: steps.detect.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.detect.outputs.version }}
         run: |
-          V="${{ steps.detect.outputs.version }}"
+          V="$VERSION"
           npm pack
           gh release view "v$V" >/dev/null 2>&1 || gh release create "v$V" --generate-notes --title "v$V"
           gh release upload "v$V" ./*.tgz --clobber
