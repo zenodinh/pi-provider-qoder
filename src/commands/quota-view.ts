@@ -89,13 +89,18 @@ function createPanel(deps: PanelDeps) {
     const remainingUsd = bucket.remainingUsdDisplay ?? "";
     const join = (parts: string[]) => parts.filter((part) => part.length > 0).join(" ".repeat(COLUMN_GAP));
     const bar = renderBar(bucket.usedFraction, theme);
+    // A rollup amount ("10,177 / 46,000", "$135.69 / $613.33") can exceed
+    // AMOUNT_COLUMN; padTo truncates past its width and a clipped number is a
+    // lie, so the column widens to fit instead. Pool rows stay byte-identical
+    // while their amounts fit.
+    const amountCol = Math.max(AMOUNT_COLUMN, visibleWidth(amount));
     // Rows degrade in priority order when the host renders narrower than the full
     // panel: the remaining figure is the reason this view exists, so the USD
     // complement and the decorative columns yield before it ever gets clipped.
     const candidates = [
       join([
         padTo(bucket.label, LABEL_COLUMN),
-        padTo(amount, AMOUNT_COLUMN),
+        padTo(amount, amountCol),
         bar,
         padTo(percent, PERCENT_COLUMN),
         remaining,
@@ -103,13 +108,13 @@ function createPanel(deps: PanelDeps) {
       ]),
       join([
         padTo(bucket.label, LABEL_COLUMN),
-        padTo(amount, AMOUNT_COLUMN),
+        padTo(amount, amountCol),
         bar,
         padTo(percent, PERCENT_COLUMN),
         remaining,
       ]),
-      join([padTo(bucket.label, LABEL_COLUMN), padTo(amount, AMOUNT_COLUMN), bar, remaining]),
-      join([padTo(bucket.label, LABEL_COLUMN), padTo(amount, AMOUNT_COLUMN), remaining]),
+      join([padTo(bucket.label, LABEL_COLUMN), padTo(amount, amountCol), bar, remaining]),
+      join([padTo(bucket.label, LABEL_COLUMN), padTo(amount, amountCol), remaining]),
     ];
     for (const row of candidates) {
       if (visibleWidth(row) <= innerWidth) return row;
@@ -144,6 +149,9 @@ function createPanel(deps: PanelDeps) {
       if (usage.exceeded)
         content.push(theme.fg("warning", "Quota exceeded: new requests are blocked until the reset date"));
       for (const bucket of usage.usageBuckets ?? []) content.push(renderBucketRow(bucket, innerWidth, theme));
+      if (usage.totalCreditsBucket !== undefined)
+        content.push(renderBucketRow(usage.totalCreditsBucket, innerWidth, theme));
+      if (usage.totalCostBucket !== undefined) content.push(renderBucketRow(usage.totalCostBucket, innerWidth, theme));
       if (usage.usageUrl !== undefined) {
         content.push(
           `${theme.fg("muted", "View details: ")}${hyperlink(stripProtocol(usage.usageUrl), usage.usageUrl)}`,

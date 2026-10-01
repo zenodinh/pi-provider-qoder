@@ -84,7 +84,7 @@ export function formatRenewalDate(isoTimestamp: string): string {
   return `${monthName} ${Number(day)}, ${year}`;
 }
 
-function renderBucketText(bucket: QoderUsageBucket, renewal?: string): string {
+function renderBucketText(bucket: QoderUsageBucket): string {
   if (bucket.available === false) return `${bucket.label}: Unavailable`;
   const unit = bucket.unit ? ` ${bucket.unit}` : "";
   const amount =
@@ -95,7 +95,6 @@ function renderBucketText(bucket: QoderUsageBucket, renewal?: string): string {
   const pieces = [`${bucket.label}: ${amount}${percent}`];
   if (bucket.remainingDisplay !== undefined) pieces.push(`Remaining ${bucket.remainingDisplay}`);
   if (bucket.remainingUsdDisplay !== undefined) pieces.push(bucket.remainingUsdDisplay);
-  if (renewal !== undefined) pieces.push(`Renews on ${renewal}`);
   return pieces.join(" — ");
 }
 
@@ -108,12 +107,21 @@ export function renderQuotaText(sections: QuotaSection[]): string {
       continue;
     }
     const { usage, servedFromCache, cacheAgeMs } = section.state;
-    lines.push(`[${section.loginName}]${usage.userType ? ` · ${usage.userType}` : ""}`);
-    if (usage.exceeded) lines.push("Quota exceeded: new requests are blocked until the reset date");
+    // The renewal date is account-level (usage.resetAt), so it rides the section
+    // header: pinning it to the first pool row lost it on a pool-less account —
+    // the same coupling the rollup rows removed for remaining and cost.
     const renewal = usage.resetAt !== undefined ? formatRenewalDate(usage.resetAt) : undefined;
-    (usage.usageBuckets ?? []).forEach((bucket, index) => {
-      lines.push(renderBucketText(bucket, index === 0 ? renewal : undefined));
+    const header = `[${section.loginName}]${usage.userType ? ` · ${usage.userType}` : ""}`;
+    lines.push(renewal !== undefined ? `${header} — Renews on ${renewal}` : header);
+    if (usage.exceeded) lines.push("Quota exceeded: new requests are blocked until the reset date");
+    (usage.usageBuckets ?? []).forEach((bucket) => {
+      lines.push(renderBucketText(bucket));
     });
+    // Account-level rollup rows: computed from whatever buckets the payload
+    // carried, so a pool cut by a Qoder migration cannot take the account's
+    // remaining or cost with it.
+    if (usage.totalCreditsBucket !== undefined) lines.push(renderBucketText(usage.totalCreditsBucket));
+    if (usage.totalCostBucket !== undefined) lines.push(renderBucketText(usage.totalCostBucket));
     if ((usage.usageBuckets ?? []).length > 0) lines.push("Cost basis: 75 Credits/USD");
     if (usage.usageUrl) lines.push(`View details: ${usage.usageUrl}`);
     if (usage.exceeded && usage.upgradeUrl) lines.push(`Upgrade plan: ${usage.upgradeUrl}`);

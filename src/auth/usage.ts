@@ -41,6 +41,16 @@ export interface QoderProviderUsage {
   /** Account kind as reported by the API ("teams", "personal", …). */
   userType?: string;
   usageBuckets?: QoderUsageBucket[];
+  /**
+   * Account-level rollup row: Σused / Σlimit and the summed remaining over
+   * every bucket the payload provided. Qoder's migrations change which pools
+   * exist (the default/base pool was cut in the 2026 migration), so the
+   * account's remaining and cost live here, computed from whatever buckets
+   * are present — never tied to one pool's row. Present whenever any bucket is.
+   */
+  totalCreditsBucket?: QoderUsageBucket;
+  /** The same rollup in USD at the shared basis: cost so far / USD granted. */
+  totalCostBucket?: QoderUsageBucket;
   raw?: Record<string, unknown>;
 }
 
@@ -151,25 +161,35 @@ interface BucketInput {
   resetAt?: string;
 }
 
-function toBucket(input: BucketInput): QoderUsageBucket {
+interface MadeBucket {
+  bucket: QoderUsageBucket;
+  limit?: number;
+  remaining?: number;
+}
+
+function toBucket(input: BucketInput): MadeBucket {
   const quota = input.quota;
   const limit = quota.cap ?? quota.total;
   const derivedRemaining = limit !== undefined ? Math.max(0, limit - quota.used) : undefined;
   const remaining = input.deriveRemaining ? derivedRemaining : (quota.remaining ?? derivedRemaining);
   const percent = quota.percentage ?? (limit !== undefined && limit > 0 ? quota.used / limit : undefined);
   return {
-    id: input.id,
-    label: input.label,
-    usedDisplay: formatNumber(quota.used),
-    limitDisplay: limit !== undefined ? formatNumber(limit) : undefined,
-    limitUsdDisplay: limit !== undefined ? formatUsd(limit) : undefined,
-    unit: quota.unit,
-    resetAt: input.resetAt,
-    remainingDisplay: remaining !== undefined ? formatNumber(remaining) : undefined,
-    remainingUsdDisplay: remaining !== undefined ? formatUsd(remaining) : undefined,
-    usedPercentDisplay: percent !== undefined ? `${Math.round(percent * 100)}%` : undefined,
-    usedFraction: percent !== undefined ? Math.min(1, Math.max(0, percent)) : undefined,
-    available: quota.available,
+    bucket: {
+      id: input.id,
+      label: input.label,
+      usedDisplay: formatNumber(quota.used),
+      limitDisplay: limit !== undefined ? formatNumber(limit) : undefined,
+      limitUsdDisplay: limit !== undefined ? formatUsd(limit) : undefined,
+      unit: quota.unit,
+      resetAt: input.resetAt,
+      remainingDisplay: remaining !== undefined ? formatNumber(remaining) : undefined,
+      remainingUsdDisplay: remaining !== undefined ? formatUsd(remaining) : undefined,
+      usedPercentDisplay: percent !== undefined ? `${Math.round(percent * 100)}%` : undefined,
+      usedFraction: percent !== undefined ? Math.min(1, Math.max(0, percent)) : undefined,
+      available: quota.available,
+    },
+    limit,
+    remaining,
   };
 }
 
@@ -196,36 +216,77 @@ export async function fetchQoderUsageForMode(
   const resetAt = usage.expiresAt !== undefined ? new Date(usage.expiresAt).toISOString() : undefined;
 
   const buckets: QoderUsageBucket[] = [];
+  // shape: none — accumulator closure inside the existing mapper; the rollup
+  //   sums share toBucket's derivation via MadeBucket, no duplicated logic.
+  let usedSum = 0;
+  let limitSum = 0;
+  let remainingSum = 0;
+  let hasLimit = false;
+  let hasRemaining = false;
+  const pushBucket = (input: BucketInput): void => {
+    const made = toBucket(input);
+    usedSum += input.quota.used;
+    if (made.limit !== undefined) {
+      limitSum += made.limit;
+      hasLimit = true;
+    }
+    if (made.remaining !== undefined) {
+      remainingSum += made.remaining;
+      hasRemaining = true;
+    }
+    buckets.push(made.bucket);
+  };
   if (usage.userQuota) {
-    buckets.push(
-      toBucket({ id: "user-quota", label: "Plan Credits", quota: usage.userQuota, deriveRemaining: false, resetAt }),
-    );
+    pushBucket({ id: "user-quota", label: "Plan Credits", quota: usage.userQuota, deriveRemaining: false, resetAt });
   }
   if (usage.addOnQuota) {
-    buckets.push(
-      toBucket({ id: "add-on-quota", label: "Add-on Credits", quota: usage.addOnQuota, deriveRemaining: false }),
-    );
+    pushBucket({ id: "add-on-quota", label: "Add-on Credits", quota: usage.addOnQuota, deriveRemaining: false });
   }
   if (usage.orgResourcePackage) {
-    buckets.push(
-      toBucket({
-        id: "org-resource-package",
-        label: "Shared Add-on Credits",
-        quota: usage.orgResourcePackage,
-        deriveRemaining: true,
-      }),
-    );
+    pushBucket({
+      id: "org-resource-package",
+      label: "Shared Add-on Credits",
+      quota: usage.orgResourcePackage,
+      deriveRemaining: true,
+    });
   }
   for (const [index, quota] of usage.dedicatedResourcePackages.entries()) {
-    buckets.push(
-      toBucket({
-        id: `dedicated-resource-package-${index}`,
-        label: "Dedicated Credits",
-        quota,
-        deriveRemaining: false,
-      }),
-    );
+    pushBucket({
+      id: `dedicated-resource-package-${index}`,
+      label: "Dedicated Credits",
+      quota,
+      deriveRemaining: false,
+    });
   }
+  const totalPercent = hasLimit && limitSum > 0 ? usedSum / limitSum : undefined;
+  const totalPercentDisplay = totalPercent !== undefined ? `${Math.round(totalPercent * 100)}%` : undefined;
+  const totalFraction = totalPercent !== undefined ? Math.min(1, Math.max(0, totalPercent)) : undefined;
+  const totalCreditsBucket: QoderUsageBucket | undefined =
+    buckets.length > 0
+      ? {
+          id: "total-credits",
+          label: "Total Credits",
+          usedDisplay: formatNumber(usedSum),
+          limitDisplay: hasLimit ? formatNumber(limitSum) : undefined,
+          remainingDisplay: hasRemaining ? formatNumber(remainingSum) : undefined,
+          usedPercentDisplay: totalPercentDisplay,
+          usedFraction: totalFraction,
+        }
+      : undefined;
+  const totalCostBucket: QoderUsageBucket | undefined =
+    buckets.length > 0
+      ? {
+          id: "total-cost",
+          label: "Total Cost (USD)",
+          usedDisplay: formatUsd(usedSum),
+          limitDisplay: hasLimit ? formatUsd(limitSum) : undefined,
+          // The remaining figure on this USD row is itself USD (owner's
+          // prototype: "Remaining $159.69" lives on the cost row).
+          remainingDisplay: hasRemaining ? formatUsd(remainingSum) : undefined,
+          usedPercentDisplay: totalPercentDisplay,
+          usedFraction: totalFraction,
+        }
+      : undefined;
 
   const planQuota = usage.userQuota;
   const summary =
@@ -243,6 +304,8 @@ export async function fetchQoderUsageForMode(
     upgradeUrl: usage.upgradeUrl,
     userType: usage.userType,
     usageBuckets: buckets,
+    totalCreditsBucket,
+    totalCostBucket,
     raw: isRecord(payload) ? payload : undefined,
   };
 }

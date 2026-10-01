@@ -65,6 +65,16 @@ const PLAN_1500_PAYLOAD = {
   userQuota: { total: 2000, used: 500, remaining: 1500, percentage: 0.25, unit: "credits" },
 };
 
+// invented: the post-2026-migration shape the owner reported — the default/base
+// pool is gone and the shared add-on pool is zeroed; the account figures must
+// survive either pool vanishing or zeroing.
+const ADDON_ZERO_PAYLOAD = {
+  userType: "enterprise",
+  isQuotaExceeded: false,
+  expiresAt: 1793376000000,
+  orgResourcePackage: { used: 0, remaining: 14062, percentage: 0, unit: "credits", cap: 14062, available: true },
+};
+
 // invented: a quota bucket with no numeric amounts, pinning “no USD string is invented”.
 const NO_AMOUNTS_PAYLOAD = {
   userType: "personal",
@@ -346,9 +356,10 @@ describe("qoder-quota command (F4)", () => {
     expect(custom).not.toHaveBeenCalled();
     const text = String(notify.mock.calls[0]?.[0]);
     expect(text).toContain("[Qoder (Browser OAuth / PAT)] · teams");
-    expect(text).toContain(
-      "Plan Credits: 3,000 / 3,000 credits (used 100%) — Remaining 0 — $0.00 — Renews on Oct 19, 2026",
-    );
+    // spec C-7: the renewal sentence is account-level and rides the header line,
+    //   never a pool row (a pool-less account must still see it).
+    expect(text).toContain("[Qoder (Browser OAuth / PAT)] · teams — Renews on Oct 19, 2026");
+    expect(text).toContain("Plan Credits: 3,000 / 3,000 credits (used 100%) — Remaining 0 — $0.00");
     expect(text).toContain("Shared Add-on Credits: 7,177 / 23,000 credits (used 32%) — Remaining 15,823");
     expect(text).toContain("View details: https://qoder.com/account/usage?client=qoder");
     expect(notify.mock.calls[0]?.[1]).toBe("info");
@@ -502,7 +513,116 @@ describe("quota dollars at the shared basis (F2)", () => {
     expect(wide).toContain("Remaining 1,500");
     expect(wide).toContain("$20.00");
     const narrow = panel.render(80).join("\n");
-    expect(narrow).toContain("Remaining 1,500");
-    expect(narrow).not.toContain("$20.00");
+    // Scoped to the pool row: the original pin (T-11/AC-08) is about the POOL
+    // row clipping its USD before its credits. The account cost row now carries
+    // a Remaining-$ at every width by design, so a panel-wide substring assert
+    // would pin the wrong object.
+    const planRow = narrow.split("\n").find((line) => line.startsWith("Plan Credits")) ?? "";
+    expect(planRow).toContain("Remaining 1,500");
+    expect(planRow).not.toContain("$20.00");
+    const costRow = narrow.split("\n").find((line) => line.startsWith("Total Cost (USD)")) ?? "";
+    expect(costRow).toContain("Remaining $20.00");
+  });
+});
+
+describe("quota account rollup rows (C-1..C-6)", () => {
+  // spec C-1: fetchQoderUsageForMode(NON_ORG) -> totalCreditsBucket sums used /
+  //   limit / remaining over every pool (400 / 1,700 / 1,300, 24%); the cost row
+  //   carries the same rollup in USD ($5.33 spent / $22.66 granted / $17.33 left).
+  it("sums every credit source into the two rollup rows", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => payloadResponse(NON_ORG_PAYLOAD)),
+    );
+    const usage = await fetchQoderUsageForMode({ access: "fake", refresh: "", expires: 0 }, "global");
+    expect(usage.totalCreditsBucket?.usedDisplay).toBe("400");
+    expect(usage.totalCreditsBucket?.limitDisplay).toBe("1,700");
+    expect(usage.totalCreditsBucket?.remainingDisplay).toBe("1,300");
+    expect(usage.totalCreditsBucket?.usedPercentDisplay).toBe("24%");
+    expect(usage.totalCostBucket?.usedDisplay).toBe("$5.33");
+    expect(usage.totalCostBucket?.limitDisplay).toBe("$22.66");
+    expect(usage.totalCostBucket?.remainingDisplay).toBe("$17.33");
+  });
+
+  // spec C-2: the text report renders both rollup rows after the pool rows;
+  //   per-pool cost pieces are gone (cost lives only on the cost row).
+  it("renders both rollup rows in text output", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => payloadResponse(TEAM_PAYLOAD)),
+    );
+    const { ctx, notify } = buildCtx({ token: "fake-token" });
+    await handleQuotaCommand("", ctx);
+    const text = String(notify.mock.calls[0]?.[0]);
+    expect(text).toContain("Total Credits: 10,177 / 26,000 (used 39%) — Remaining 15,823");
+    expect(text).toContain("Total Cost (USD): $135.69 / $346.66 (used 39%) — Remaining $210.97");
+    expect(text).not.toContain("— Cost $");
+  });
+
+  // spec C-3: the invariant — a single-pool account still gets both rollup rows,
+  //   so the account figures never depend on how many pools the payload carries.
+  it("renders the rollup rows for a single-pool account", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => payloadResponse(PLAN_1500_PAYLOAD)),
+    );
+    const { ctx, notify } = buildCtx({ token: "fake-token" });
+    await handleQuotaCommand("", ctx);
+    const text = String(notify.mock.calls[0]?.[0]);
+    expect(text).toContain("Total Credits: 500 / 2,000 (used 25%) — Remaining 1,500");
+    expect(text).toContain("Total Cost (USD): $6.66 / $26.66 (used 25%) — Remaining $20.00");
+  });
+
+  // spec C-4: a zeroed add-on pool (the 2026 migration shape) keeps the account
+  //   figures right: $0.00 spent against the granted USD, remaining intact.
+  it("keeps the account figures correct when the add-on pool is zeroed", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => payloadResponse(ADDON_ZERO_PAYLOAD)),
+    );
+    const { ctx, notify } = buildCtx({ token: "fake-token" });
+    await handleQuotaCommand("", ctx);
+    const text = String(notify.mock.calls[0]?.[0]);
+    expect(text).toContain("Total Credits: 0 / 14,062 (used 0%) — Remaining 14,062");
+    expect(text).toContain("Total Cost (USD): $0.00 / $187.49 (used 0%) — Remaining $187.49");
+  });
+
+  // spec C-5: a pool with used but no limit degrades the rollup honestly — no
+  //   limit, percent or remaining is invented on either rollup row.
+  it("degrades the rollup rows for a pool without a limit", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => payloadResponse(NO_AMOUNTS_PAYLOAD)),
+    );
+    const { ctx, notify } = buildCtx({ token: "fake-token" });
+    await handleQuotaCommand("", ctx);
+    const text = String(notify.mock.calls[0]?.[0]);
+    expect(text).toContain("Total Credits: 10");
+    expect(text).toContain("Total Cost (USD): $0.13");
+    expect(text).not.toContain("Total Credits: 10 /");
+  });
+
+  // spec C-6: the panel renders the rollup rows through the same row renderer;
+  //   the amount column widens instead of clipping the summed figures.
+  it("renders unclipped rollup rows in the panel", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => payloadResponse(TEAM_PAYLOAD)),
+    );
+    let capture: PanelCapture | undefined;
+    const { ctx } = buildCtx({
+      token: "fake-token",
+      mode: "tui",
+      onPanel: (c) => {
+        capture = c;
+      },
+    });
+    await handleQuotaCommand("", ctx);
+    const text = requireCapture(capture).panel.render(120).join("\n");
+    expect(text).toContain("Total Credits");
+    expect(text).toContain("10,177 / 26,000");
+    expect(text).toContain("Total Cost (USD)");
+    expect(text).toContain("$135.69 / $346.66");
+    expect(text).toContain("Remaining $210.97");
   });
 });
