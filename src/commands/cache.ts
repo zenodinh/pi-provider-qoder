@@ -4,6 +4,7 @@
 
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { MODEL_PROMPT_CACHE } from "../catalog.js";
+import { debugLog } from "../debug.js";
 import {
   type LedgerScan,
   type LifetimeProfile,
@@ -57,6 +58,12 @@ export interface CacheHealth {
   survival: ModelSurvivalHealth[];
   profiles: ModelProfileHealth[];
   verdict: "ok" | "warn" | "inactive";
+}
+
+/** What both the text report and the TUI panel render. */
+export interface CachePanelData {
+  config: string;
+  health: CacheHealth;
 }
 
 // shape: none — one aggregation pass plus two threshold conditions.
@@ -131,11 +138,11 @@ export function assessCacheHealth(
   };
 }
 
-function shareText(value: number | undefined): string {
+export function shareText(value: number | undefined): string {
   return value === undefined ? "n/a" : value.toFixed(2);
 }
 
-function ageText(computedAt: string | undefined, now: number): string {
+export function ageText(computedAt: string | undefined, now: number): string {
   if (computedAt === undefined) return "age unknown";
   const ageMs = now - Date.parse(computedAt);
   if (!Number.isFinite(ageMs) || ageMs < 0) return "age unknown";
@@ -191,16 +198,46 @@ function budgetLabel(budget: Budget): string {
   return budget.kind === "off" ? "off (uncapped)" : `${budget.fraction}`;
 }
 
-/**
- * `/qoder-cache` — warming health from the always-on surfaces (session ledgers
- * plus the learned profile), with the live knob state in front of it. On
- * demand, never on the turn path.
- */
-export async function handleCacheCommand(_args: string, ctx: ExtensionCommandContext): Promise<void> {
+/** One scan + profile read + assessment; the panel's initial and refreshed data. */
+function collectCachePanelData(): CachePanelData {
   const gateOn = process.env.QODER_CACHE_WARM === "1";
   const budget = parseBudgetEnv(process.env.QODER_WARM_BUDGET);
   const scan = scanLedgers(CACHE_MONITOR_BUDGET_MS);
-  const health = assessCacheHealth(scan, readProfile(), Date.now());
-  const config = `config: gate ${gateOn ? "ON" : "OFF (QODER_CACHE_WARM=1 enables)"} · budget ${budgetLabel(budget)}`;
-  ctx.ui.notify(`${config}\n${renderCacheHealth(health)}`, health.verdict === "warn" ? "warning" : "info");
+  return {
+    config: `config: gate ${gateOn ? "ON" : "OFF"} · budget ${budgetLabel(budget)}`,
+    health: assessCacheHealth(scan, readProfile(), Date.now()),
+  };
+}
+
+/**
+ * `/qoder-cache` — warming health from the always-on surfaces (session ledgers
+ * plus the learned profile), with the live knob state in front of it. On
+ * demand, never on the turn path. In the TUI it opens a panel (like
+ * /qoder-quota and /qoder-context); every other mode prints the same report.
+ */
+export async function handleCacheCommand(_args: string, ctx: ExtensionCommandContext): Promise<void> {
+  const initial = collectCachePanelData();
+  if (ctx.mode === "tui") {
+    try {
+      const { showCachePanel } = await import("./cache-view.js");
+      await showCachePanel(ctx, {
+        ...initial,
+        refresh: async () => {
+          // Yield once so the panel paints its "refreshing…" state before the
+          // synchronous ledger scan runs.
+          await new Promise((resolve) => setTimeout(resolve, 0));
+          return collectCachePanelData();
+        },
+      });
+      return;
+    } catch (error) {
+      // The pi-tui virtual module is only guaranteed on TUI-capable hosts; a
+      // panel that cannot load must not swallow the report.
+      debugLog("qoder cache panel unavailable; falling back to text output", error);
+    }
+  }
+  ctx.ui.notify(
+    `${initial.config}\n${renderCacheHealth(initial.health)}`,
+    initial.health.verdict === "warn" ? "warning" : "info",
+  );
 }

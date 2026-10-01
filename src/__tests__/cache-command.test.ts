@@ -183,6 +183,40 @@ describe("/qoder-cache command", () => {
     rmSync(home, { recursive: true, force: true });
   });
 
+  it("opens the TUI panel instead of notifying when the host is in TUI mode", async () => {
+    const start = Date.UTC(2026, 9, 1, 0, 0, 0);
+    const home = homeWithSession([
+      JSON.stringify(assistantEntry(MODEL, start, { input: 1000, cacheRead: 9000, output: 100 })),
+      JSON.stringify(assistantEntry(MODEL, start + 200_000, { input: 1000, cacheRead: 9000, output: 100 })),
+      JSON.stringify(warmEntry(start + 300_000, { input: 159, cacheRead: 141_568, output: 4 }, 0, 2.8673033579999996)),
+    ]);
+    process.env.QODER_CACHE_WARM = "1";
+    const notify = vi.fn();
+    const theme = { fg: (_kind: string, text: string) => text, bold: (text: string) => text };
+    interface CapturedPanel {
+      render(width: number): string[];
+      handleInput(data: string): void;
+    }
+    let panel: CapturedPanel | undefined;
+    const custom = vi.fn((factory: (tui: unknown, theme: unknown, kb: unknown, done: unknown) => CapturedPanel) => {
+      panel = factory({ requestRender: () => {} }, theme, {}, () => {});
+      return Promise.resolve(undefined);
+    });
+    const ctx = { mode: "tui", ui: { notify, custom } } as never;
+
+    await handleCacheCommand("", ctx);
+
+    expect(custom).toHaveBeenCalledTimes(1);
+    expect(notify).not.toHaveBeenCalled();
+    const text = panel?.render(80).join("\n") ?? "";
+    expect(text).toContain("Qoder cache warming  OK");
+    expect(text).toContain("config: gate ON · budget 0.5");
+    expect(text).toContain("Refreshes");
+    expect(text).toContain("1 · $0.0382 spent");
+    expect(text).toContain("esc/q close · r rescan");
+    rmSync(home, { recursive: true, force: true });
+  });
+
   it("raises a warning when survival health degrades", async () => {
     const start = Date.UTC(2026, 9, 1, 0, 0, 0);
     const lines = [JSON.stringify(assistantEntry(MODEL, start, { input: 7000, cacheRead: 3000, output: 100 }))];
@@ -201,7 +235,7 @@ describe("/qoder-cache command", () => {
     const [message, kind] = notify.mock.calls[0] as [string, string];
     expect(kind).toBe("warning");
     expect(message).toContain("Qoder cache warming — WARN");
-    expect(message).toContain("config: gate OFF (QODER_CACHE_WARM=1 enables)");
+    expect(message).toContain("config: gate OFF");
     expect(message).toContain("probable misses 6");
     rmSync(home, { recursive: true, force: true });
   });

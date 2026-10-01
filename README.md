@@ -144,7 +144,7 @@ Repeat runs within 60 seconds are served from a cache; concurrent runs share a s
 
 ## Cache warming health
 
-`/qoder-cache` answers "is warming actually working?" from the data that is always on disk — the session ledger and the learned profile — so no debug flag is needed. It prints the live config plus three evidence sections:
+`/qoder-cache` answers "is warming actually working?" from the data that is always on disk — the session ledger and the learned profile — so no debug flag is needed. In the TUI it opens a panel (`esc`/`q` closes, `r` rescans); every other mode prints the same report. It shows the live config plus three evidence sections:
 
 - **Refreshes** — warm-refresh count, spend in USD (Qoder Credits ÷ 75, or the priced v2 total), the median cache-read share (a healthy refresh is a near-pure cache read; a low share means the replay re-wrote the prefix), and how many rows look like re-writes.
 - **Survival** — per model, the median cache-read share of real turns that follow a natural idle gap (warm refreshes excluded) and the count of probable misses. This is the signal that the cache survived the idle window warming was meant to bridge.
