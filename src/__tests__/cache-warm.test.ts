@@ -1,5 +1,6 @@
 import type { CacheWarmingDecisionEvent } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { assistantEntry, warmEntry } from "./session-fixtures.js";
 
 // Keep the extension's startup path offline and deterministic: a visible PAT
 // would make it attempt a login exchange against the network (same guard as
@@ -52,7 +53,26 @@ const stopDecision: CacheWarmingDecisionEvent = {
   continuationProbability: 0.15,
 };
 
-const qoderCtx = { model: { provider: "qoder" } };
+// The guarded handler reads the session branch, so the fixture ctx carries a
+// stub session manager. `Lite` resolves to an unmeasured upstream key, which
+// keeps the legacy force-warm outcome these pre-guard tests pinned.
+const qoderCtx = {
+  model: { provider: "qoder", id: "Lite" },
+  sessionManager: { getBranch: () => [] },
+};
+
+// invented: governed branch already at the cap — same math as warm-guard T-01
+// (anchor 1,607,144 prompt tokens on dfmodel -> protected ~$0.20, two $0.05
+// refreshes meet the 0.5 fraction).
+function governedCtxAtCap() {
+  const anchor = assistantEntry("DeepSeek-V4-Flash", 1_000_000, { input: 1_607_144, cacheRead: 0, output: 10 });
+  const refresh = (timestampMs: number) =>
+    warmEntry(timestampMs, { input: 1_607_144, cacheRead: 0, output: 4 }, 0, 3.75);
+  return {
+    model: { provider: "qoder", id: "DeepSeek-V4-Flash" },
+    sessionManager: { getBranch: () => [anchor, refresh(1_300_000), refresh(1_600_000)] },
+  };
+}
 
 describe("cache warming decision hook", () => {
   it("overrides pi's economics stop when QODER_CACHE_WARM=1", async () => {
@@ -82,5 +102,24 @@ describe("cache warming decision hook", () => {
     expect(handler, "extension did not register a cache_warming_decision handler").toBeDefined();
     expect(await handler?.(stopDecision, { model: { provider: "anthropic" } })).toBeUndefined();
     expect(await handler?.(stopDecision, { model: undefined })).toBeUndefined();
+  });
+
+  it("stops pi's warm at the cap on a governed model", async () => {
+    process.env.QODER_CACHE_WARM = "1";
+    const handler = (await loadHandlers()).get("cache_warming_decision");
+    expect(handler, "extension did not register a cache_warming_decision handler").toBeDefined();
+    expect(await handler?.({ ...stopDecision, action: "warm" }, governedCtxAtCap())).toEqual({ action: "stop" });
+  });
+
+  it("leaves gate-off decisions untouched, and ungoverned models on the legacy path", async () => {
+    delete process.env.QODER_CACHE_WARM;
+    const handler = (await loadHandlers()).get("cache_warming_decision");
+    expect(handler, "extension did not register a cache_warming_decision handler").toBeDefined();
+    const governed = governedCtxAtCap();
+    expect(await handler?.(stopDecision, governed)).toBeUndefined();
+    expect(await handler?.({ ...stopDecision, action: "warm" }, governed)).toBeUndefined();
+
+    process.env.QODER_CACHE_WARM = "1";
+    expect(await handler?.({ ...stopDecision, action: "stop" }, qoderCtx)).toEqual({ action: "warm" });
   });
 });

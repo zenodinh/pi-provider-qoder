@@ -14,6 +14,7 @@ import {
 } from "../catalog.js";
 import { debugLog } from "../debug.js";
 import { getPiAgentDir } from "../home.js";
+import { type LifetimeProfile, PROFILE_STALE_MS, readProfile } from "../lifetime.js";
 import { getQoderRegionConfig, QODER_MODES, type QoderMode } from "../region.js";
 
 /** pi's built-in fallbacks (settings-manager DEFAULT_COMPACTION_TOKEN_SETTINGS). */
@@ -269,6 +270,7 @@ export function listQoderModelLocations(): QoderModelLocation[] {
 export function renderContextReport(
   modelsJson: Record<string, unknown>,
   settingsJson: Record<string, unknown>,
+  profile: LifetimeProfile | undefined = readProfile(),
 ): string {
   const lines: string[] = [];
   for (const location of listQoderModelLocations()) {
@@ -280,7 +282,23 @@ export function renderContextReport(
     );
   }
   lines.push("", USAGE);
+  lines.push("", renderEstimates(profile));
   return lines.join("\n");
+}
+
+// shape: none — straight-line string assembly; one branch on profile presence.
+/** Learned lifetime/rate estimates with their evidence; an absent profile
+ *  renders an explicit unmeasured note, never invented numbers. */
+function renderEstimates(profile: LifetimeProfile | undefined): string {
+  const entries = profile === undefined ? [] : Object.entries(profile.models);
+  if (entries.length === 0) return "Cache estimates: unmeasured — no learned profile yet.";
+  const rows = entries.map(([modelId, estimate]) => {
+    const stale = Date.now() - Date.parse(estimate.computedAt) > PROFILE_STALE_MS ? " (stale)" : "";
+    const fit = estimate.rateFit;
+    const fitText = fit === undefined ? "" : ` · rate fit R² ${fit.rSquared.toFixed(3)} (${fit.samples} turns)`;
+    return `${modelId} · lifetime ${estimate.lifetimeSeconds} s (${estimate.samples} samples, computed ${estimate.computedAt})${stale}${fitText}`;
+  });
+  return ["Cache estimates (learned):", ...rows].join("\n");
 }
 
 /**

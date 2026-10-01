@@ -15,6 +15,7 @@ import {
   tokensToPercent,
 } from "../commands/context.js";
 import { getPiAgentDir } from "../home.js";
+import type { LifetimeProfile } from "../lifetime.js";
 
 const CACHE_PATH = join(getPiAgentDir(), "qoder-models-cache.json");
 
@@ -195,5 +196,37 @@ describe("renderContextReport", () => {
     expect(report).toContain(`${location.providerID}/Ultimate`);
     expect(report).toContain("window 1,000,000");
     expect(report).toContain("reserve 1.6% (16,384)");
+  });
+
+  it("appends learned estimates with their evidence, or an unmeasured note", () => {
+    // invented: a published profile drawn from the schema example in SA §5.5.
+    const profile: LifetimeProfile = {
+      version: 2,
+      updatedAt: "2026-10-01T00:00:00.000Z",
+      models: {
+        "DeepSeek-V4-Flash": {
+          lifetimeSeconds: 600,
+          samples: 30,
+          computedAt: "2026-09-30T12:00:00.000Z",
+          buckets: [{ upperSeconds: 600, medianRatio: 0.84, samples: 3 }],
+          rateFit: {
+            inputCreditsPerToken: 9.5238e-6,
+            cacheReadCreditsPerToken: 1.90476e-7,
+            outputCreditsPerToken: 3.80952e-5,
+            rSquared: 0.9982,
+            samples: 42,
+            fittedAt: "2026-09-30T12:00:00.000Z",
+          },
+        },
+      },
+    };
+    const published = renderContextReport({}, {}, profile);
+    expect(published).toContain("Cache estimates (learned):");
+    expect(published).toContain("DeepSeek-V4-Flash · lifetime 600 s (30 samples, computed 2026-09-30T12:00:00.000Z)");
+    expect(published).toContain("rate fit R² 0.998 (42 turns)");
+
+    const unmeasured = renderContextReport({}, {});
+    expect(unmeasured).toContain("unmeasured");
+    expect(unmeasured).not.toContain("lifetime 600");
   });
 });

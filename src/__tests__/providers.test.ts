@@ -1,5 +1,6 @@
 import type { OAuthCredentials } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { LedgerScan, LifetimeProfile } from "../lifetime.js";
 
 const patEnvNames = [
   "QODER_API_KEY",
@@ -170,5 +171,151 @@ describe("qoder-api registry", () => {
     expect(providers.get("qoder-cn")?.api).toBe("qoder-api");
     expect(typeof providers.get("qoder")?.streamSimple).toBe("function");
     expect(typeof providers.get("qoder-cn")?.streamSimple).toBe("function");
+  });
+});
+
+// invented: a scan shaped like the AC-05/AC-07 publishable cases — 30 natural
+// gaps (12/9/6/3 across the 30/120/300/600 buckets at ratio 0.9) and 30 turns
+// following one exact linear Credit form.
+function publishingScan(): LedgerScan {
+  const gaps = [];
+  for (const bucket of [
+    { count: 12, seconds: 20 },
+    { count: 9, seconds: 90 },
+    { count: 6, seconds: 200 },
+    { count: 3, seconds: 500 },
+  ]) {
+    for (let index = 0; index < bucket.count; index += 1) gaps.push({ seconds: bucket.seconds, ratio: 0.9 });
+  }
+  const turns = Array.from({ length: 30 }, (_, index) => {
+    const input = 1000 + (index % 5) * 313;
+    const cacheRead = 5000 + (index % 7) * 617;
+    const output = 100 + (index % 3) * 41;
+    return { input, cacheRead, output, credits: 1e-5 * input + 1e-6 * cacheRead + 3e-5 * output };
+  });
+  return { models: { "DeepSeek-V4-Flash": { gaps, turns } }, files: 1, exceededBudget: false };
+}
+
+// invented: published values for a hand-fitted model (dfmodel lifetime only)
+// and a learned-rate model outside the fitted table (qmodel_preview).
+function learnedProfile(): LifetimeProfile {
+  return {
+    version: 2,
+    updatedAt: "2026-10-01T00:00:00.000Z",
+    models: {
+      "DeepSeek-V4-Flash": { lifetimeSeconds: 600, samples: 30, computedAt: "2026-10-01T00:00:00.000Z", buckets: [] },
+      "Qwen3.8-Max": {
+        lifetimeSeconds: 900,
+        samples: 25,
+        computedAt: "2026-10-01T00:00:00.000Z",
+        buckets: [],
+        rateFit: {
+          inputCreditsPerToken: 1e-5,
+          cacheReadCreditsPerToken: 1e-6,
+          outputCreditsPerToken: 3e-5,
+          rSquared: 0.99,
+          samples: 30,
+          fittedAt: "2026-10-01T00:00:00.000Z",
+        },
+      },
+    },
+  };
+}
+
+describe("learned profile feed (AC-06)", () => {
+  it("stamps learned lifetimes and rates at registration with hand-fitted precedence", async () => {
+    for (const name of patEnvNames) delete process.env[name];
+    const providers = new Map<string, Record<string, unknown>>();
+    const pi = {
+      registerProvider(providerID: string, config: Record<string, unknown>) {
+        providers.set(providerID, config);
+      },
+      registerCommand: vi.fn(),
+      on: vi.fn(),
+    };
+
+    const { default: registerProviders } = await import("../index.js");
+    await registerProviders(pi as never, { profile: learnedProfile() });
+
+    const models = providers.get("qoder")?.models as Array<{
+      id: string;
+      promptCache?: { short?: number };
+      cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+    }>;
+    const flash = models.find((model) => model.id === "DeepSeek-V4-Flash");
+    expect(flash?.promptCache?.short).toBe(600);
+    // dfmodel keeps the hand-fitted measured rates even though a fit exists.
+    expect(flash?.cost).toEqual({ input: 0.126984, output: 0.507936, cacheRead: 0.00253968, cacheWrite: 0.126984 });
+
+    const qwen = models.find((model) => model.id === "Qwen3.8-Max");
+    expect(qwen?.promptCache?.short).toBe(900);
+    expect(qwen?.cost?.input).toBeCloseTo(10 / 75, 12);
+    expect(qwen?.cost?.cacheRead).toBeCloseTo(1 / 75, 12);
+    expect(qwen?.cost?.output).toBeCloseTo(30 / 75, 12);
+    expect(qwen?.cost?.cacheWrite).toBeCloseTo(10 / 75, 12);
+
+    const lite = models.find((model) => model.id === "Lite");
+    expect(lite?.promptCache?.short).toBe(300);
+  });
+
+  it("re-registers both providers after the learner publishes", async () => {
+    for (const name of patEnvNames) delete process.env[name];
+    const providers = new Map<string, Record<string, unknown>>();
+    const registerProvider = vi.fn((providerID: string, config: Record<string, unknown>) => {
+      providers.set(providerID, config);
+    });
+    const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    const pi = {
+      registerProvider,
+      unregisterProvider: vi.fn(),
+      registerCommand: vi.fn(),
+      on: vi.fn((name: string, handler: (event: unknown, ctx: unknown) => unknown) => {
+        handlers.set(name, handler);
+      }),
+    };
+
+    const scan = publishingScan();
+    const writeProfile = vi.fn();
+    const { default: registerProviders } = await import("../index.js");
+    await registerProviders(pi as never, { scanLedgers: () => scan, writeProfile });
+    expect(registerProvider).toHaveBeenCalledTimes(2);
+
+    const ctx = { modelRegistry: { getApiKeyForProvider: async () => undefined } };
+    await handlers.get("session_start")?.({}, ctx);
+
+    expect(registerProvider).toHaveBeenCalledTimes(4);
+    expect(writeProfile).toHaveBeenCalledTimes(1);
+    const reregistered = registerProvider.mock.calls[2][1].models as Array<{
+      id: string;
+      promptCache?: { short?: number };
+    }>;
+    expect(reregistered.find((model) => model.id === "DeepSeek-V4-Flash")?.promptCache?.short).toBe(600);
+  });
+
+  it("keeps the prior registration when the learner scan throws", async () => {
+    for (const name of patEnvNames) delete process.env[name];
+    const registerProvider = vi.fn();
+    const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    const pi = {
+      registerProvider,
+      unregisterProvider: vi.fn(),
+      registerCommand: vi.fn(),
+      on: vi.fn((name: string, handler: (event: unknown, ctx: unknown) => unknown) => {
+        handlers.set(name, handler);
+      }),
+    };
+    const writeProfile = vi.fn();
+    const { default: registerProviders } = await import("../index.js");
+    await registerProviders(pi as never, {
+      scanLedgers: () => {
+        throw new Error("scan boom");
+      },
+      writeProfile,
+    });
+
+    const ctx = { modelRegistry: { getApiKeyForProvider: async () => undefined } };
+    await expect(handlers.get("session_start")?.({}, ctx)).resolves.toBeUndefined();
+    expect(registerProvider).toHaveBeenCalledTimes(2);
+    expect(writeProfile).not.toHaveBeenCalled();
   });
 });

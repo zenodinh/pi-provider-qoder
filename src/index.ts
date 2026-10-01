@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import type { Api, OAuthCredentials } from "@earendil-works/pi-ai";
+import type { Api, ModelCost, OAuthCredentials } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-agent";
 import {
   autoLoginQoderFromEnvironment,
@@ -10,6 +10,7 @@ import {
 } from "./auth/oauth.js";
 import { fetchQoderUsageForMode } from "./auth/usage.js";
 import {
+  getCachedModelConfig,
   getCachedModels,
   isCacheStale,
   MODEL_PROMPT_CACHE,
@@ -21,8 +22,22 @@ import { handleContextCommand } from "./commands/context.js";
 import { handleQuotaCommand } from "./commands/quota.js";
 import { debugLog } from "./debug.js";
 import { getPiAgentDir } from "./home.js";
+import {
+  clampLifetimeSeconds,
+  LEARNER_BUDGET_MS,
+  type LedgerScan,
+  type LifetimeProfile,
+  learnProfile,
+  profileValuesChanged,
+  type RateFit,
+  readProfile,
+  scanLedgers,
+  writeProfile,
+} from "./lifetime.js";
+import { CREDITS_PER_USD, rateForUpstreamKey } from "./pricing.js";
 import { streamQoderRouter } from "./protocol/router.js";
 import { getQoderBaseUrl, getQoderRegionConfig, QODER_MODES, type QoderMode } from "./region.js";
+import { evaluateGuard, parseBudgetEnv } from "./warm-guard.js";
 
 // pi reads a `fetchUsage` hook off the oauth config at runtime, but it is not
 // part of the published ProviderConfig type. Extend it locally so the hook is
@@ -32,6 +47,18 @@ type QoderOAuth = NonNullable<ProviderConfig["oauth"]> & {
 };
 
 type QoderProviderModel = NonNullable<ProviderConfig["models"]>[number];
+
+/**
+ * Test seams for the extension factory. Production pi calls the factory with
+ * only the API; tests inject the learned profile and the learner's scan/write
+ * steps so no session file or network is touched.
+ */
+export interface QoderExtensionDeps {
+  /** Factory-time learned profile; each registration falls back to readProfile(). */
+  profile?: LifetimeProfile;
+  scanLedgers?: (budgetMs: number) => LedgerScan;
+  writeProfile?: (profile: LifetimeProfile) => void;
+}
 
 const QODER_API = "qoder-api" as Api;
 
@@ -50,18 +77,47 @@ async function registerQoderApi(): Promise<void> {
   }
 }
 
-function modelsForProvider(mode: QoderMode, providerID: string): QoderProviderModel[] {
+/** USD per 1M tokens from a learned Credits-per-token fit (cacheWrite mirrors input). */
+function costFromRateFit(fit: RateFit): ModelCost {
+  const perMillion = (creditsPerToken: number): number => (creditsPerToken * 1_000_000) / CREDITS_PER_USD;
+  return {
+    input: perMillion(fit.inputCreditsPerToken),
+    output: perMillion(fit.outputCreditsPerToken),
+    cacheRead: perMillion(fit.cacheReadCreditsPerToken),
+    cacheWrite: perMillion(fit.inputCreditsPerToken),
+  };
+}
+
+function modelsForProvider(
+  mode: QoderMode,
+  providerID: string,
+  profile: LifetimeProfile | undefined = readProfile(),
+): QoderProviderModel[] {
   const cached = getCachedModels(mode);
   const modelsToUse = cached.length > 0 ? cached : mode === "cn" ? staticCnModels : staticModels;
 
-  return modelsToUse.map((m) => ({
-    ...m,
-    provider: providerID,
-    baseUrl: getQoderBaseUrl(mode),
-    // A catalog parsed from disk may predate the declared lifetime; without it
-    // pi treats the cache as unknown and never warms.
-    promptCache: m.promptCache ?? MODEL_PROMPT_CACHE,
-  }));
+  return modelsToUse.map((m) => {
+    const learned = profile?.models[m.id];
+    const upstreamKey = m.upstreamKey ?? getCachedModelConfig(m.id, mode)?.key;
+    return {
+      ...m,
+      provider: providerID,
+      baseUrl: getQoderBaseUrl(mode),
+      // A catalog parsed from disk may predate the declared lifetime; without it
+      // pi treats the cache as unknown and never warms. A published learned
+      // lifetime overrides the declared one, clamped to its defensive bounds.
+      promptCache:
+        learned?.lifetimeSeconds !== undefined
+          ? { ...(m.promptCache ?? MODEL_PROMPT_CACHE), short: clampLifetimeSeconds(learned.lifetimeSeconds) }
+          : (m.promptCache ?? MODEL_PROMPT_CACHE),
+      // Learned rates price only models the hand-fitted table cannot: a fitted
+      // key already carries its measured rates, and overriding it would trade a
+      // measured form for a modeled one.
+      ...(learned?.rateFit !== undefined && rateForUpstreamKey(upstreamKey) === undefined
+        ? { cost: costFromRateFit(learned.rateFit) }
+        : {}),
+    };
+  });
 }
 
 function createQoderOAuth(mode: QoderMode): QoderOAuth {
@@ -80,12 +136,12 @@ function createQoderOAuth(mode: QoderMode): QoderOAuth {
   };
 }
 
-function registerQoderProvider(pi: ExtensionAPI, mode: QoderMode): void {
+function registerQoderProvider(pi: ExtensionAPI, mode: QoderMode, profile?: LifetimeProfile): void {
   const providerID = getQoderRegionConfig(mode).providerID;
   pi.registerProvider(providerID, {
     baseUrl: getQoderBaseUrl(mode),
     api: QODER_API,
-    models: modelsForProvider(mode, providerID),
+    models: modelsForProvider(mode, providerID, profile),
     oauth: createQoderOAuth(mode),
     streamSimple: streamQoderRouter,
   });
@@ -142,7 +198,7 @@ async function refreshQoderModelsCache(mode: QoderMode, accessToken?: string): P
   );
 }
 
-export default async function (pi: ExtensionAPI) {
+export default async function (pi: ExtensionAPI, deps: QoderExtensionDeps = {}) {
   await registerQoderApi();
 
   const legacy = detectLegacyPackage();
@@ -197,6 +253,23 @@ export default async function (pi: ExtensionAPI) {
         }
       }),
     );
+
+    // Learn per-model cache lifetimes and rates from the session ledgers, write
+    // them atomically, and feed them back through re-registration. Best-effort:
+    // a failed scan or write keeps the prior profile in force and never blocks
+    // startup (the extension must not die from an auxiliary failure).
+    try {
+      const prior = readProfile();
+      const scan = (deps.scanLedgers ?? scanLedgers)(LEARNER_BUDGET_MS);
+      const learned = learnProfile(scan, prior);
+      if (Object.keys(learned.models).length === 0) return;
+      (deps.writeProfile ?? writeProfile)(learned);
+      if (profileValuesChanged(prior, learned)) {
+        for (const mode of QODER_MODES) registerQoderProvider(pi, mode, learned);
+      }
+    } catch (error) {
+      debugLog("session_start cache-lifetime learning failed", error);
+    }
   });
 
   // Cache warming is inert for these models by default: pi prices them at $0
@@ -207,13 +280,30 @@ export default async function (pi: ExtensionAPI) {
   // idle re-bill it prevents. Warming still requires the model's declared
   // promptCache tier (catalog.ts) and pi's `cacheWarming: "idle"` setting, and
   // the override is scoped to this extension's two providers so it never
-  // spends another provider's tokens.
+  // spends another provider's tokens. With the gate on, the refresh budget is
+  // governed per opportunity: spend since the last real turn is compared in
+  // USD against a fraction of the protected miss, and models without a usable
+  // rate keep the legacy force-warm (warm-guard.ts).
   // shape: none — dispatch object does not apply: one env gate over pi's own decision.
   pi.on("cache_warming_decision", (event, ctx) => {
     if (process.env.QODER_CACHE_WARM !== "1") return undefined;
-    const provider = ctx.model?.provider;
-    if (provider !== "qoder" && provider !== "qoder-cn") return undefined;
-    return event.action === "stop" ? { action: "warm" } : undefined;
+    const model = ctx.model;
+    if (!model || (model.provider !== "qoder" && model.provider !== "qoder-cn")) return undefined;
+    const mode: QoderMode = model.provider === "qoder-cn" ? "cn" : "global";
+    const budget = parseBudgetEnv(process.env.QODER_WARM_BUDGET);
+    const verdict = evaluateGuard(event, {
+      entries: ctx.sessionManager.getBranch(),
+      modelId: model.id,
+      mode,
+      budget,
+    });
+    debugLog(
+      `cache warming verdict: action=${verdict.action} reason=${verdict.reason} rateSource=${verdict.rateSource} ` +
+        `spendUsd=${verdict.spendUsd.toFixed(6)} protectedUsd=${verdict.protectedUsd.toFixed(6)} ` +
+        `fraction=${budget.kind === "fraction" ? budget.fraction : "off"}`,
+    );
+    if (verdict.action === undefined || verdict.action === event.action) return undefined;
+    return { action: verdict.action };
   });
 
   pi.registerCommand("qoder-quota", {
@@ -226,5 +316,5 @@ export default async function (pi: ExtensionAPI) {
     handler: handleContextCommand,
   });
 
-  for (const mode of QODER_MODES) registerQoderProvider(pi, mode);
+  for (const mode of QODER_MODES) registerQoderProvider(pi, mode, deps.profile);
 }
