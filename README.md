@@ -205,7 +205,24 @@ Around these gates, the repo also relies on GitHub-side controls that live in se
 
 ## Releasing
 
-Bump the version (`npm version patch --no-git-tag-version`) and merge to `main`. The [Release workflow](https://github.com/zenodinh/pi-provider-qoder/blob/main/.github/workflows/release.yml) detects the version change, re-runs lint/types/tests, publishes to npm via Trusted Publishing (OIDC, with provenance), tags `v<version>`, and creates the GitHub Release with generated notes plus the packaged tarball. Merges that do not change the version are green no-ops. The first-ever npm publish is manual: npm requires the package to exist before a trusted publisher can be configured.
+Releases are **tag-triggered and owner-only**. Merging a pull request never publishes, whatever it contains: a version bump on `main` is inert until a `v*` tag is pushed, and the release job refuses any tag pushed by someone other than the owner. A tag ruleset restricting `v*` creation to admins is the second layer (Settings → Rules → Rulesets → new ruleset → target **tag**).
+
+```bash
+# 1. the version bump reaches main through an ordinary pull request
+npm version patch --no-git-tag-version        # 0.0.11 -> 0.0.12
+git commit -am "chore(release): 0.0.12"       # push, open the PR, merge as usual
+
+# 2. ship it whenever you decide, from the commit whose package.json matches
+git switch main && git pull
+git tag -a v0.0.12 -m "0.0.12"
+git push origin v0.0.12
+```
+
+The [Release workflow](https://github.com/zenodinh/pi-provider-qoder/blob/main/.github/workflows/release.yml) then refuses the tag unless `github.actor` is the owner **and** `v<package.json version>` equals the tag, asserts npm ≥ 11.5.1 (the Trusted Publishing floor; Node 26 ships 11.16.0, so nothing is installed over it), re-runs lint/types/tests, skips publishing if that version is already on npm, publishes with `--provenance` through Trusted Publishing (OIDC, no `NPM_TOKEN`), and creates the GitHub Release with generated notes plus the packaged tarball. Re-running a tag is safe — the npm check and `gh release view` make it idempotent.
+
+**Skipping versions is normal.** Bump straight to the number you want and tag that commit; every version in between then simply never exists on npm. pi does exactly this — 0.87.1 was published on 2026-09-22 and the next release was 0.99.0 on 2026-09-29, with nothing published in between.
+
+The first-ever npm publish is manual: npm requires the package to exist before a trusted publisher can be configured. The trusted publisher binds organization/user, repository, **workflow filename** and optional environment — not a branch or tag — so changing the trigger does not disturb provenance as long as the file stays `release.yml`.
 
 ## Credits
 

@@ -236,6 +236,19 @@ describe("manifest rules (package.json)", () => {
     expect(rules(findings, "warn")).toEqual(["MANIFEST-BASELINE-MISSING"]);
   });
 
+  it("advises on a root version bump and stays silent when the version is untouched", () => {
+    const manifest = (version: string) =>
+      JSON.stringify({ name: "@zenodinh/pi-provider-qoder", version, scripts: { test: "vitest run" } });
+
+    const bumped = scan("", { baseManifestText: manifest("0.0.11"), headManifestText: manifest("0.0.12") });
+    expect(rules(bumped, "warn")).toContain("MANIFEST-VERSION-BUMP");
+    // A bump is a release *intent*, not a dangerous construct: advise, never block.
+    expect(rules(bumped, "fail")).toEqual([]);
+    expect(bumped.find((finding) => finding.rule === "MANIFEST-VERSION-BUMP")?.detail).toContain("0.0.11 -> 0.0.12");
+
+    expect(scan("", { baseManifestText: manifest("0.0.11"), headManifestText: manifest("0.0.11") })).toEqual([]);
+  });
+
   it("skips the manifest rules when the head manifest is absent or unparsable", () => {
     expect(scan("", { baseManifestText: base, headManifestText: "not json at all" })).toEqual([]);
     expect(scan("", { baseManifestText: base })).toEqual([]);

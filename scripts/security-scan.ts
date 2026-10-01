@@ -306,6 +306,21 @@ export function scanManifest(baseText: string | undefined, headText: string | un
   const findings: Finding[] = [];
   const file = "package.json";
 
+  // Releases are tag-triggered, so a bump publishes nothing by itself: this
+  // advises rather than blocks. It tells the reviewer that the pull request
+  // intends a release, and that this number is the one the next `v*` tag must
+  // match (the release job refuses a tag that disagrees with it).
+  const baseVersion = readStringField(base, "version");
+  const headVersion = readStringField(head, "version");
+  if (baseVersion !== undefined && headVersion !== undefined && baseVersion !== headVersion) {
+    findings.push({
+      severity: "warn",
+      rule: "MANIFEST-VERSION-BUMP",
+      file,
+      detail: `root version ${baseVersion} -> ${headVersion}. Publishes nothing on its own; it records the version the next v* tag must match. Confirm the bump is intentional and semver-correct.`,
+    });
+  }
+
   const baseScripts = scriptsOf(base);
   const headScripts = scriptsOf(head);
   for (const [name, value] of Object.entries(headScripts)) {

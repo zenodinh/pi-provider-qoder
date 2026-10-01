@@ -1,16 +1,24 @@
 name: Release
 
+# Release intent is a tag, not a diff. Pushing `v*` is the only trigger, and the
+# tag ruleset restricts tag creation to repository admins — so merging a pull
+# request can never publish, no matter what it contains. A version bump on main
+# is inert on its own: it only records the version the next tag must match.
+# This also makes skipped versions normal. Bump 0.0.11 -> 0.99.0 in one pull
+# request, tag v0.99.0, and 0.0.12..0.98.x simply never exist — the same pattern
+# pi follows (npm shows 0.87.1 on 2026-09-22 then 0.99.0 on 2026-09-29, with
+# nothing published in between).
 on:
   push:
-    branches: [main]
+    tags: ["v*"]
 
-# Serialize releases so two quick merges cannot publish out of order.
+# Serialize re-runs of the same tag; never cancel a publish in flight.
 concurrency:
-  group: release-main
+  group: release-${{ github.ref_name }}
   cancel-in-progress: false
 
 permissions:
-  # Required to create the tag and the GitHub Release.
+  # Required to create the GitHub Release and upload its tarball asset.
   contents: write
   # Required for npm provenance (OIDC).
   id-token: write
@@ -24,91 +32,106 @@ jobs:
         # Pinned to a commit SHA: this job holds `id-token: write`, so a mutable
         # tag here is a path to minting an npm provenance token for a tampered
         # tarball. Dependabot (github-actions ecosystem) keeps the SHA current.
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout v4 (2026-07-16)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1 (2026-07-17)
         with:
-          # The version-diff baseline is github.event.before — needs real history.
+          # `gh release create --generate-notes` walks history between tags.
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # actions/setup-node v4 (2025-04-02)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # actions/setup-node v7.0.0 (2026-07-14)
         with:
-          node-version: 24
+          node-version: 26
           registry-url: https://registry.npmjs.org
 
-      # Runs first, so merges without a version bump skip every heavy step.
-      - name: Detect version change
-        id: detect
-        # Every value reaching the shell arrives through `env:`. Interpolating
-        # an expression straight into `run:` is a script-injection vector, and
-        # this job can publish to npm.
+      # Defence in depth behind the tag ruleset: even if tag creation is ever
+      # opened up to someone else, this job refuses to publish for any actor but
+      # the owner, and refuses a tag that disagrees with the version it would
+      # publish. Runs before any dependency is installed.
+      - name: Assert release authority
         env:
-          BEFORE: ${{ github.event.before }}
+          ACTOR: ${{ github.actor }}
+          REF: ${{ github.ref_name }}
+          RELEASE_OWNER: zenodinh
         run: |
-          NEW="$(node -p "require('./package.json').version")"
-          OLD=""
-          if [ -n "$BEFORE" ] && git cat-file -e "$BEFORE:package.json" 2>/dev/null; then
-            OLD="$(git show "$BEFORE:package.json" | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).version")"
+          set -euo pipefail
+          if [ "$ACTOR" != "$RELEASE_OWNER" ]; then
+            echo "::error::Release refused: '$ACTOR' pushed $REF; only '$RELEASE_OWNER' may publish."
+            exit 1
           fi
-          if [ "$OLD" != "$NEW" ]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "version=$NEW" >> "$GITHUB_OUTPUT"
-            echo "Version change: ${OLD:-<none>} -> $NEW"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "No version change ($NEW) — skipping release."
+          case "$REF" in
+            v*) ;;
+            *) echo "::error::Release refused: '$REF' is not a v* tag."; exit 1 ;;
+          esac
+          VERSION="$(node -p "require('./package.json').version")"
+          if [ "v$VERSION" != "$REF" ]; then
+            echo "::error::Release refused: tag '$REF' does not match package.json version '$VERSION'. Bump the version on main first, then tag that commit."
+            exit 1
           fi
+          echo "Authorized: $ACTOR publishing $REF"
 
-      - name: Is the version already on npm?
-        id: npmcheck
-        if: steps.detect.outputs.changed == 'true'
-        # The version string comes from package.json, i.e. from whoever last
-        # edited it — never interpolate it into the script body.
-        env:
-          VERSION: ${{ steps.detect.outputs.version }}
+      # Trusted Publishing (OIDC) requires npm >= 11.5.1. Node 26 ships 11.16.0,
+      # so assert the floor instead of installing over it: `npm install -g
+      # npm@latest` would pull whatever npm published most recently into the job
+      # that mints the provenance token.
+      - name: Assert npm supports Trusted Publishing
         run: |
+          set -euo pipefail
+          npm --version | node -e '
+            let input = "";
+            process.stdin.on("data", (chunk) => { input += chunk; }).on("close", () => {
+              const version = input.trim();
+              const [major, minor] = version.split(".").map(Number);
+              if (!Number.isInteger(major) || !Number.isInteger(minor)) {
+                console.error(`unparseable npm version "${version}"`);
+                process.exit(1);
+              }
+              if (major < 11 || (major === 11 && minor < 5)) {
+                console.error(`npm ${version} is below the 11.5.1 Trusted Publishing floor`);
+                process.exit(1);
+              }
+              console.log(`npm ${version} meets the >= 11.5.1 Trusted Publishing floor`);
+            });'
+
+      # Idempotence: re-running a tag after a partial failure must not attempt a
+      # second publish of the same version.
+      - name: Is this version already on npm?
+        id: npmcheck
+        env:
+          REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${REF#v}"
           if npm view "@zenodinh/pi-provider-qoder@$VERSION" version >/dev/null 2>&1; then
             echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "$VERSION is already on npm — publish will be skipped."
           else
             echo "published=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # Trusted Publishing (OIDC) requires npm >= 11.5.1. Pinned to a major
-      # instead of `latest`, which would pull whatever npm published most
-      # recently into the job that mints the provenance token. One inline retry:
-      # registry reads from runners occasionally ECONNRESET.
-      - name: Upgrade npm
-        if: steps.detect.outputs.changed == 'true'
-        run: npm install -g npm@11 || npm install -g npm@11
-
       - name: Install dependencies
-        if: steps.detect.outputs.changed == 'true'
         run: npm ci
 
       - name: Lint
-        if: steps.detect.outputs.changed == 'true'
         run: npm run lint
 
       - name: Type check
-        if: steps.detect.outputs.changed == 'true'
         run: npm run check
 
       - name: Test
-        if: steps.detect.outputs.changed == 'true'
         run: npm test
 
       # Publishes via Trusted Publishing (OIDC) — no NPM_TOKEN needed.
       # npm publish runs prepublishOnly (type check) again as a safety net.
       - name: Publish to npm
-        if: steps.detect.outputs.changed == 'true' && steps.npmcheck.outputs.published == 'false'
+        if: steps.npmcheck.outputs.published == 'false'
         run: npm publish --provenance --access public
 
       - name: Pack and create the GitHub Release
-        if: steps.detect.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.detect.outputs.version }}
+          REF: ${{ github.ref_name }}
         run: |
-          V="$VERSION"
+          set -euo pipefail
           npm pack
-          gh release view "v$V" >/dev/null 2>&1 || gh release create "v$V" --generate-notes --title "v$V"
-          gh release upload "v$V" ./*.tgz --clobber
+          gh release view "$REF" >/dev/null 2>&1 || gh release create "$REF" --generate-notes --title "$REF"
+          gh release upload "$REF" ./*.tgz --clobber

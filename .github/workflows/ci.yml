@@ -18,7 +18,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  NODE_VERSION: "24"
+  # Node 26 is the Current line (26.10.0, 2026-09-21); LTS is 24 "Krypton".
+  # Pinned to Current on purpose — the suite, both CI scanners and the release
+  # job are all verified on 26.10.0. Move to 24 if a Current-line break ever
+  # costs more than the newer runtime is worth.
+  NODE_VERSION: "26"
 
 jobs:
   # Runs the project's own dependency tree, so by definition it executes code
@@ -40,13 +44,13 @@ jobs:
         # Pinned to a commit SHA: a mutable tag on a third-party action is a
         # supply-chain hole. Dependabot (github-actions ecosystem) keeps these
         # current.
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout v4 (2026-07-16)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1 (2026-07-17)
         with:
           # Both gates diff against the merge base, so real history is needed.
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # actions/setup-node v4 (2025-04-02)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # actions/setup-node v7.0.0 (2026-07-14)
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -117,16 +121,16 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout v4 (2026-07-16)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1 (2026-07-17)
         with:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # actions/setup-node v4 (2025-04-02)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # actions/setup-node v7.0.0 (2026-07-14)
         with:
           # No `cache: npm` on purpose: this job must not resolve or install
           # anything. Node runs the TypeScript scanner directly, with no flag and
-          # no tsx — verified on Node 24 (what CI pins) and Node 26, including
+          # no tsx — verified on Node 26 (what CI pins) and Node 24, including
           # native resolution of the `.ts` import specifiers.
           node-version: ${{ env.NODE_VERSION }}
 
