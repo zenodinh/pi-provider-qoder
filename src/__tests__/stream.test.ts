@@ -1179,3 +1179,64 @@ describe("streamQoder", () => {
     expect(done.message.stopReason).toBe("toolUse");
   });
 });
+
+/**
+ * FS-6 T-03 — legacy's text_end is purely additive.
+ *
+ * The fixture carries text, thinking and a tool call, so every block type the
+ * legacy parser owns is in one sequence. The assertions are the pre-change
+ * outcomes (final content, block order, stop reason) plus the new event's
+ * presence, payload and boundary. Nothing here counts events: legacy coalesces
+ * text_delta by design, so a count could only be wrong.
+ */
+describe("streamQoder closes text blocks additively (FS-6)", () => {
+  const originalFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it("T-03 keeps the message content and block order while adding text_end", async () => {
+    const sse =
+      sseEnvelope(chunk({ content: "before <thinking>reason</thinking> after" })) +
+      sseEnvelope(chunk({ tool_calls: [{ index: 0, id: "call_1", function: { name: "lookup", arguments: "{}" } }] })) +
+      sseEnvelope(finishChunk("tool_calls")) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+    const done = events.find((event) => event.type === "done") as { message: AssistantMessage };
+
+    // The pre-change outcome: same content, same block order, same tool call.
+    expect(done.message.content).toEqual([
+      { type: "text", text: "before " },
+      { type: "thinking", thinking: "reason" },
+      { type: "text", text: " after" },
+      { type: "toolCall", id: "call_1", name: "lookup", arguments: {} },
+    ]);
+    expect(done.message.stopReason).toBe("toolUse");
+
+    // The addition: one text_end per closed block, each carrying the block's
+    // full text at the index its text_start opened.
+    const textEnds = events.filter(
+      (event): event is Extract<AssistantMessageEvent, { type: "text_end" }> => event.type === "text_end",
+    );
+    expect(textEnds.map((event) => event.contentIndex)).toEqual([0, 2]);
+    for (const end of textEnds) {
+      const streamed = events
+        .filter(
+          (event): event is Extract<AssistantMessageEvent, { type: "text_delta" }> =>
+            event.type === "text_delta" && event.contentIndex === end.contentIndex,
+        )
+        .reduce((acc, event) => acc + event.delta, "");
+      expect(end.content).toBe(streamed);
+    }
+    expect(textEnds.at(-1)?.content).toBe(" after");
+
+    // Ordering boundary: the closing event follows its last delta and precedes
+    // the terminal. indexOf, not a fixed position.
+    const sequence = events.map((event) => event.type);
+    const lastEnd = sequence.lastIndexOf("text_end");
+    expect(sequence.lastIndexOf("text_delta", lastEnd)).toBeLessThan(lastEnd);
+    expect(lastEnd).toBeLessThan(sequence.indexOf("done"));
+  });
+});
