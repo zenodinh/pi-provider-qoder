@@ -133,7 +133,23 @@ The streamed response is normalized into pi thinking blocks regardless of how th
 
 The custom stream supports pi's `onPayload` (before encoding/signing), `onResponse` (before reading the body, including HTTP errors), injected `fetch` (chat and identity lookup), `headers`, `env`, `timeoutMs`, `temperature`, and model/request `maxTokens`. Header overrides are case-insensitive; `null` removes a default. Overriding COSY authentication headers can invalidate signatures. A model `baseUrl` override must point to a Qoder-compatible gateway, not a generic OpenAI endpoint.
 
-Chat POST requests are not automatically retried, even when `maxRetries` is supplied: replaying a generation may duplicate billing. The host can decide when to retry. Transport remains SSE.
+### Retry behavior
+
+This provider never retries a chat POST inside its own `fetch` layer. `src/retry.ts` retries non-billable requests only — `fetchWithRetry` forces a single attempt for every non-GET method — so that layer never replays a POST. That GET-only policy is unchanged. Transport remains SSE. (The one repo-side re-dispatch is the opt-in `QODER_FALLBACK` self-heal, which fires only when the v2 model-server rejects a model key before a generation starts.)
+
+Two retry layers sit above it, and they differ:
+
+- **Agent-level retry (pi; both protocols).** pi's agent loop retries a failed assistant turn by matching the rendered error text against `isRetryableAssistantError`. It is armed by default in pi (`settings.retry.enabled`), covers both the legacy COSY transport and v2, and re-dispatches the turn with bounded exponential backoff. This provider writes its error text to match that classifier, so a stream that ends without a terminal response event is retried where it previously was not.
+- **Provider-level HTTP retry (pi-ai; v2's model-server calls).** pi-ai can retry the HTTP request itself, but it is disarmed unless you set `settings.retry.provider.maxRetries`. Arming it silently retries v2's billable chat POSTs, which can duplicate billing and spend — it changes spend with no code change and no test. This is the tripwire: leave it unset unless you have measured the cost. The owner's settings leave it unset.
+
+### Re-check after upgrading pi
+
+The retry classifier and the compat facade are host-owned prose and symbols this provider does not control, so a pi upgrade is a contract review, not just a version bump. Re-check:
+
+- the **host seam module** — the single place the two pi-compat symbols (`openAICompletionsApi`, `registerApiProvider`) are acquired, and where a renamed or deleted facade becomes a named error instead of a silent break;
+- the **parity suite** (`src/__tests__/wire-vocabulary.test.ts`, `src/__tests__/error-vocabulary.test.ts`) — body, header and event vocabularies plus every rendered error text;
+- the **retry patterns** in `@earendil-works/pi-ai/utils/retry` — an upstream edit to that alternation silently changes which failures this provider retries, and the executed verdict table in `src/__tests__/error-vocabulary.test.ts` is where the change shows;
+- the **history-repair dependency** (`src/protocol/transform.ts`) — errored and aborted turns are dropped before dispatch by this repo, not by pi, and the cache-neutral retry rotation rests on it.
 
 ## Usage reporting
 
