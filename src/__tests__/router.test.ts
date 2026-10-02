@@ -1,7 +1,7 @@
 import { type Api, type Model, normalizeContext, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cacheQoderIdentityForTest, clearQoderAuthMemCache } from "../auth/oauth.js";
-import { clearQoderModelsMemCache, staticModels } from "../catalog.js";
+import { clearQoderModelsMemCache, staticCnModels, staticModels } from "../catalog.js";
 import { resolveProtocol, streamQoderRouter } from "../protocol/router.js";
 import {
   clearQoderFallbackCache,
@@ -153,5 +153,52 @@ describe("streamQoderRouter", () => {
     await streamQoderRouter(modelNamed("Ultimate"), context, { apiKey: "fake", fetch }).result();
     expect(String(url)).toContain("agent_chat_generation");
     expect(isMarkedLegacyOnly("ultimate")).toBe(true);
+  });
+
+  /**
+   * T-14 / AC-07 — the combination nothing pinned before: QODER_PROTOCOL=v2
+   * forcing v2 in cn mode with no QODER_MODEL_SERVER_HOST. resolveProtocol
+   * honours the env override over the cn-legacy rule (router.ts:30-33), so the
+   * dispatch reaches streamQoderV2, whose v2BaseUrl returns "" for cn without an
+   * override (v2.ts:34-40) and whose allowlist guard rejects it with errorStream
+   * before any fetch (v2.ts:44-54, :258-260).
+   *
+   * This is the class PRD §8.2's outbound allowlist exists to stop: a request to
+   * an empty or non-Qoder host. FS-4 moves the mode derivation into TurnPlan and
+   * must keep this boundary terminal — the plan is computed after the guard, so a
+   * rejected host never triggers identity resolution.
+   */
+  it("terminates at the outbound allowlist with zero network when v2 is forced in cn mode", async () => {
+    vi.stubEnv("QODER_PROTOCOL", "v2");
+    // Explicit, even though setup.ts scrubs the QODER_* family: the combination
+    // under test is "forced v2 AND no host override", and naming the second half
+    // keeps the row honest if the scrub is ever narrowed.
+    delete process.env.QODER_MODEL_SERVER_HOST;
+
+    // A cn-provider model from the CN static seed, so getCachedModelConfig
+    // resolves in cn mode. This matters: were it unresolved, router.ts:52-56
+    // falls back to legacy BEFORE resolveProtocol is consulted, the allowlist is
+    // never reached, and the spy below would fire — so the row fails loudly
+    // rather than passing for the wrong reason.
+    const cnModel = staticCnModels.find((model) => model.id === "Qwen3.7-Plus");
+    if (!cnModel) throw new Error("fixture model missing from the cn static seed: Qwen3.7-Plus");
+    expect(cnModel.provider).toBe("qoder-cn");
+
+    // The spy throws if invoked, making an accidental dispatch a loud failure
+    // instead of a network attempt. Kept as the vi.fn type (not cast to
+    // `typeof globalThis.fetch` at declaration) so `.mock` stays readable.
+    const fetchSpy = vi.fn(async () => {
+      throw new Error("the allowlist guard must reject before any dispatch");
+    });
+    const fetch = fetchSpy as unknown as typeof globalThis.fetch;
+
+    const result = await streamQoderRouter(cnModel as Model<Api>, context, { apiKey: "fake", fetch }).result();
+
+    expect(result.stopReason).toBe("error");
+    // Exact instance: the rendered text names the allowlist and the empty host.
+    expect(result.errorMessage).toBe("Qoder v2 host rejected by the outbound allowlist: (empty)");
+    // Zero network, and therefore no request body built or serialized.
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(fetchSpy.mock.calls).toEqual([]);
   });
 });

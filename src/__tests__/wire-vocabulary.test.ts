@@ -1,7 +1,14 @@
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type Api, type Context, type Model, normalizeContext, type SimpleStreamOptions } from "@earendil-works/pi-ai";
+import {
+  type Api,
+  type AssistantMessageEventStream,
+  type Context,
+  type Model,
+  normalizeContext,
+  type SimpleStreamOptions,
+} from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cacheQoderIdentityForTest, clearQoderAuthMemCache } from "../auth/oauth.js";
 import { clearQoderModelsMemCache, staticModels } from "../catalog.js";
@@ -239,6 +246,86 @@ describe("v2 wire vocabulary (SA rows 1, 8, 9, 10)", () => {
   });
 });
 
+/**
+ * stream.ts:326-371 — the legacy body's 24 keys in the shipped order.
+ *
+ * COSY hashes whatever bytes it is handed, so a dropped, renamed or reordered
+ * key still signs cleanly and nothing downstream notices: the gateway either
+ * rejects the turn or silently mis-bills it. Order is part of the pin because
+ * the signature is computed over the serialized bytes.
+ */
+const LEGACY_BODY_KEYS = [
+  "request_id",
+  "request_set_id",
+  "chat_record_id",
+  "session_id",
+  "stream",
+  "chat_task",
+  "is_reply",
+  "is_retry",
+  "source",
+  "version",
+  "session_type",
+  "agent_id",
+  "task_id",
+  "code_language",
+  "chat_prompt",
+  "image_urls",
+  "aliyun_user_type",
+  "system",
+  "messages",
+  "tools",
+  "parameters",
+  "chat_context",
+  "model_config",
+  "business",
+];
+
+/**
+ * The 6 base names stream.ts:419-431 merges over the 19 names cosy.ts:183-203
+ * returns, sorted for comparison. The COSY names are load-bearing for the
+ * signature path; the base names are what the gateway's SSE contract expects.
+ * Values are deliberately NOT compared: X-Request-Id is a fresh uuid, Cosy-Date
+ * a timestamp and Authorization a signature, so all three differ per request.
+ */
+const LEGACY_HEADER_NAMES = [
+  // stream.ts:419-431
+  "Accept",
+  "Accept-Encoding",
+  "Cache-Control",
+  "Content-Type",
+  "X-Model-Key",
+  "X-Model-Source",
+  // cosy.ts:183-203
+  "Authorization",
+  "Cosy-Bodyhash",
+  "Cosy-Bodylength",
+  "Cosy-Clientip",
+  "Cosy-Clienttype",
+  "Cosy-Data-Policy",
+  "Cosy-Date",
+  "Cosy-Key",
+  "Cosy-Machineid",
+  "Cosy-Machineos",
+  "Cosy-Machinetoken",
+  "Cosy-Machinetype",
+  "Cosy-Organization-Id",
+  "Cosy-Organization-Tags",
+  "Cosy-Sigpath",
+  "Cosy-User",
+  "Cosy-Version",
+  "Login-Version",
+  "X-Request-Id",
+].sort();
+
+/** The affinity trio v2 sends and legacy does not (AC-08's negative pin). */
+const AFFINITY_HEADER_NAMES = ["session_id", "x-client-request-id", "x-session-affinity"];
+
+/** True for the plain record mergeQoderHeaders returns, false for the other HeadersInit arms. */
+function isPlainHeaderRecord(value: HeadersInit): value is Record<string, string> {
+  return !Array.isArray(value) && !(value instanceof Headers);
+}
+
 describe("legacy parameters vocabulary (SA rows 2, 8)", () => {
   /** The legacy body is signed after onPayload, so capture pre-signing. */
   async function runLegacy(options: SimpleStreamOptions) {
@@ -256,6 +343,42 @@ describe("legacy parameters vocabulary (SA rows 2, 8)", () => {
     expect(result.stopReason).toBe("stop");
     if (!captured) throw new Error("expected the legacy onPayload to receive the request body");
     return captured;
+  }
+
+  /**
+   * Capture the pre-signing body AND the RequestInit the transport receives.
+   *
+   * Headers are read off the RequestInit, not off the COSY signer's return
+   * value: the subject is the merged set the gateway actually sees, which is
+   * mergeQoderHeaders' output, not buildAuthHeaders'.
+   */
+  async function runLegacyCapture(options: SimpleStreamOptions) {
+    seedLegacyEffortKey();
+    let captured: Record<string, unknown> | undefined;
+    let init: RequestInit | undefined;
+    const fetch = vi.fn(async (_input: unknown, requestInit?: RequestInit) => {
+      init = requestInit;
+      return new Response(legacySuccess);
+    }) as typeof globalThis.fetch;
+    const result = await streamQoderRouter(modelNamed("DeepSeek-V4-Flash"), context, {
+      ...options,
+      onPayload: async (payload: unknown) => {
+        captured = payload as Record<string, unknown>;
+        return undefined;
+      },
+      fetch,
+    }).result();
+    expect(result.stopReason).toBe("stop");
+    if (!captured) throw new Error("expected the legacy onPayload to receive the request body");
+    // boundary: stream.ts:419 passes mergeQoderHeaders' plain Record straight
+    // through as RequestInit.headers. Anything else means the transport seam
+    // changed shape, and this row must fail loudly rather than assert over an
+    // empty header set and pass vacuously.
+    if (!init) throw new Error("expected the legacy transport to receive a RequestInit");
+    if (!init.headers || !isPlainHeaderRecord(init.headers)) {
+      throw new Error(`expected a plain header record, got: ${String(init.headers)}`);
+    }
+    return { body: captured, headers: init.headers };
   }
 
   it("keeps the system prompt and tool set and sends enable_thinking + reasoning_effort for an effort-based key", async () => {
@@ -279,6 +402,239 @@ describe("legacy parameters vocabulary (SA rows 2, 8)", () => {
     const parameters = body.parameters as Record<string, unknown>;
     expect(parameters.enable_thinking).toBe(false);
     expect("reasoning_effort" in parameters).toBe(false);
+  });
+
+  // T-02 / AC-01: the ordered 24-key body. Element-by-element, so a reorder is
+  // as red as a drop -- the COSY signature is over the serialized bytes.
+  it("sends exactly the 24 legacy body keys, request_id first and business last, in the shipped order", async () => {
+    const { body } = await runLegacyCapture({ apiKey: "fake", reasoning: "high" });
+    const keys = Object.keys(body);
+    expect(keys).toEqual(LEGACY_BODY_KEYS);
+    expect(keys).toHaveLength(24);
+    expect(keys[0]).toBe("request_id");
+    expect(keys.at(-1)).toBe("business");
+  });
+
+  // T-03 / AC-01: the merged 25-name header set.
+  it("merges the 6 base header names over the 19 COSY names into one 25-name set", async () => {
+    const { headers } = await runLegacyCapture({ apiKey: "fake", reasoning: "high" });
+    const names = Object.keys(headers);
+    expect([...names].sort()).toEqual(LEGACY_HEADER_NAMES);
+    expect(names).toHaveLength(25);
+    // mergeQoderHeaders is case-insensitive, so a set that lost that property
+    // would show two spellings of one name and 26 entries.
+    expect(new Set(names.map((name) => name.toLowerCase())).size).toBe(25);
+    // The non-deterministic values are present but not compared; pin only that
+    // they are non-empty, so a blanked signature is still caught.
+    expect(String(headers.Authorization).startsWith("Bearer COSY.")).toBe(true);
+    expect(String(headers["X-Request-Id"]).length).toBeGreaterThan(0);
+    expect(String(headers["Cosy-Date"]).length).toBeGreaterThan(0);
+  });
+
+  // T-04 / AC-08: the affinity gap, pinned as a negative so the CU-7 probe
+  // verdict flips this row deliberately instead of silently.
+  it("sends no prompt_cache_key field and none of the three affinity headers", async () => {
+    // sessionId is supplied on purpose: were affinity implemented, this is the
+    // value it would carry, so the negative is meaningful rather than trivial.
+    const { body, headers } = await runLegacyCapture({
+      apiKey: "fake",
+      reasoning: "high",
+      sessionId: "session-1",
+    });
+    expect("prompt_cache_key" in body).toBe(false);
+    const lower = new Set(Object.keys(headers).map((name) => name.toLowerCase()));
+    for (const name of AFFINITY_HEADER_NAMES) {
+      expect(lower.has(name), `legacy must not send the ${name} header`).toBe(false);
+    }
+  });
+});
+
+/**
+ * AC-02 — each protocol's emitted event-type vocabulary.
+ *
+ * Count-based assertions are deliberately absent. Legacy coalesces text_delta
+ * by design (stream.ts:139-158) and never closes text blocks, so comparing
+ * event COUNTS across protocols can only be wrong; the comparable dimension is
+ * which TYPES a protocol can emit. That is the dimension the migration promises
+ * to unify, and the one the host's block-closing path depends on.
+ *
+ * One stream cannot emit both terminals, so each protocol's vocabulary is the
+ * union of a rich success stream and an error stream -- measured, not assumed:
+ * legacy rich emits 10 types and its error stream adds `error` (11 total);
+ * v2 rich emits 11 including `text_end` and its error stream adds `error` (12).
+ */
+describe("event vocabulary parity (SA FR-5)", () => {
+  /** The 12 types pi-ai's AssistantMessageEvent union declares, in declaration order. */
+  const FULL_VOCABULARY = [
+    "start",
+    "text_start",
+    "text_delta",
+    "text_end",
+    "thinking_start",
+    "thinking_delta",
+    "thinking_end",
+    "toolcall_start",
+    "toolcall_delta",
+    "toolcall_end",
+    "done",
+    "error",
+  ];
+
+  /** Legacy emits 11 of the 12 today: no site in src/protocol pushes text_end. */
+  const LEGACY_VOCABULARY = FULL_VOCABULARY.filter((type) => type !== "text_end");
+
+  const deltaChunk = (delta: object) => ({ choices: [{ delta, index: 0 }], id: "probe", model: "auto" });
+  const finish = (reason: string) => ({
+    choices: [{ finish_reason: reason, index: 0 }],
+    id: "probe",
+    model: "auto",
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  });
+
+  async function collectTypes(stream: AssistantMessageEventStream): Promise<string[]> {
+    const sequence: string[] = [];
+    for await (const event of stream) {
+      sequence.push(event.type);
+      if (event.type === "done" || event.type === "error") break;
+    }
+    return sequence;
+  }
+
+  /** start before any update, exactly one terminal, and the terminal is last. */
+  function assertBoundaryContract(sequence: string[], label: string): void {
+    expect(sequence[0], `${label} must open with start`).toBe("start");
+    const terminals = sequence.filter((type) => type === "done" || type === "error");
+    expect(terminals, `${label} must terminate exactly once`).toHaveLength(1);
+    expect(sequence.at(-1), `${label} must end on its terminal`).toBe(terminals[0]);
+  }
+
+  const runLegacyStream = async (sse: string): Promise<string[]> => {
+    seedLegacyEffortKey();
+    const fetch = vi.fn(
+      async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+    ) as typeof globalThis.fetch;
+    return collectTypes(
+      streamQoderRouter(modelNamed("DeepSeek-V4-Flash"), context, { apiKey: "fake", fetch, reasoning: "high" }),
+    );
+  };
+
+  const runV2Stream = async (sse: string): Promise<string[]> => {
+    const fetch = vi.fn(
+      async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+    ) as typeof globalThis.fetch;
+    return collectTypes(
+      streamQoderRouter(modelNamed("Ultimate"), context, { apiKey: "fake", fetch, reasoning: "high" }),
+    );
+  };
+
+  /** Thinking, then text, then a tool call split across two deltas, then a terminal. */
+  const legacyRich =
+    envelope(deltaChunk({ reasoning_content: "<thinking>hmm</thinking>" })) +
+    envelope(deltaChunk({ content: "hello" })) +
+    envelope(deltaChunk({ tool_calls: [{ index: 0, id: "c1", function: { name: "read", arguments: '{"p":' } }] })) +
+    envelope(deltaChunk({ tool_calls: [{ index: 0, function: { arguments: '"x"}' } }] })) +
+    envelope(finish("tool_calls")) +
+    "data: [DONE]\n\n";
+
+  /** A text delta and then the body closes with no finish_reason and no sentinel. */
+  const legacyTruncated = envelope(deltaChunk({ content: "hello" }));
+
+  const v2Frame = (payload: object) => `data:${JSON.stringify({ id: "probe", model: "ultimate", ...payload })}`;
+  const v2Rich = [
+    v2Frame({ choices: [{ delta: { reasoning_content: "thinking hard" }, index: 0 }] }),
+    v2Frame({ choices: [{ delta: { content: "answer" }, index: 0 }] }),
+    v2Frame({
+      choices: [
+        {
+          delta: {
+            tool_calls: [{ index: 0, id: "c1", type: "function", function: { name: "read", arguments: '{"p":"x"}' } }],
+          },
+          index: 0,
+        },
+      ],
+    }),
+    v2Frame({
+      choices: [{ delta: {}, finish_reason: "tool_calls", index: 0 }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    }),
+    "data:[DONE]",
+  ].join("\n\n");
+
+  const v2Failed = `${v2Frame({ error: { message: "boom" } })}\n\ndata:[DONE]`;
+
+  // T-05 / AC-02
+  it("legacy emits 11 of the 12 event types, and text_end is not one of them", async () => {
+    const success = await runLegacyStream(legacyRich);
+    const failed = await runLegacyStream(legacyTruncated);
+    assertBoundaryContract(success, "legacy success");
+    assertBoundaryContract(failed, "legacy failure");
+
+    const emitted = new Set([...success, ...failed]);
+    expect([...emitted].sort()).toEqual([...LEGACY_VOCABULARY].sort());
+    expect(emitted.size).toBe(11);
+    // The absence FS-6 inverts, asserted by name so the inversion is a flipped
+    // expectation on this row rather than a silent set difference.
+    expect(emitted.has("text_end"), "legacy never closes a text block today").toBe(false);
+    // Sanity on the channels the fixture drives, without counting events.
+    for (const expected of [
+      "thinking_start",
+      "thinking_delta",
+      "thinking_end",
+      "text_start",
+      "text_delta",
+      "toolcall_start",
+      "toolcall_delta",
+      "toolcall_end",
+      "done",
+    ]) {
+      expect(emitted.has(expected), `legacy rich stream should emit ${expected}`).toBe(true);
+    }
+    expect(failed.at(-1)).toBe("error");
+  });
+
+  // T-06 / AC-02
+  it("v2 emits the full 12-type union, establishing the target legacy must reach", async () => {
+    const success = await runV2Stream(v2Rich);
+    const failed = await runV2Stream(v2Failed);
+    assertBoundaryContract(success, "v2 success");
+    assertBoundaryContract(failed, "v2 failure");
+
+    const emitted = new Set([...success, ...failed]);
+    expect([...emitted].sort()).toEqual([...FULL_VOCABULARY].sort());
+    expect(emitted.size).toBe(12);
+    // The one type v2 has and legacy does not -- the parity gap in one assertion.
+    expect(emitted.has("text_end"), "v2 closes its text block").toBe(true);
+    expect(failed.at(-1)).toBe("error");
+  });
+
+  it("puts the parity gap on exactly one type, so FS-6 has a single row to flip", async () => {
+    seedLegacyEffortKey();
+    const legacyFetch = vi.fn(
+      async () => new Response(legacyRich, { status: 200, headers: { "content-type": "text/event-stream" } }),
+    ) as typeof globalThis.fetch;
+    const v2Fetch = vi.fn(
+      async () => new Response(v2Rich, { status: 200, headers: { "content-type": "text/event-stream" } }),
+    ) as typeof globalThis.fetch;
+
+    const legacy = new Set(
+      await collectTypes(
+        streamQoderRouter(modelNamed("DeepSeek-V4-Flash"), context, {
+          apiKey: "fake",
+          fetch: legacyFetch,
+          reasoning: "high",
+        }),
+      ),
+    );
+    const v2 = new Set(
+      await collectTypes(
+        streamQoderRouter(modelNamed("Ultimate"), context, { apiKey: "fake", fetch: v2Fetch, reasoning: "high" }),
+      ),
+    );
+
+    const onlyV2 = [...v2].filter((type) => !legacy.has(type)).sort();
+    const onlyLegacy = [...legacy].filter((type) => !v2.has(type)).sort();
+    expect(onlyV2).toEqual(["text_end"]);
+    expect(onlyLegacy).toEqual([]);
   });
 });
 
