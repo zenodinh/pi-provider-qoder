@@ -174,19 +174,23 @@ export class ThinkingTagParser {
     this.buffer = "";
     // Remember the text block so the next content starts a fresh block after
     // whatever came out-of-band (an API thinking block or a tool call).
-    this.lastTextBlockIndex = this.textBlockIndex;
-    this.textBlockIndex = null;
+    this.closeText();
   }
 
   finalize(): void {
-    if (!this.buffer) return;
-    if (this.phase === "thinking" && this.thinkingBlockIndex !== null) {
-      this.emitThinking(this.buffer);
-      this.emitThinkingEnd();
-    } else {
-      this.emitText(this.buffer);
+    if (this.buffer) {
+      if (this.phase === "thinking" && this.thinkingBlockIndex !== null) {
+        this.emitThinking(this.buffer);
+        this.emitThinkingEnd();
+      } else {
+        this.emitText(this.buffer);
+      }
+      this.buffer = "";
     }
-    this.buffer = "";
+    // End of stream is final, unlike a boundary: close the open text block even
+    // when the buffer is already empty, which is the common case for an answer
+    // whose last chunk streamed out intact.
+    this.closeText();
   }
 
   /** Consume as much of `buffer` as the current phase allows. */
@@ -211,8 +215,7 @@ export class ThinkingTagParser {
           // emitted events: end text tracking so the thinking block gets its
           // own fresh index.
           if (this.sawThinkingBlock && this.textBlockIndex !== null) {
-            this.lastTextBlockIndex = this.textBlockIndex;
-            this.textBlockIndex = null;
+            this.closeText();
           }
           this.activeEndTag = tag.variant.close;
           this.phase = "thinking";
@@ -274,8 +277,7 @@ export class ThinkingTagParser {
     this.phase = "text";
     this.sawThinkingBlock = true;
     this.thinkingBlockIndex = null;
-    this.lastTextBlockIndex = this.textBlockIndex;
-    this.textBlockIndex = null;
+    this.closeText();
   }
 
   private emitThinkingEnd(): void {
@@ -284,6 +286,29 @@ export class ThinkingTagParser {
       type: "thinking_end",
       contentIndex: this.thinkingBlockIndex as number,
       content: block.thinking,
+      partial: this.output,
+    });
+  }
+
+  /**
+   * Close the open text block, if any: emit its `text_end` carrying the block's
+   * full accumulated text, then hand the index to `lastTextBlockIndex` so
+   * {@link getTextBlockIndex} keeps reporting the block that just closed and the
+   * next text starts a fresh block. Called at every point where `textBlockIndex`
+   * is dropped or the stream ends, so no site can forget it.
+   */
+  private closeText(): void {
+    if (this.textBlockIndex !== null) this.emitTextEnd();
+    this.lastTextBlockIndex = this.textBlockIndex;
+    this.textBlockIndex = null;
+  }
+
+  private emitTextEnd(): void {
+    const block = this.output.content[this.textBlockIndex as number] as TextContent;
+    this.emitEvent({
+      type: "text_end",
+      contentIndex: this.textBlockIndex as number,
+      content: block.text,
       partial: this.output,
     });
   }
