@@ -1547,3 +1547,130 @@ describe("plan seam on the legacy transport", () => {
     );
   });
 });
+
+/**
+ * The shared stamp tail on the legacy transport (spec qoder-stamp-tail CU-02,
+ * T-04/T-05).
+ *
+ * AC-01's kill evidence lives here: cost is written at the assembly site inside
+ * the read loop, so the post-loop toolcall_end frame and every preceding frame
+ * are serialized to `--json` already priced. Moving that write into the tail
+ * would freeze cost zeros into stdout for every tool-use turn — the in-memory
+ * message self-corrects (the frames share the usage object), stdout does not.
+ */
+describe("stamp tail on the legacy transport", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.unstubAllEnvs();
+  });
+
+  /** A tool-use turn whose usage chunk arrives BEFORE the tool deltas. */
+  const toolTurnSse =
+    sseEnvelope(chunk({ content: "working", role: "assistant" })) +
+    sseEnvelope(
+      chunk(
+        {},
+        {
+          usage: {
+            prompt_tokens: 250_000,
+            completion_tokens: 1_000,
+            total_tokens: 251_000,
+            credits: 100.0,
+          },
+        },
+      ),
+    ) +
+    sseEnvelope(
+      chunk({ tool_calls: [{ index: 0, id: "call_1", function: { name: "bash", arguments: '{"command":"ls"}' } }] }),
+    ) +
+    sseEnvelope(finishChunk("tool_calls")) +
+    DONE_SSE;
+
+  async function toolTurnEvents(gate: string): Promise<AssistantMessageEvent[]> {
+    vi.stubEnv("QODER_CORE_STAMP", gate);
+    globalThis.fetch = mockFetch(toolTurnSse);
+    return consume(streamQoder(makeModel("qoder", "DeepSeek-V4-Flash"), makeContext(), { apiKey: "fake" }));
+  }
+
+  /** The tool turn up to (and including) its finish chunk, without the sentinel. */
+  const toolTurnPrefix = toolTurnSse.slice(0, toolTurnSse.length - DONE_SSE.length);
+
+  it("T-04 a tool-use turn's pre-terminal frames carry the priced usage on both gate settings", async () => {
+    for (const gate of ["", "1"]) {
+      const label = `gate=${gate || "(off)"}`;
+      vi.stubEnv("QODER_CORE_STAMP", gate);
+      let controller!: ReadableStreamDefaultController<Uint8Array>;
+      const body = new ReadableStream<Uint8Array>({
+        start(c) {
+          controller = c;
+        },
+      });
+      globalThis.fetch = vi.fn(
+        async () => new Response(body, { headers: { "content-type": "text/event-stream" } }),
+      ) as unknown as typeof fetch;
+
+      const events: AssistantMessageEvent[] = [];
+      const task = (async () => {
+        for await (const event of streamQoder(makeModel("qoder", "DeepSeek-V4-Flash"), makeContext(), {
+          apiKey: "fake",
+        })) {
+          events.push(event);
+        }
+      })();
+      const encoder = new TextEncoder();
+      // Everything except the sentinel, so the body stays open and no terminal
+      // exists yet. Only in this window can a terminal-only cost write be
+      // distinguished from the in-loop one — after the terminal the shared
+      // usage object self-corrects in memory.
+      controller.enqueue(encoder.encode(toolTurnPrefix));
+      for (let i = 0; i < 10; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+
+      const openFrames = events.filter((event) => event.type !== "done" && event.type !== "error");
+      expect(openFrames.length, `${label} expected pre-terminal frames while open`).toBeGreaterThan(0);
+      const priced = openFrames
+        .map((event) => (event as { partial: AssistantMessage }).partial.usage as StoredUsage)
+        .filter((usage) => usage.totalTokens > 0);
+      expect(priced.length, `${label} expected a priced pre-terminal frame`).toBeGreaterThan(0);
+      for (const usage of priced) {
+        expect(usage.cost.total, `${label} pre-terminal frame`).toBeCloseTo(1.3333333, 6);
+        expect(usage.rateSource, `${label} pre-terminal frame`).toBe("credits");
+      }
+
+      // Close the turn: the post-loop toolcall_end and the terminal agree.
+      controller.enqueue(encoder.encode(DONE_SSE));
+      await task;
+      const done = events.find((event) => event.type === "done") as
+        | Extract<AssistantMessageEvent, { type: "done" }>
+        | undefined;
+      const toolEnd = events.find((event) => event.type === "toolcall_end") as
+        | Extract<AssistantMessageEvent, { type: "toolcall_end" }>
+        | undefined;
+      if (!toolEnd || !done) throw new Error(`${label} expected the post-loop toolcall_end and done frames`);
+      expect(toolEnd.partial.usage.cost.total).toBeCloseTo(1.3333333, 6);
+      expect((toolEnd.partial.usage as StoredUsage).rateSource).toBe("credits");
+      expect((done.message.usage as StoredUsage).rateSource).toBe("credits");
+    }
+  });
+
+  it("T-05 gate off is the pre-migration tail; gate on adds the wrapper without an observable change", async () => {
+    const off = await toolTurnEvents("");
+    const on = await toolTurnEvents("1");
+    expect(on.map((event) => event.type)).toEqual(off.map((event) => event.type));
+    const terminalOf = (events: AssistantMessageEvent[]) =>
+      (events.at(-1) as Extract<AssistantMessageEvent, { type: "done" }>).message.usage;
+    expect(terminalOf(on)).toEqual(terminalOf(off));
+
+    // The same plain fixture under both settings: the ordered event sequence is
+    // identical, so the gate is a real off-path, not a behavior fork.
+    vi.stubEnv("QODER_CORE_STAMP", "1");
+    globalThis.fetch = mockFetch(SUCCESS_SSE);
+    const wrapped = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+    expect(wrapped.at(-1)?.type).toBe("done");
+    vi.stubEnv("QODER_CORE_STAMP", "");
+    globalThis.fetch = mockFetch(SUCCESS_SSE);
+    const plain = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+    expect(plain.map((event) => event.type)).toEqual(wrapped.map((event) => event.type));
+  });
+});
