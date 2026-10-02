@@ -219,4 +219,29 @@ describe("withTerminalStamp", () => {
     expect(seen[0]).toBe(done.message);
     expect(done.message.endTurn).toBe(true);
   });
+
+  it("a throwing hook cannot unseat the terminal guarantee on either path", async () => {
+    const boom = (): void => {
+      throw new Error("hook exploded");
+    };
+    // Happy path: the successful done survives; the failed observer is inert.
+    const inner = createAssistantMessageEventStream();
+    const terminal = assistantMessage({ stopReason: "stop" });
+    inner.push({ type: "done", reason: "stop", message: terminal });
+    inner.end();
+    const happy = withTerminalStamp(inner, { onTerminal: boom });
+    const happyEvents = await consume(happy);
+    expect(happyEvents.map((event) => event.type)).toEqual(["done"]);
+    expect((await happy.result()).stopReason).toBe("stop");
+
+    // Failure path: the tail's own error terminal is still pushed before end,
+    // so result() settles instead of awaiting forever.
+    const failing = withTerminalStamp(
+      explodingStream({ type: "text_delta", contentIndex: 0, delta: "x", partial: assistantMessage() }),
+      { onTerminal: boom },
+    );
+    const failedEvents = await consume(failing);
+    expect(failedEvents.map((event) => event.type)).toEqual(["text_delta", "error"]);
+    expect((await failing.result()).stopReason).toBe("error");
+  });
 });

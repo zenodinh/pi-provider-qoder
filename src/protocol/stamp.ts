@@ -98,6 +98,16 @@ export function withTerminalStamp(
   const out = createAssistantMessageEventStream();
   let lastMessage: AssistantMessage | undefined;
   let ended = false;
+  // The stamp must never defeat the order it decorates: a throwing observer is
+  // logged and skipped, so it can neither drop a terminal (leaving result()
+  // pending) nor rewrite a settled turn's outcome.
+  const applyStamp = (event: AssistantMessageEvent): void => {
+    try {
+      stampTerminal(event, stamp);
+    } catch (error) {
+      debugLog(`provider.stamp tail: terminal stamp failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
   const pushFailure = (error: unknown): void => {
     if (ended) return;
     ended = true;
@@ -106,7 +116,7 @@ export function withTerminalStamp(
       message.stopReason = "error";
       message.errorMessage = error instanceof Error ? error.message : String(error);
       const failure: AssistantMessageEvent = { type: "error", reason: "error", error: message };
-      stampTerminal(failure, stamp);
+      applyStamp(failure);
       out.push(failure);
     } catch {}
   };
@@ -114,7 +124,7 @@ export function withTerminalStamp(
     for await (const event of inner) {
       const terminal = event.type === "done" || event.type === "error";
       lastMessage = terminal ? terminalMessage(event) : event.partial;
-      stampTerminal(event, stamp);
+      applyStamp(event);
       out.push(event);
       if (terminal) ended = true;
     }
