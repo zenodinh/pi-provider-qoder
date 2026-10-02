@@ -699,3 +699,99 @@ describe("plan seam on the v2 transport", () => {
     expect(metadata.context.source_session_id).toBe(long);
   });
 });
+
+/**
+ * The shared stamp tail on the v2 transport (spec qoder-stamp-tail CU-03,
+ * T-06/T-07).
+ *
+ * T-06 closes the asymmetry D5 decided: legacy never claims a rate source on an
+ * unpriced error row, and v2's old local stamp did. T-07 proves the self-heal
+ * still forwards legacy's own assembly stamps instead of overwriting them with
+ * v2's two-value lookup.
+ */
+describe("stamp tail on the v2 transport", () => {
+  function v2UsageSuccess(usage: Record<string, number>): string {
+    return [
+      `data: ${JSON.stringify({ id: "x", model: "dfmodel", choices: [{ delta: { content: "OK" }, index: 0 }] })}`,
+      `data: ${JSON.stringify({ id: "x", model: "dfmodel", choices: [{ delta: {}, finish_reason: "stop", index: 0 }], usage })}`,
+      "data: [DONE]",
+    ].join("\n\n");
+  }
+
+  function usageFetch(usage: Record<string, number>): typeof globalThis.fetch {
+    return vi.fn(
+      async () => new Response(v2UsageSuccess(usage), { headers: { "content-type": "text/event-stream" } }),
+    ) as unknown as typeof globalThis.fetch;
+  }
+
+  it("T-06 stamps no rateSource on an unpriced v2 error row and keeps pi-ai's cost on a priced done row", async () => {
+    // An event-stream that ends without a terminal chunk: pi-ai reports the
+    // failure with its zeroed usage, so nothing priced this row.
+    const unpriced = `data: ${JSON.stringify({
+      id: "x",
+      model: "ultimate",
+      choices: [{ delta: { content: "boom" }, index: 0 }],
+    })}\n\n`;
+    const failedFetch = vi.fn(
+      async () => new Response(unpriced, { headers: { "content-type": "text/event-stream" } }),
+    ) as unknown as typeof globalThis.fetch;
+    const failed = await streamQoderV2(
+      modelNamed("Ultimate"),
+      context,
+      { apiKey: "fake", fetch: failedFetch },
+      { mode: "global", modelConfig: { key: "ultimate" }, upstreamKey: "ultimate" },
+    ).result();
+    expect(failed.stopReason).toBe("error");
+    expect(failed.usage.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 });
+    expect("rateSource" in failed.usage).toBe(false);
+
+    // A priced turn keeps the two-value lookup's result and pi-ai's cost.
+    const priced = await streamQoderV2(
+      modelNamed("DeepSeek-V4-Flash"),
+      context,
+      {
+        apiKey: "fake",
+        fetch: usageFetch({ prompt_tokens: 100_000, completion_tokens: 1_000, total_tokens: 101_000 }),
+      },
+      { mode: "global", modelConfig: { key: "dfmodel" }, upstreamKey: "dfmodel" },
+    ).result();
+    expect(priced.stopReason).toBe("stop");
+    expect(priced.usage.cost.input).toBeCloseTo(0.0126984, 6);
+    expect(priced.usage.cost.output).toBeCloseTo(0.000507936, 6);
+    expect((priced.usage as AssistantMessage["usage"] & { rateSource?: string }).rateSource).toBe("rate-table");
+  });
+
+  it("T-07 the self-heal forwards legacy's assembly stamp instead of v2's lookup", async () => {
+    const legacyCredits = [
+      envelope({ choices: [{ delta: { content: "OK" } }] }),
+      envelope({
+        choices: [{ finish_reason: "stop", index: 0 }],
+        usage: { prompt_tokens: 1_000, completion_tokens: 100, total_tokens: 1_100, credits: 0.4 },
+      }),
+      "data: [DONE]",
+    ].join("\n\n");
+    const fetch = vi.fn(async (input: unknown) => {
+      if (String(input).includes("chat/completions")) {
+        return new Response(
+          JSON.stringify({ error: { type: "invalid_model_error", message: "model not supported" } }),
+          {
+            status: 400,
+            headers: { "content-type": "application/json" },
+          },
+        );
+      }
+      return new Response(legacyCredits, { headers: { "content-type": "text/event-stream" } });
+    }) as typeof globalThis.fetch;
+
+    const result = await streamQoderV2(
+      modelNamed("DeepSeek-V4-Flash"),
+      context,
+      { apiKey: "fake", fetch, env: { QODER_FALLBACK: "1" } } as SimpleStreamOptions,
+      { mode: "global", modelConfig: { key: "dfmodel" }, upstreamKey: "dfmodel" },
+    ).result();
+    expect(result.stopReason).toBe("stop");
+    // dfmodel's v2 lookup would say "rate-table"; legacy's assembly priced the
+    // Credits and wrote "credits". The forwarded value is legacy's, untouched.
+    expect((result.usage as AssistantMessage["usage"] & { rateSource?: string }).rateSource).toBe("credits");
+  });
+});

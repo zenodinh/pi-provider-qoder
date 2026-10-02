@@ -27,6 +27,7 @@ import { PROCESS_FALLBACK_SESSION_ID, planQoderTurn, qoderModeFor, type TurnPlan
 import { mergeQoderHeaders } from "./request.js";
 import { PROTOCOL } from "./routing.js";
 import { classifyTurnKind, resolveRunIdentity } from "./run-identity.js";
+import { withTerminalStamp } from "./stamp.js";
 import { stripThinkingTags, ThinkingTagParser } from "./thinking.js";
 import { ToolCallAccumulator } from "./tool-calls.js";
 import { contentToText, transformMessagesForQoder, transformTools } from "./transform.js";
@@ -110,6 +111,11 @@ export function streamQoder(
   let pendingDelta: QoderDeltaEvent | null = null;
   let lastDeltaFlushAt = Date.now();
   let deltaTimer: ReturnType<typeof setTimeout> | undefined;
+  // One gate read per request, resolved once rather than per chunk. Off means
+  // the returned stream is the closure's own — the pre-migration tail, whose
+  // rate source and cost are written at the assembly site inside the read loop.
+  // On wraps it in the shared ordered tail without changing an observable.
+  const stampTail = (options?.env?.QODER_CORE_STAMP ?? process.env.QODER_CORE_STAMP) === "1";
   const configuredDeltaInterval = Number(
     options?.env?.QODER_STREAM_DELTA_INTERVAL_MS ?? process.env.QODER_STREAM_DELTA_INTERVAL_MS,
   );
@@ -840,5 +846,7 @@ export function streamQoder(
     }
   })();
 
-  return stream;
+  // The gate wraps the closure's stream; it never moves the assembly write or
+  // the push order above. Off is the pre-migration tail.
+  return stampTail ? withTerminalStamp(stream, {}) : stream;
 }
