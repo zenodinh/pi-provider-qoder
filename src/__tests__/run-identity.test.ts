@@ -93,6 +93,20 @@ describe("isRunContinuation", () => {
     ];
     expect(isRunContinuation(messages)).toBe(false);
   });
+
+  it("is false for an empty or assistant-terminated tail, and when no assistant declared the open result", () => {
+    expect(isRunContinuation([])).toBe(false);
+    // Assistant-terminated: the tail is the assistant, not a tool result.
+    expect(isRunContinuation([user("do it"), assistantWithTools(["call-1"])])).toBe(false);
+    // An open tool result with no preceding assistant at all.
+    expect(isRunContinuation([toolResult("call-1")])).toBe(false);
+    // An assistant that declared no tool calls ends the walk as false.
+    expect(isRunContinuation([user("do it"), assistantWithTools([]), toolResult("call-1")])).toBe(false);
+    // A user message reached before the declaring assistant ends the walk as false.
+    expect(isRunContinuation([user("do it"), user("again"), toolResult("call-1")])).toBe(false);
+    // Any other role before the declaring assistant is skipped, not treated as a hit.
+    expect(isRunContinuation([{ role: "system", content: "prompt" }, toolResult("call-1")])).toBe(false);
+  });
 });
 
 /**
