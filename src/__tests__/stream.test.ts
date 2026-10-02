@@ -5,12 +5,16 @@ import type {
   AssistantMessageEventStream,
   Context,
   Model,
+  SimpleStreamOptions,
   ToolCall,
   TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { normalizeContext } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { staticModels } from "../catalog.js";
+import { clearQoderRunRegistry } from "../protocol/run-identity.js";
 import { streamQoder } from "../protocol/stream.js";
+import { streamQoderV2 } from "../protocol/v2.js";
 import { loadLiveFixture } from "./live-fixture.js";
 
 // Pin the identity so the mocked fetch below only ever serves the chat request.
@@ -1177,5 +1181,155 @@ describe("streamQoder", () => {
       { type: "toolCall", id: "native_1", name: "search", arguments: { q: "x" } },
     ]);
     expect(done.message.stopReason).toBe("toolUse");
+  });
+});
+
+/**
+ * Run identity on the wire (spec CU-05, T-08..T-10).
+ *
+ * The legacy body is COSY-encoded before it leaves, so it is captured
+ * pre-signing through onPayload — the same harness wire-vocabulary.test.ts uses.
+ */
+describe("run identity on the wire", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    clearQoderRunRegistry();
+    vi.restoreAllMocks();
+  });
+
+  function contextWith(messages: unknown[]): TranscriptContext {
+    return normalizeContext({ systemPrompt: "test", messages, tools: [] } as unknown as Context);
+  }
+
+  /** The raw pi shape the transform consumes for a completed tool round. */
+  function imageToolRound(): TranscriptContext {
+    return contextWith([
+      { role: "user", content: "read the screenshot" },
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "reading" },
+          { type: "toolCall", id: "call_1", name: "read_file", arguments: { path: "/tmp/shot.png" } },
+        ],
+      },
+      {
+        role: "toolResult",
+        toolCallId: "call_1",
+        content: [
+          { type: "text", text: "Read image file [image/png]" },
+          { type: "image", data: "abc123", mimeType: "image/png" },
+        ],
+      },
+    ]);
+  }
+
+  /** Capture the pre-signing legacy body once per dispatch. */
+  function captureBody(bodies: Record<string, unknown>[]) {
+    return (payload: unknown) => {
+      bodies.push(payload as Record<string, unknown>);
+      return undefined;
+    };
+  }
+
+  it("continues the run for a tool round that returned an image (T-08/AC-01)", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const options = { apiKey: "fake", sessionId: "session-image", onPayload: captureBody(bodies) };
+
+    globalThis.fetch = mockFetch(SUCCESS_SSE);
+    await consume(
+      streamQoder(makeModel("qoder", "Lite"), contextWith([{ role: "user", content: "read the screenshot" }]), options),
+    );
+
+    globalThis.fetch = mockFetch(SUCCESS_SSE);
+    await consume(streamQoder(makeModel("qoder", "Lite"), imageToolRound(), options));
+
+    expect(bodies, "one captured body per dispatch").toHaveLength(2);
+    const prompt = bodies[0];
+    const round = bodies[1];
+    expect(round.request_set_id, "the image round continues the run").toBe(prompt.request_set_id);
+    expect((round.business as { id: string }).id).toBe((prompt.business as { id: string }).id);
+    expect((round.business as { begin_at: number }).begin_at).toBe((prompt.business as { begin_at: number }).begin_at);
+  });
+
+  it("rotates the run identity across a retry while the cache key stays identical (T-09/AC-05)", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const options = { apiKey: "fake", sessionId: "session-retry", onPayload: captureBody(bodies) };
+
+    // Attempt 1 ends in an errored turn.
+    globalThis.fetch = mockFetch(sseEnvelope({ error: { message: "upstream boom" } }) + DONE_SSE);
+    await consume(streamQoder(makeModel("qoder", "Lite"), makeContext(), options));
+
+    // Attempt 2 of the same options: history repair drops the errored assistant
+    // turn, so the raw tail is again a fresh user prompt and the run rotates.
+    globalThis.fetch = mockFetch(SUCCESS_SSE);
+    await consume(
+      streamQoder(
+        makeModel("qoder", "Lite"),
+        contextWith([
+          { role: "user", content: "hi" },
+          { role: "assistant", content: [], stopReason: "error" },
+        ]),
+        options,
+      ),
+    );
+
+    expect(bodies, "one captured body per attempt").toHaveLength(2);
+    expect(bodies[1].request_set_id, "the retry is billed as its own run").not.toBe(bodies[0].request_set_id);
+    expect(bodies[1].session_id, "rotation is cache-neutral").toBe(bodies[0].session_id);
+  });
+
+  it("makes one run-identity call per dispatch, visible as the wire stage (T-10/AC-08)", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    globalThis.fetch = mockFetch(SUCCESS_SSE);
+    await consume(
+      streamQoder(makeModel("qoder", "Lite"), makeContext(), {
+        apiKey: "fake",
+        sessionId: "session-stage",
+        onPayload: captureBody(bodies),
+      }),
+    );
+    expect((bodies[0].business as { stage: string }).stage, "a run's first request reports start").toBe("start");
+
+    // Self-heal: a v2 dispatch falls back to legacy. v2 resolves its own run
+    // identity for metadata.context.request_set_id; the legacy re-dispatch makes
+    // its own single call, so the captured legacy body is a fresh "start"
+    // rather than a slot v2 had already advanced to "processing".
+    clearQoderRunRegistry();
+    const selfHealBodies: Record<string, unknown>[] = [];
+    const fetch = vi.fn(async (input: unknown) => {
+      if (String(input).includes("chat/completions")) {
+        return new Response(
+          JSON.stringify({ error: { type: "invalid_model_error", message: "model not supported" } }),
+          {
+            status: 400,
+            headers: { "content-type": "application/json" },
+          },
+        );
+      }
+      return new Response(SUCCESS_SSE);
+    }) as unknown as typeof globalThis.fetch;
+    const ultimate = staticModels.find((model) => model.id === "Ultimate");
+    if (!ultimate) throw new Error("fixture model missing from static seed: Ultimate");
+    await consume(
+      streamQoderV2(
+        ultimate as Model<Api>,
+        makeContext(),
+        {
+          apiKey: "fake",
+          fetch,
+          sessionId: "session-heal",
+          env: { QODER_FALLBACK: "1" },
+          onPayload: captureBody(selfHealBodies),
+        } as SimpleStreamOptions,
+        { mode: "global", modelConfig: { key: "ultimate" }, upstreamKey: "ultimate" },
+      ),
+    );
+    const legacyBodies = selfHealBodies.filter((body) => "business" in body);
+    expect(legacyBodies, "the self-heal produced exactly one legacy body").toHaveLength(1);
+    expect((legacyBodies[0].business as { stage: string }).stage, "stage reflects only the legacy dispatch").toBe(
+      "start",
+    );
   });
 });

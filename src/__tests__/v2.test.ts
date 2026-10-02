@@ -5,6 +5,7 @@ import {
   type Api,
   type AssistantMessage,
   type AssistantMessageEvent,
+  type Context,
   type Model,
   normalizeContext,
   type SimpleStreamOptions,
@@ -14,10 +15,53 @@ import { cacheQoderIdentityForTest, clearQoderAuthMemCache } from "../auth/oauth
 import { clearQoderModelsMemCache, staticModels } from "../catalog.js";
 import { streamQoderRouter } from "../protocol/router.js";
 import { clearQoderFallbackCache, clearQoderRoutingMemCache, isMarkedLegacyOnly } from "../protocol/routing.js";
+import { clearQoderRunRegistry } from "../protocol/run-identity.js";
 import { clearQoderFilterMemCache } from "../protocol/sampling.js";
 import { streamQoderV2 } from "../protocol/v2.js";
 
 const context = normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: 0 }] });
+// A completed tool round in the raw pi shape, so the run continuation predicate
+// has the same view the legacy transport feeds it.
+const completedAssistant: AssistantMessage = {
+  role: "assistant",
+  content: [{ type: "toolCall", id: "call_1", name: "read_file", arguments: { path: "/tmp/x" } }],
+  api: "openai-completions" as Api,
+  provider: "qoder" as AssistantMessage["provider"],
+  model: "ultimate",
+  usage: {
+    input: 1,
+    output: 1,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 2,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  },
+  stopReason: "toolUse",
+  timestamp: 0,
+};
+const toolRoundContext = normalizeContext({
+  messages: [
+    { role: "user", content: "hi", timestamp: 0 },
+    completedAssistant,
+    {
+      role: "toolResult",
+      toolCallId: "call_1",
+      toolName: "read_file",
+      content: [{ type: "text", text: "result" }],
+      isError: false,
+      timestamp: 0,
+    },
+  ],
+} as unknown as Context);
+
+/** True when `key` appears at any depth of the captured JSON body. */
+function hasKeyDeep(value: unknown, key: string): boolean {
+  if (Array.isArray(value)) return value.some((entry) => hasKeyDeep(entry, key));
+  if (!value || typeof value !== "object") return false;
+  return Object.entries(value as Record<string, unknown>).some(
+    ([name, child]) => name === key || hasKeyDeep(child, key),
+  );
+}
 // v2.ts maps the host platform the way osType() does; CI runs linux, so derive it.
 const expectedOsType = process.platform === "darwin" ? "macos" : process.platform === "win32" ? "windows" : "linux";
 const cachePath = () => join(process.env.HOME as string, ".pi", "agent", "qoder-models-cache.json");
@@ -104,6 +148,7 @@ afterEach(() => {
   clearQoderRoutingMemCache();
   clearQoderFilterMemCache();
   clearQoderModelsMemCache();
+  clearQoderRunRegistry();
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
 });
@@ -142,7 +187,7 @@ describe("v2 field injector", () => {
     expect("skipCacheWrite" in body).toBe(false);
   });
 
-  it("keeps request_set_id stable per session and distinct across sessions", async () => {
+  it("rotates request_set_id per user submit and stays distinct across sessions (OD-5, spec T-11/AC-03)", async () => {
     seedCatalogWithTiers();
     const a = v2FetchCapture();
     await streamQoderRouter(modelNamed("Ultimate"), context, {
@@ -163,8 +208,75 @@ describe("v2 field injector", () => {
     }).result();
     const metaAt = (calls: { url: unknown; body?: Record<string, unknown> }[], i: number) =>
       bodyOf(calls, i).metadata as { context: Record<string, unknown> };
-    expect(metaAt(a.calls, 1).context.request_set_id).toBe(metaAt(a.calls, 0).context.request_set_id);
+    // OD-5, owner-signed: two submits in one session are two runs now, not one.
+    expect(metaAt(a.calls, 1).context.request_set_id).not.toBe(metaAt(a.calls, 0).context.request_set_id);
     expect(metaAt(b.calls, 0).context.request_set_id).not.toBe(metaAt(a.calls, 0).context.request_set_id);
+  });
+
+  it("matches the run identity across a tool round between two user submits (T-11/AC-03)", async () => {
+    seedCatalogWithTiers();
+    const { calls, fetch } = v2FetchCapture();
+    await streamQoderRouter(modelNamed("Ultimate"), context, {
+      apiKey: "fake",
+      fetch,
+      sessionId: "session-run",
+    }).result();
+    await streamQoderRouter(modelNamed("Ultimate"), context, {
+      apiKey: "fake",
+      fetch,
+      sessionId: "session-run",
+    }).result();
+    await streamQoderRouter(modelNamed("Ultimate"), toolRoundContext, {
+      apiKey: "fake",
+      fetch,
+      sessionId: "session-run",
+    }).result();
+    const metaAt = (i: number) => bodyOf(calls, i).metadata as { context: Record<string, unknown> };
+    expect(metaAt(1).context.request_set_id).not.toBe(metaAt(0).context.request_set_id);
+    expect(metaAt(2).context.request_set_id).toBe(metaAt(1).context.request_set_id);
+  });
+
+  it("changes only the rotation rule: the v2 body carries no business key at any level (T-12/AC-08)", async () => {
+    seedCatalogWithTiers();
+    const { calls, fetch } = v2FetchCapture();
+    await streamQoderRouter(modelNamed("Ultimate"), context, {
+      apiKey: "fake",
+      fetch,
+      sessionId: "session-business",
+    }).result();
+    const body = bodyOf(calls);
+    expect(hasKeyDeep(body, "business"), "no business object reaches a v2 request").toBe(false);
+    const metadata = body.metadata as { context: Record<string, unknown> };
+    expect(metadata.context.request_id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(metadata.context.request_set_id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(metadata.context.session_id).toBe("session-business");
+    expect(metadata.context.source_session_id).toBe("session-business");
+    expect(metadata.context.os_type).toBe(expectedOsType);
+    expect(metadata.context.task_id).toBe("common");
+    expect(metadata.context.client_type).toBe("5");
+    expect(typeof metadata.context.context_length).toBe("string");
+  });
+
+  it("leaves the v2 run slot untouched on a warm replay (T-13/AC-02)", async () => {
+    seedCatalogWithTiers();
+    const { calls, fetch } = v2FetchCapture();
+    const dispatch = (ctx: typeof context, options: Record<string, unknown> = {}) =>
+      streamQoderRouter(modelNamed("Ultimate"), ctx, {
+        apiKey: "fake",
+        fetch,
+        sessionId: "session-warm",
+        ...options,
+      } as SimpleStreamOptions).result();
+
+    await dispatch(context); // a real user submit establishes the slot
+    await dispatch(context, { maxTokens: 1 }); // the host cache warmer replays it
+    await dispatch(toolRoundContext); // the next real tool round continues
+
+    const metaAt = (i: number) => bodyOf(calls, i).metadata as { context: Record<string, unknown> };
+    expect(metaAt(1).context.request_set_id, "the warm replay reuses the slot").toBe(metaAt(0).context.request_set_id);
+    expect(metaAt(2).context.request_set_id, "the real round continues the pre-warm identity").toBe(
+      metaAt(0).context.request_set_id,
+    );
   });
 
   it("honors a models.json contextWindow override for context_length", async () => {

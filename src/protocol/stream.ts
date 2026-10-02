@@ -24,7 +24,7 @@ import { yieldToEventLoop } from "../yield.js";
 import { type DsmlParserEvent, DsmlToolCallParser } from "./dsml.js";
 import { qoderEncodeBodyAsync } from "./encoding.js";
 import { mergeQoderHeaders } from "./request.js";
-import { getQoderRunIdentity } from "./run-state.js";
+import { classifyTurnKind, resolveRunIdentity } from "./run-identity.js";
 import { stripThinkingTags, ThinkingTagParser } from "./thinking.js";
 import { ToolCallAccumulator } from "./tool-calls.js";
 import { contentToText, transformMessagesForQoder, transformTools } from "./transform.js";
@@ -313,13 +313,17 @@ export function streamQoder(
       // them from a hash of the whole (growing) history, so every tool round
       // looked like a separate never-finished run on the credit ledger. Infer
       // the run boundary from the message tail and reuse the run identity.
-      const { requestSetId, business } = getQoderRunIdentity({
+      const { requestSetId, business } = resolveRunIdentity({
         mode: providerMode,
-        model: qoderModel,
-        sessionId: sessionID,
-        messages: normalizedMessages,
+        upstreamKey: qoderModel,
+        wireSessionId: sessionID,
+        // The RAW transcript, not the normalized list: the transform defers an
+        // image-bearing tool result into a trailing synthetic user message, so
+        // the normalized tail reads as a fresh prompt and splits the run.
+        messages: transcriptMessages,
         lastUserText,
         product: "cli",
+        turnKind: classifyTurnKind(options?.maxTokens),
       });
       const requestID = crypto.randomUUID();
 
