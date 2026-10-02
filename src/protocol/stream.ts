@@ -16,6 +16,7 @@ import {
 import { resolveQoderIdentity } from "../auth/oauth.js";
 import { getCachedModelConfig, MAX_OUTPUT_TOKENS } from "../catalog.js";
 import { buildAuthHeaders, getMachineId } from "../cosy.js";
+import { capText, createDebugFetch, debugEnabled, redactHeadersForDebug, writeDebugRecord } from "../debug-log.js";
 import { readResponseText, withAbort } from "../http.js";
 import { priceTurnCost, type RateSource, rateForUpstreamKey } from "../pricing.js";
 import { getQoderChatURL, getQoderRegionConfig } from "../region.js";
@@ -415,21 +416,52 @@ export function streamQoder(
       };
       resetIdleTimer();
 
-      const fetchPromise = (options?.fetch ?? fetch)(chatURL, {
+      const finalHeaders = mergeQoderHeaders(
+        {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Accept-Encoding": "identity",
+          "X-Model-Key": outgoingConfig?.key || qoderModel,
+          "X-Model-Source": modelSource,
+          ...headers,
+        },
+        model.headers,
+        options?.headers,
+      );
+      if (debugEnabled()) {
+        // Logical payload before COSY encoding — the wire bytes are opaque
+        // base64, so the request record is written here, not in the fetch
+        // wrapper (which captures the raw response side instead). Records are
+        // keyed by the PI session id (the ledger join key), with the hashed
+        // wire session id carried as a field — legacy and v2 must land in the
+        // same per-session file.
+        const capped = capText(JSON.stringify(payload));
+        writeDebugRecord(options?.sessionId, {
+          type: "request",
+          protocol: "legacy",
+          session: options?.sessionId,
+          wireSessionId: sessionID,
+          model: model.id,
+          upstreamKey: qoderModel,
+          url: chatURL,
+          method: "POST",
+          headers: redactHeadersForDebug(finalHeaders),
+          body: capped.text,
+          bodyTruncated: capped.truncated,
+        });
+      }
+      const debugFetch = createDebugFetch(options?.fetch ?? fetch, {
+        protocol: "legacy",
+        session: options?.sessionId,
+        model: model.id,
+        upstreamKey: qoderModel,
+        logRequest: false,
+      });
+
+      const fetchPromise = debugFetch(chatURL, {
         method: "POST",
-        headers: mergeQoderHeaders(
-          {
-            "Content-Type": "application/json",
-            Accept: "text/event-stream",
-            "Cache-Control": "no-cache",
-            "Accept-Encoding": "identity",
-            "X-Model-Key": outgoingConfig?.key || qoderModel,
-            "X-Model-Source": modelSource,
-            ...headers,
-          },
-          model.headers,
-          options?.headers,
-        ),
+        headers: finalHeaders,
         // Buffer is a valid Uint8Array at runtime but not in DOM's BodyInit union.
         body: encodedBytes as unknown as BodyInit,
         signal: requestController.signal,

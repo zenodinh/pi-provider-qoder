@@ -108,7 +108,11 @@ The streamed response is normalized into pi thinking blocks regardless of how th
 | `QODERCN_API_KEY`, `QODERCN_PERSONAL_ACCESS_TOKEN`, `QODERCN_PAT` | China PAT (first non-empty wins). |
 | `QODER_STREAM_IDLE_TIMEOUT_MS` | Stream idle timeout override (default `120000` ms). |
 | `QODER_STREAM_DELTA_INTERVAL_MS` | Minimum gap between streamed text/thinking deltas (default `50` ms). Higher values cut UI CPU on long responses. |
-| `QODER_DEBUG` | When set, log diagnostics for best-effort failures (catalog refresh, PAT exchange fallthrough, userinfo lookup). Malformed SSE and token refresh failures are always surfaced as errors. |
+| `QODER_DEBUG` | Debug mode. When set, all diagnostics go to per-session JSONL files under `~/.pi/agent/logs/qoder-debug/<sessionId>.jsonl` — every chat request (decoded body + redacted headers) and its raw server response, on both transports, plus best-effort failure notes (catalog refresh, PAT exchange fallthrough, userinfo lookup) and per-decision cache-warming verdicts. Nothing is written to the console/TUI. Malformed SSE and token refresh failures are always surfaced as errors regardless of this flag. |
+| `QODER_DEBUG_DIR` | Override the debug capture directory (default `~/.pi/agent/logs/qoder-debug`). |
+| `QODER_DEBUG_KEEP` | Session files retained before oldest-first pruning (default `50`). |
+| `QODER_DEBUG_HEADERS` | Set to `1` to include auth-bearing headers verbatim; by default `Authorization`/`Cosy-*`/token-shaped headers are redacted to their length. |
+| `QODER_DEBUG_MAX_BYTES` | Per-record cap for request bodies and response SSE text (default `2000000`; longer values are truncated and flagged). |
 | `QODER_FALLBACK` | Set to `1` to retry a turn once on the legacy transport when the v2 model-server rejects a model key (stale routing); the correction is cached for the session. Off by default. |
 | `QODER_PROTOCOL` | Force `v2` or `legacy` for every request, overriding the routing table. |
 | `QODER_MODEL_SERVER_HOST` | Override the v2 model-server base URL (for example to reach a v2 host from the China region). |

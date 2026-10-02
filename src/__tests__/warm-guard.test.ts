@@ -1,7 +1,11 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { CacheWarmingDecisionEvent } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { LifetimeProfile } from "../lifetime.js";
 import { type Budget, evaluateGuard, parseBudgetEnv } from "../warm-guard.js";
+import { debugMessages } from "./debug-sink.js";
 import { assistantEntry, compactionEntry, warmEntry } from "./session-fixtures.js";
 
 const MODEL = "DeepSeek-V4-Flash";
@@ -145,10 +149,13 @@ describe("rate-source ladder (AC-08)", () => {
 });
 
 // spec: parseBudgetEnv(undefined) -> 0.5; ("off") -> uncapped; ("abc"/"-1"/"0")
-//   -> 0.5 with exactly one debug entry naming the raw value
+//   -> 0.5 with exactly one debug entry naming the raw value. Sink contract
+//   (owner directive 2026-10-02): entries are JSONL file records, console silent.
 describe("QODER_WARM_BUDGET parsing (AC-04)", () => {
   it("defaults, disables, and falls back with one debug entry per invalid value", () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const dir = mkdtempSync(join(tmpdir(), "warm-guard-debug-"));
+    process.env.QODER_DEBUG_DIR = dir;
     delete process.env.QODER_DEBUG;
 
     expect(parseBudgetEnv(undefined)).toEqual({ kind: "fraction", fraction: 0.5 });
@@ -162,11 +169,14 @@ describe("QODER_WARM_BUDGET parsing (AC-04)", () => {
     expect(parseBudgetEnv("abc")).toEqual({ kind: "fraction", fraction: 0.5 });
     expect(parseBudgetEnv("-1")).toEqual({ kind: "fraction", fraction: 0.5 });
     expect(parseBudgetEnv("0")).toEqual({ kind: "fraction", fraction: 0.5 });
-    expect(errorSpy).toHaveBeenCalledTimes(3);
-    const logged = errorSpy.mock.calls.map((call) => String(call[0]));
+    expect(errorSpy).not.toHaveBeenCalled();
+    const logged = debugMessages(dir);
+    expect(logged).toHaveLength(3);
     expect(logged[0]).toContain('"abc"');
     expect(logged[1]).toContain('"-1"');
     expect(logged[2]).toContain('"0"');
+    delete process.env.QODER_DEBUG;
+    delete process.env.QODER_DEBUG_DIR;
   });
 });
 
