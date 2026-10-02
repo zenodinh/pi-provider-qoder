@@ -22,7 +22,10 @@ import { debugLog } from "./debug.js";
  * Re-check after every pi upgrade (OB-2): this module, the wire/error parity
  * suites, the host's retry-classifier prose, and the history-repair dependency
  * in `protocol/transform.ts` (errored turns are dropped by this repo, not by
- * the host).
+ * the host). One asymmetry to keep in mind: the provider-composer dispatch path
+ * wraps this extension in pi-ai's `lazyStream`, so a seam throw becomes a
+ * terminal error event there, while the global compat-registry path calls the
+ * registered function directly and sees the throw.
  */
 
 /** Named prefix on every seam failure, so the acquisition point is one grep away. */
@@ -42,12 +45,18 @@ function missingCompatibility(symbol: string): Error {
 /**
  * The host's OpenAI-completions Api, acquired synchronously: the v2 adapter
  * builds the stream it must return without awaiting, so this cannot become an
- * async import.
+ * async import. Throws rather than returning a value the call site would have
+ * to null-check -- an Api that is absent, or present but no longer shaped like
+ * one, is the same silent break.
  */
 export function openAICompletionsApi(): ReturnType<typeof qoderCompat.openAICompletionsApi> {
   const acquire = qoderCompat.openAICompletionsApi;
   if (typeof acquire !== "function") throw missingCompatibility("openAICompletionsApi");
-  return acquire();
+  const api = acquire();
+  if (typeof (api as { streamSimple?: unknown } | undefined)?.streamSimple !== "function") {
+    throw missingCompatibility("openAICompletionsApi().streamSimple");
+  }
+  return api;
 }
 
 /**
