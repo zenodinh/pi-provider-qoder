@@ -340,3 +340,101 @@ describe("debug sink configuration", () => {
     expect(res?.sse).toBeUndefined();
   });
 });
+
+/**
+ * The unified capture field (spec fs-qoder-turn-plan CU-07, T-16/AC-01, AC-04):
+ * both transports' response records carry the session id that went on the wire,
+ * and absence stays absence.
+ */
+describe("wireSessionId on the response records", () => {
+  it("T-16 writes it into both response branches and omits the key when the meta has none", async () => {
+    vi.stubEnv("QODER_DEBUG", "1");
+
+    const teed = createDebugFetch(async () => new Response("data: [DONE]\n\n", { status: 200 }), {
+      protocol: "v2",
+      session: "sess-wire-tee",
+      wireSessionId: "wire-tee",
+    });
+    await teed("https://example.test/chat/completions", { method: "POST", body: "{}" });
+    await vi.waitFor(() => {
+      expect(readDebugRecords(debugDir, "sess-wire-tee").some((r) => r.type === "response")).toBe(true);
+    });
+    expect(readDebugRecords(debugDir, "sess-wire-tee").find((r) => r.type === "response")?.wireSessionId).toBe(
+      "wire-tee",
+    );
+
+    const bodyless = createDebugFetch(async () => new Response(null, { status: 204 }), {
+      protocol: "v2",
+      session: "sess-wire-empty",
+      wireSessionId: "wire-empty",
+    });
+    await bodyless("https://example.test/chat/completions", { method: "POST" });
+    await vi.waitFor(() => {
+      expect(readDebugRecords(debugDir, "sess-wire-empty").some((r) => r.type === "response")).toBe(true);
+    });
+    expect(readDebugRecords(debugDir, "sess-wire-empty").find((r) => r.type === "response")?.wireSessionId).toBe(
+      "wire-empty",
+    );
+
+    // No invented values: a record written without the field must not carry the key at all.
+    const noId = createDebugFetch(async () => new Response(null, { status: 204 }), {
+      protocol: "v2",
+      session: "sess-wire-absent",
+    });
+    await noId("https://example.test/chat/completions", { method: "POST" });
+    await vi.waitFor(() => {
+      expect(readDebugRecords(debugDir, "sess-wire-absent").some((r) => r.type === "response")).toBe(true);
+    });
+    const record = readDebugRecords(debugDir, "sess-wire-absent").find((r) => r.type === "response") as Record<
+      string,
+      unknown
+    >;
+    expect("wireSessionId" in record).toBe(false);
+  });
+
+  it("T-16 a v2 dispatch captures the same session id its body carried", async () => {
+    vi.stubEnv("QODER_DEBUG", "1");
+    vi.stubEnv("QODER_CORE_PLAN", "1");
+    const cacheDir = join(tmpHome, "agent");
+    mkdirSync(cacheDir, { recursive: true });
+    writeFileSync(
+      join(cacheDir, "qoder-models-cache.json"),
+      JSON.stringify({
+        updatedAt: Date.now(),
+        models: [],
+        configs: {
+          Ultimate: {
+            key: "ultimate",
+            enable: true,
+            display_name: "Ultimate",
+            context_config: { "200K": { token_count: 200_000, is_default: true } },
+          },
+        },
+      }),
+      "utf8",
+    );
+    clearQoderModelsMemCache();
+
+    const bodies: Record<string, unknown>[] = [];
+    const fetch = vi.fn(async (input: unknown, init?: RequestInit) => {
+      if (String(input).includes("chat/completions")) bodies.push(JSON.parse(String(init?.body)));
+      return new Response(V2_SUCCESS_SSE, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as unknown as typeof globalThis.fetch;
+    await drain(
+      streamQoderRouter(staticModelNamed("Ultimate"), makeContext(), {
+        apiKey: "fake",
+        fetch,
+        sessionId: "sess-wire-e2e",
+      }),
+    );
+
+    await vi.waitFor(() => {
+      expect(readDebugRecords(debugDir, "sess-wire-e2e").some((r) => r.type === "response")).toBe(true);
+    });
+    const metadata = bodies[0]?.metadata as { context: Record<string, unknown> } | undefined;
+    const response = readDebugRecords(debugDir, "sess-wire-e2e").find((r) => r.type === "response");
+    expect(response?.wireSessionId).toBe(metadata?.context.session_id);
+    expect(response?.wireSessionId).toBe("sess-wire-e2e");
+    expect(errSpy).not.toHaveBeenCalled();
+  });
+});

@@ -37,6 +37,7 @@ import {
   writeProfile,
 } from "./lifetime.js";
 import { CREDITS_PER_USD, rateForUpstreamKey } from "./pricing.js";
+import { qoderModeFor } from "./protocol/plan.js";
 import { streamQoderRouter } from "./protocol/router.js";
 import { getQoderBaseUrl, getQoderRegionConfig, QODER_MODES, type QoderMode } from "./region.js";
 import { evaluateGuard, parseBudgetEnv } from "./warm-guard.js";
@@ -294,7 +295,7 @@ export default async function (pi: ExtensionAPI, deps: QoderExtensionDeps = {}) 
     if (process.env.QODER_CACHE_WARM !== "1") return undefined;
     const model = ctx.model;
     if (!model || (model.provider !== "qoder" && model.provider !== "qoder-cn")) return undefined;
-    const mode: QoderMode = model.provider === "qoder-cn" ? "cn" : "global";
+    const mode: QoderMode = qoderModeFor(model.provider);
     const budget = parseBudgetEnv(process.env.QODER_WARM_BUDGET);
     const verdict = evaluateGuard(event, {
       entries: ctx.sessionManager.getBranch(),

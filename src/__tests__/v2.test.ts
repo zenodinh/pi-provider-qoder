@@ -1,4 +1,5 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -18,6 +19,7 @@ import { clearQoderFallbackCache, clearQoderRoutingMemCache, isMarkedLegacyOnly 
 import { clearQoderRunRegistry } from "../protocol/run-identity.js";
 import { clearQoderFilterMemCache } from "../protocol/sampling.js";
 import { streamQoderV2 } from "../protocol/v2.js";
+import { readDebugRecords } from "./debug-sink.js";
 
 const context = normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: 0 }] });
 // A completed tool round in the raw pi shape, so the run continuation predicate
@@ -595,5 +597,105 @@ describe("v2 cost rate source (spec CU-07, T-12/T-13)", () => {
     expect(result.stopReason).toBe("stop");
     expect(result.usage.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 });
     expect((result.usage as AssistantMessage["usage"] & { rateSource?: string }).rateSource).toBe("fallback");
+  });
+});
+
+/**
+ * The plan seam on the v2 transport (spec fs-qoder-turn-plan CU-05,
+ * T-12..T-14).
+ *
+ * T-12 pins capture == wire for the session value; T-13 pins the plan-failure
+ * rule through pi-ai's own terminal-error route; T-14 pins the clamped/unclamped
+ * split that must survive the single-producer change.
+ */
+describe("plan seam on the v2 transport", () => {
+  afterEach(() => {
+    vi.doUnmock("../protocol/plan.js");
+    vi.resetModules();
+  });
+
+  it("T-12 the debug record's wireSessionId equals the session_id the wire carried", async () => {
+    seedCatalogWithTiers();
+    const dir = mkdtempSync(join(tmpdir(), "qoder-v2-plan-"));
+    vi.stubEnv("QODER_DEBUG", "1");
+    vi.stubEnv("QODER_DEBUG_DIR", dir);
+    vi.stubEnv("QODER_CORE_PLAN", "1");
+
+    for (const sessionId of ["sess-plan", undefined]) {
+      const { calls, fetch } = v2FetchCapture();
+      await streamQoderRouter(modelNamed("Ultimate"), context, { apiKey: "fake", fetch, sessionId }).result();
+      const metadata = bodyOf(calls).metadata as { context: Record<string, unknown> };
+      // A session-less dispatch is keyed by the extension's file name, like legacy's record.
+      const debugFile = sessionId ?? "extension";
+      await vi.waitFor(() => {
+        expect(readDebugRecords(dir, debugFile).some((record) => record.type === "response")).toBe(true);
+      });
+      const response = readDebugRecords(dir, debugFile).find((record) => record.type === "response");
+      expect(typeof response?.wireSessionId).toBe("string");
+      expect(response?.wireSessionId, `sessionId=${sessionId ?? "(none)"}`).toBe(metadata.context.session_id);
+    }
+  });
+
+  it("T-13 a rejected plan inside wrappedOnPayload becomes a terminal error event", async () => {
+    // AC-10 forbids an identity lookup on v2, so a v2 plan cannot reject through
+    // its resolver; the plan boundary itself is rejected here to exercise the
+    // rule the spec pins (pi-ai's own terminal-error route, never a hang).
+    vi.doMock("../protocol/plan.js", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("../protocol/plan.js")>();
+      return {
+        ...actual,
+        planQoderTurn: async () => {
+          throw new Error("plan rejected for test");
+        },
+      };
+    });
+    vi.resetModules();
+    const { streamQoderV2: streamQoderV2WithRejectedPlan } = await import("../protocol/v2.js");
+    const fetchSpy = vi.fn(async () => {
+      throw new Error("the plan rejects before any request is built");
+    });
+
+    const events: AssistantMessageEvent[] = [];
+    const stream = streamQoderV2WithRejectedPlan(
+      modelNamed("Ultimate"),
+      context,
+      { apiKey: "fake", fetch: fetchSpy as unknown as typeof globalThis.fetch, sessionId: "sess-plan" },
+      {
+        mode: "global",
+        modelConfig: { key: "ultimate" },
+        upstreamKey: "ultimate",
+        plan: {
+          protocol: "v2",
+          mode: "global",
+          upstreamKey: "ultimate",
+          rejectedSamplingKeys: [],
+          piSessionId: "sess-plan",
+          wireSessionV2: { promptCacheKey: "sess-plan", envelopeAndHeaders: "sess-plan" },
+          turnKind: "real",
+          capture: { protocol: "v2", model: "Ultimate", session: "sess-plan" },
+        } as const,
+      },
+    );
+    for await (const event of stream) events.push(event);
+
+    expect(events.at(-1)?.type).toBe("error");
+    // The host awaits result(); an end without a terminal event leaves it pending.
+    expect((await stream.result()).stopReason).toBe("error");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("T-14 the long session keeps the clamped prompt_cache_key and the unclamped envelope", async () => {
+    seedCatalogWithTiers();
+    vi.stubEnv("QODER_CORE_PLAN", "1");
+    const long = `session-${"x".repeat(80)}`;
+
+    const { calls, fetch } = v2FetchCapture();
+    await streamQoderRouter(modelNamed("Ultimate"), context, { apiKey: "fake", fetch, sessionId: long }).result();
+    const body = bodyOf(calls);
+    const metadata = body.metadata as { context: Record<string, unknown> };
+
+    expect(body.prompt_cache_key).toBe(long.slice(0, 64));
+    expect(metadata.context.session_id).toBe(long);
+    expect(metadata.context.source_session_id).toBe(long);
   });
 });

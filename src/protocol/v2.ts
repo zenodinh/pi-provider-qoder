@@ -10,6 +10,7 @@ import {
   createAssistantMessageEventStream,
   type Model,
   type SimpleStreamOptions,
+  type ThinkingLevel,
   type TranscriptContext,
   withoutInitialSystemMessage,
 } from "@earendil-works/pi-ai";
@@ -19,8 +20,9 @@ import { debugLog } from "../debug.js";
 import { createDebugFetch } from "../debug-log.js";
 import { type RateSource, rateForUpstreamKey } from "../pricing.js";
 import type { QoderMode } from "../region.js";
+import { PROCESS_FALLBACK_SESSION_ID, planQoderTurn, type TurnPlan, type TurnPlanSeed } from "./plan.js";
 import { markLegacyOnly } from "./routing.js";
-import { classifyTurnKind, type QoderRunMessage, type QoderTurnKind, resolveRunIdentity } from "./run-identity.js";
+import { classifyTurnKind, type QoderRunMessage, resolveRunIdentity } from "./run-identity.js";
 import { createReframedFetch } from "./sse-reframe.js";
 import { MAX_PROMPT_CACHE_KEY_LENGTH, streamQoder } from "./stream.js";
 import { contentToText } from "./transform.js";
@@ -29,6 +31,8 @@ interface V2Route {
   mode: QoderMode;
   modelConfig: QoderModelEntry;
   upstreamKey: string;
+  /** The router's plan seed when QODER_CORE_PLAN is on; absent means the pre-migration inline path. */
+  plan?: TurnPlanSeed;
 }
 
 function envValue(options: SimpleStreamOptions | undefined, name: string): string | undefined {
@@ -55,10 +59,9 @@ function isAllowedV2Host(baseUrl: string, options?: SimpleStreamOptions): boolea
   }
 }
 
-// Process-stable fallback for hosts that never pass options.sessionId — stable
-// across turns of the process without any identity dependency (identity
-// resolution is legacy-local by design).
-const processFallbackSessionId = crypto.randomUUID();
+// Process-stable fallback for hosts that never pass options.sessionId lives in
+// plan.ts (PROCESS_FALLBACK_SESSION_ID): identity resolution is legacy-local by
+// design, so both protocols share that one process value (OD-6).
 
 /**
  * The current user prompt's text, for the run display name. v2 omits the
@@ -126,7 +129,7 @@ function injectQoderFields(
   model: Model<Api>,
   options: SimpleStreamOptions | undefined,
   messages: readonly QoderRunMessage[],
-  turnKind: QoderTurnKind,
+  plan: TurnPlan | undefined,
 ): void {
   // metadata.context — required envelope; session_id keys prompt caching.
   // qodercli's bundled JS (decoded 2026-09-29) additionally sends
@@ -135,16 +138,18 @@ function injectQoderFields(
   // (string-valued); the top-level context_length number alone proved
   // ineffective against the ~60K-token wall, so the envelope is mirrored here.
   const metadata = isRecord(body.metadata) ? body.metadata : {};
-  const sessionId = options?.sessionId ?? processFallbackSessionId;
+  // One producer for the session value: the plan's v2 wire form when the gate
+  // is on, the same expression inline when it is off (identical by construction).
+  const sessionId = plan?.wireSession.v2.envelopeAndHeaders ?? options?.sessionId ?? PROCESS_FALLBACK_SESSION_ID;
   const tier = resolveContextLength(route.modelConfig.context_config, model.contextWindow);
   const { requestSetId } = resolveRunIdentity({
     mode: route.mode,
     upstreamKey: route.upstreamKey,
-    wireSessionId: sessionId,
+    wireSessionId: plan?.capture.wireSessionId ?? sessionId,
     messages,
     lastUserText: lastUserTextOf(messages),
     product: "cli",
-    turnKind,
+    turnKind: plan?.turnKind ?? classifyTurnKind(options?.maxTokens),
   });
   body.metadata = {
     ...metadata,
@@ -161,7 +166,7 @@ function injectQoderFields(
   };
   // Explicit-send set (owner direction 2026-09-25; probes are acceptance
   // checks, server default is never trusted silently).
-  body.enable_thinking = resolveReasoningLevel(model, options) !== undefined;
+  body.enable_thinking = resolveReasoningLevel(model, plan?.thinkingInputs.level ?? options?.reasoning) !== undefined;
   if (tier !== undefined) body.context_length = tier;
   body.preserve_thinking = true;
   body.parallel_tool_calls = true;
@@ -179,11 +184,10 @@ function injectQoderFields(
   // from its session id in its OpenAI-protocol requests, and the server already
   // receives this exact identity as metadata.context.session_id.
   if (options?.cacheRetention === "none") body.skipCacheWrite = true;
-  else body.prompt_cache_key = clampPromptCacheKey(sessionId);
+  else body.prompt_cache_key = plan?.wireSession.v2.promptCacheKey ?? clampPromptCacheKey(sessionId);
 }
 
-function resolveReasoningLevel(model: Model<Api>, options?: SimpleStreamOptions): string | undefined {
-  const requestedLevel = options?.reasoning;
+function resolveReasoningLevel(model: Model<Api>, requestedLevel: ThinkingLevel | undefined): string | undefined {
   if (!requestedLevel) return undefined;
   // Same rule as the legacy path (stream.ts): clamp through pi-ai's model-aware
   // helper; "off" (or an unsupported model) disables, anything else enables.
@@ -298,7 +302,9 @@ export function streamQoderV2(
     // The raw transcript view, matching the legacy transport's input. Both
     // adapters read the same view so one predicate serves both protocols.
     const messages = withoutInitialSystemMessage(context.messages);
-    injectQoderFields(body, route, v2Model, options, messages, classifyTurnKind(options?.maxTokens));
+    // One plan per v2 dispatch: no identity lookup happens on this protocol.
+    const plan = route.plan ? await planQoderTurn(model, context, options, route.plan) : undefined;
+    injectQoderFields(body, route, v2Model, options, messages, plan);
     if (callerOnPayload) {
       const next = await callerOnPayload(body, selected);
       return next !== undefined ? next : body;
@@ -310,15 +316,17 @@ export function streamQoderV2(
   // 2026-09-28); repair the framing before the SDK's strict SSE parser sees it.
   // Debug capture wraps the base fetch INSIDE the reframe wrapper: the capture
   // tees raw server bytes, and reframe still repairs the framing downstream.
-  const debugSession = options?.sessionId ?? processFallbackSessionId;
+  const syncSession = options?.sessionId ?? PROCESS_FALLBACK_SESSION_ID;
   const inner = openAICompletionsApi().streamSimple(v2Model, context, {
     ...options,
     fetch: createReframedFetch(
       createDebugFetch(options?.fetch ?? globalThis.fetch, {
         protocol: "v2",
-        session: debugSession,
+        session: options?.sessionId,
         model: model.id,
         upstreamKey: route.upstreamKey,
+        // The value that actually went on the wire: metadata.context.session_id.
+        wireSessionId: route.plan?.wireSessionV2.envelopeAndHeaders ?? syncSession,
       }),
     ),
     onPayload: wrappedOnPayload,
@@ -343,7 +351,7 @@ export function streamQoderV2(
         if (isInvalidModelErrorEvent(event)) {
           markLegacyOnly(route.upstreamKey);
           debugLog(`provider.fallback model_key=${route.upstreamKey} from=v2 to=legacy`);
-          const legacyStream = streamQoder(model, context, options);
+          const legacyStream = streamQoder(model, context, options, route.plan);
           for await (const legacyEvent of legacyStream) out.push(legacyEvent);
           out.end();
           return;

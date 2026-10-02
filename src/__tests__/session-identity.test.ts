@@ -11,16 +11,16 @@ import { clearQoderFilterMemCache } from "../protocol/sampling.js";
 import { MAX_PROMPT_CACHE_KEY_LENGTH } from "../protocol/stream.js";
 
 /**
- * AC-04 — the two protocols' session-id wire forms, pinned as they DIVERGE today.
+ * AC-04 — the two protocols' session-id wire forms.
  *
  * This is a cross-protocol fact, so it belongs in neither protocol's suite.
- * FS-4 replaces both derivations with TurnPlan.wireSession and must therefore
- * INVERT the session-less row: what is asserted here as an asymmetry is the
- * thing the migration unifies. Pinning it as today's behaviour is what makes
- * that unification an observed inversion rather than a silent one — including
- * the direction it moves in, which carries OD-6's accepted consequence (two
- * session-less dispatches that today mint two run-scoping keys start sharing
- * one, merging billing runs and gaining affinity).
+ * FS-1 pinned the two protocols' forms as they diverged; FS-4 replaced both
+ * derivations with TurnPlan.wireSession and INVERTED the session-less row
+ * (OD-6, owner-decided 2026-10-02): what used to be a fresh run-scoping uuid
+ * per request on legacy versus one per-process value on v2 is now one shared
+ * per-process id on both, which merges session-less legacy turns into one
+ * billing run per mode and model and gives them cache affinity. The readable /
+ * bounded / clamped forms below stay exactly as recorded.
  *
  * Every literal below was RECORDED from a live capture of the real transports
  * under a fixed identity (userID "user", upstream key "dfmodel"), not recomputed
@@ -200,36 +200,33 @@ describe("wire session forms (AC-04)", () => {
     expect(hashed).not.toBe(readable);
   });
 
-  // T-11 (legacy half): today's per-request uuid. FS-4 unifies this, so the row
-  // is written to be inverted — it asserts the divergence, not the desired state.
-  it("legacy mints a DIFFERENT session_id on each session-less dispatch, over a stable hash prefix", async () => {
+  // T-11 (legacy half): OD-6 inverted today's per-request uuid. The gate is left
+  // unset here on purpose: the unified per-process fallback is what the inline
+  // (pre-migration) derivation produces too, which is what keeps the legacy body
+  // byte-identical across the QODER_CORE_PLAN settings (T-10).
+  it("legacy reuses ONE per-process session_id across session-less dispatches", async () => {
     const first = await legacySessionId({ apiKey: "fake" });
     const second = await legacySessionId({ apiKey: "fake" });
 
-    // stableHash("qoder-session", userID, qoderModel) — identical across both,
-    // because the hash input carries no session component.
-    const prefix = "b047787bc4afc9f3-";
-    expect(first.startsWith(prefix)).toBe(true);
-    expect(second.startsWith(prefix)).toBe(true);
-
-    // The suffix is a fresh crypto.randomUUID() per request (stream.ts:263), so
-    // two dispatches of one session-less turn carry two run-scoping keys.
-    expect(first).not.toBe(second);
+    // stable across dispatches of the process, unlike the fresh uuid each
+    // request used to mint (stream.ts:263 before FS-4).
+    expect(first).toBe(second);
     const uuidShape = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-    expect(first.slice(prefix.length)).toMatch(uuidShape);
-    expect(second.slice(prefix.length)).toMatch(uuidShape);
+    expect(first).toMatch(uuidShape);
   });
 
-  // T-11 (v2 half): the other side of the asymmetry.
-  it("v2 reuses ONE per-process session_id across session-less dispatches", async () => {
+  // T-11 (v2 half): the same unified value, so a session-less legacy turn and a
+  // session-less v2 turn key the identical run and the identical prompt cache.
+  it("v2 reuses ONE per-process session_id across session-less dispatches, shared with legacy", async () => {
     const first = await v2SessionFields({ apiKey: "fake" });
     const second = await v2SessionFields({ apiKey: "fake" });
 
-    // processFallbackSessionId is a module-level uuid (v2.ts:58): stable across
-    // turns of the process with no identity dependency.
+    // processFallbackSessionId is now plan.ts's PROCESS_FALLBACK_SESSION_ID: one
+    // value per process, the same one legacy sends for a session-less turn.
     expect(first.promptCacheKey).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
     expect(second.promptCacheKey).toBe(first.promptCacheKey);
     expect(first.envelopeSessionId).toBe(first.promptCacheKey);
+    expect(await legacySessionId({ apiKey: "fake" })).toBe(first.promptCacheKey);
   });
 
   // T-11 / AC-04: the clamp split, and the affinity trio legacy does not send.
