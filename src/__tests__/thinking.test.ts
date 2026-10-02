@@ -35,6 +35,18 @@ function createOutput(): AssistantMessage {
   } as AssistantMessage;
 }
 
+/** Every event the parser pushed, in order. */
+function collectEvents(mock: ReturnType<typeof vi.fn>): AssistantMessageEvent[] {
+  return mock.mock.calls.map((call) => call[0] as AssistantMessageEvent);
+}
+
+/** The text_end events, narrowed to the two fields the parity rows assert. */
+function textEndEvents(mock: ReturnType<typeof vi.fn>): Array<{ contentIndex: number; content: string }> {
+  return collectEvents(mock)
+    .filter((event): event is Extract<AssistantMessageEvent, { type: "text_end" }> => event.type === "text_end")
+    .map((event) => ({ contentIndex: event.contentIndex, content: event.content }));
+}
+
 describe("ThinkingTagParser", () => {
   let output: AssistantMessage;
   let stream: AssistantMessageEventStream;
@@ -366,6 +378,116 @@ describe("ThinkingTagParser", () => {
     expect(text).not.toContain("</thinking>");
     expect(text).toContain("intro");
     expect(text).toContain("outro");
+  });
+
+  // ── Closing text blocks (FS-6) ────────────────────────────────────────
+
+  // T-01 / AC-01: a text block is closed wherever its index is dropped, so the
+  // host's block-closing path sees a text_end per block on legacy too.
+
+  it("T-01 closes the text block at a tool-call boundary", () => {
+    const parser = new ThinkingTagParser(output, stream);
+    parser.processChunk("before");
+    parser.flushAtBoundary();
+    parser.processChunk("after");
+    parser.finalize();
+
+    expect(textEndEvents(pushMock)).toEqual([
+      { contentIndex: 0, content: "before" },
+      { contentIndex: 1, content: "after" },
+    ]);
+    // closeText still hands the index to lastTextBlockIndex, so getTextBlockIndex
+    // reports the value it did before the end event existed.
+    expect(parser.getTextBlockIndex()).toBe(1);
+  });
+
+  it("T-01 closes the text block when leaving the thinking phase", () => {
+    const parser = new ThinkingTagParser(output, stream);
+    parser.processChunk("prefix <thinking>reason</thinking> suffix");
+    parser.finalize();
+
+    expect(textEndEvents(pushMock)).toEqual([
+      { contentIndex: 0, content: "prefix " },
+      { contentIndex: 2, content: " suffix" },
+    ]);
+  });
+
+  it("T-01 closes the text block before a later thinking block", () => {
+    const parser = new ThinkingTagParser(output, stream);
+    parser.processChunk("a <thinking>x</thinking> b <thinking>y</thinking>");
+    parser.finalize();
+
+    expect(textEndEvents(pushMock)).toEqual([
+      { contentIndex: 0, content: "a " },
+      { contentIndex: 2, content: " b " },
+    ]);
+  });
+
+  it("T-01 emits no text_end when no text block is open", () => {
+    const parser = new ThinkingTagParser(output, stream);
+    parser.processChunk("<thinking>only thinking</thinking>");
+    parser.flushAtBoundary();
+    parser.finalize();
+
+    expect(textEndEvents(pushMock)).toEqual([]);
+
+    // A second finalize over an already-closed block stays quiet.
+    const emitted = pushMock.mock.calls.length;
+    parser.finalize();
+    expect(pushMock.mock.calls.length).toBe(emitted);
+  });
+
+  // T-02 / AC-02: the end event carries the whole block, not the last delta.
+  it("T-02 emits text_end with the block's full text and the text_start's index", () => {
+    const parser = new ThinkingTagParser(output, stream);
+    parser.processChunk("Hel");
+    parser.processChunk("lo <thinking>thought</thinking> wor");
+    parser.processChunk("ld");
+    parser.finalize();
+
+    expect(textEndEvents(pushMock)).toEqual([
+      { contentIndex: 0, content: "Hello " },
+      { contentIndex: 2, content: " world" },
+    ]);
+
+    const events = collectEvents(pushMock);
+    for (const end of textEndEvents(pushMock)) {
+      expect(
+        events.some((event) => event.type === "text_start" && event.contentIndex === end.contentIndex),
+        `text_end ${end.contentIndex} must match the text_start that opened it`,
+      ).toBe(true);
+      const streamed = events
+        .filter(
+          (event): event is Extract<AssistantMessageEvent, { type: "text_delta" }> =>
+            event.type === "text_delta" && event.contentIndex === end.contentIndex,
+        )
+        .reduce((acc, event) => acc + event.delta, "");
+      expect(end.content).toBe(streamed);
+    }
+  });
+
+  // T-04 / AC-01, AC-03: end of stream closes the open block even when the
+  // buffer is already empty, which is the common case for an ordinary answer.
+  it("T-04 finalize closes an already-drained text block and stays quiet after", () => {
+    const parser = new ThinkingTagParser(output, stream);
+    parser.processChunk("complete answer");
+    parser.finalize();
+
+    expect(textEndEvents(pushMock)).toEqual([{ contentIndex: 0, content: "complete answer" }]);
+
+    const emitted = pushMock.mock.calls.length;
+    parser.finalize();
+    expect(pushMock.mock.calls.length).toBe(emitted);
+  });
+
+  it("T-04 finalize mid-thinking emits thinking_end and no text_end", () => {
+    const parser = new ThinkingTagParser(output, stream);
+    parser.processChunk("<thinking>unfinished</thin");
+    parser.finalize();
+
+    const types = collectEvents(pushMock).map((event) => event.type);
+    expect(types).toContain("thinking_end");
+    expect(textEndEvents(pushMock)).toEqual([]);
   });
 
   // ── stripThinkingTags helper ───────────────────────────────────────────

@@ -450,18 +450,19 @@ describe("legacy parameters vocabulary (SA rows 2, 8)", () => {
 });
 
 /**
- * AC-02 — each protocol's emitted event-type vocabulary.
+ * AC-01/AC-05 — each protocol's emitted event-type vocabulary is the same
+ * twelve types.
  *
  * Count-based assertions are deliberately absent. Legacy coalesces text_delta
- * by design (stream.ts:139-158) and never closes text blocks, so comparing
- * event COUNTS across protocols can only be wrong; the comparable dimension is
- * which TYPES a protocol can emit. That is the dimension the migration promises
- * to unify, and the one the host's block-closing path depends on.
+ * by design (stream.ts:139-158), so comparing event COUNTS across protocols can
+ * only be wrong; the comparable dimension is which TYPES a protocol can emit.
+ * That is the dimension the migration promises to unify, and the one the host's
+ * block-closing path depends on. Every row here compares type Sets; none counts
+ * events.
  *
  * One stream cannot emit both terminals, so each protocol's vocabulary is the
  * union of a rich success stream and an error stream -- measured, not assumed:
- * legacy rich emits 10 types and its error stream adds `error` (11 total);
- * v2 rich emits 11 including `text_end` and its error stream adds `error` (12).
+ * both protocols now emit all 12 types, legacy having gained text_end.
  */
 describe("event vocabulary parity (SA FR-5)", () => {
   /** The 12 types pi-ai's AssistantMessageEvent union declares, in declaration order. */
@@ -480,9 +481,6 @@ describe("event vocabulary parity (SA FR-5)", () => {
     "error",
   ];
 
-  /** Legacy emits 11 of the 12 today: no site in src/protocol pushes text_end. */
-  const LEGACY_VOCABULARY = FULL_VOCABULARY.filter((type) => type !== "text_end");
-
   const deltaChunk = (delta: object) => ({ choices: [{ delta, index: 0 }], id: "probe", model: "auto" });
   const finish = (reason: string) => ({
     choices: [{ finish_reason: reason, index: 0 }],
@@ -500,12 +498,15 @@ describe("event vocabulary parity (SA FR-5)", () => {
     return sequence;
   }
 
-  /** start before any update, exactly one terminal, and the terminal is last. */
+  /** start before any update, and the terminal is last with no terminal before it. */
   function assertBoundaryContract(sequence: string[], label: string): void {
     expect(sequence[0], `${label} must open with start`).toBe("start");
-    const terminals = sequence.filter((type) => type === "done" || type === "error");
-    expect(terminals, `${label} must terminate exactly once`).toHaveLength(1);
-    expect(sequence.at(-1), `${label} must end on its terminal`).toBe(terminals[0]);
+    const terminal = sequence.at(-1);
+    expect(terminal === "done" || terminal === "error", `${label} must end on its terminal`).toBe(true);
+    // Expressed without a length/count comparison: a count over an event array
+    // is exactly the assertion class D8 forbids in this describe.
+    const earlierTerminal = sequence.slice(0, -1).find((type) => type === "done" || type === "error");
+    expect(earlierTerminal, `${label} must terminate exactly once`).toBeUndefined();
   }
 
   const runLegacyStream = async (sse: string): Promise<string[]> => {
@@ -562,19 +563,18 @@ describe("event vocabulary parity (SA FR-5)", () => {
 
   const v2Failed = `${v2Frame({ error: { message: "boom" } })}\n\ndata:[DONE]`;
 
-  // T-05 / AC-02
-  it("legacy emits 11 of the 12 event types, and text_end is not one of them", async () => {
+  // T-05 / AC-01
+  it("legacy emits the full twelve-type vocabulary, text_end included", async () => {
     const success = await runLegacyStream(legacyRich);
     const failed = await runLegacyStream(legacyTruncated);
     assertBoundaryContract(success, "legacy success");
     assertBoundaryContract(failed, "legacy failure");
 
     const emitted = new Set([...success, ...failed]);
-    expect([...emitted].sort()).toEqual([...LEGACY_VOCABULARY].sort());
-    expect(emitted.size).toBe(11);
-    // The absence FS-6 inverts, asserted by name so the inversion is a flipped
-    // expectation on this row rather than a silent set difference.
-    expect(emitted.has("text_end"), "legacy never closes a text block today").toBe(false);
+    expect([...emitted].sort()).toEqual([...FULL_VOCABULARY].sort());
+    // The gap FS-6 closes, asserted by name so a regression to an unclosed text
+    // block is a red row rather than a quiet set difference.
+    expect(emitted.has("text_end"), "legacy now closes its text blocks").toBe(true);
     // Sanity on the channels the fixture drives, without counting events.
     for (const expected of [
       "thinking_start",
@@ -582,6 +582,7 @@ describe("event vocabulary parity (SA FR-5)", () => {
       "thinking_end",
       "text_start",
       "text_delta",
+      "text_end",
       "toolcall_start",
       "toolcall_delta",
       "toolcall_end",
@@ -592,8 +593,8 @@ describe("event vocabulary parity (SA FR-5)", () => {
     expect(failed.at(-1)).toBe("error");
   });
 
-  // T-06 / AC-02
-  it("v2 emits the full 12-type union, establishing the target legacy must reach", async () => {
+  // T-06 / AC-01
+  it("v2 emits the same full twelve-type union", async () => {
     const success = await runV2Stream(v2Rich);
     const failed = await runV2Stream(v2Failed);
     assertBoundaryContract(success, "v2 success");
@@ -601,13 +602,13 @@ describe("event vocabulary parity (SA FR-5)", () => {
 
     const emitted = new Set([...success, ...failed]);
     expect([...emitted].sort()).toEqual([...FULL_VOCABULARY].sort());
-    expect(emitted.size).toBe(12);
-    // The one type v2 has and legacy does not -- the parity gap in one assertion.
     expect(emitted.has("text_end"), "v2 closes its text block").toBe(true);
     expect(failed.at(-1)).toBe("error");
   });
 
-  it("puts the parity gap on exactly one type, so FS-6 has a single row to flip", async () => {
+  // T-05 / AC-01: the migration's parity claim in one assertion -- neither
+  // protocol emits a type the other does not.
+  it("puts both protocols on the same type set, with no parity gap left", async () => {
     seedLegacyEffortKey();
     const legacyFetch = vi.fn(
       async () => new Response(legacyRich, { status: 200, headers: { "content-type": "text/event-stream" } }),
@@ -631,10 +632,48 @@ describe("event vocabulary parity (SA FR-5)", () => {
       ),
     );
 
-    const onlyV2 = [...v2].filter((type) => !legacy.has(type)).sort();
-    const onlyLegacy = [...legacy].filter((type) => !v2.has(type)).sort();
-    expect(onlyV2).toEqual(["text_end"]);
-    expect(onlyLegacy).toEqual([]);
+    expect([...legacy].filter((type) => !v2.has(type)).sort()).toEqual([]);
+    expect([...v2].filter((type) => !legacy.has(type)).sort()).toEqual([]);
+  });
+
+  // T-05 / AC-01: the ordering boundary. The coalescer force-flushes a pending
+  // delta before any non-delta event (stream.ts:139-158), so a text_end lands
+  // after its block's last text_delta and before whatever follows. indexOf
+  // comparisons, never fixed positions: legacy coalesces deltas, so how many
+  // events precede any of these varies by fixture.
+  it("orders text_end after its last delta and before the following block or terminal", async () => {
+    // End of an ordinary answer: the block closes with the stream, before done.
+    const plain = await runLegacyStream(legacySuccess);
+    const plainEnd = plain.indexOf("text_end");
+    expect(plain.lastIndexOf("text_delta", plainEnd)).toBeLessThan(plainEnd);
+    expect(plainEnd).toBeLessThan(plain.indexOf("done"));
+
+    // A DSML tool call embedded in content is an ordering boundary: the text
+    // block closes before the tool block opens.
+    const dsmlCall =
+      `<｜DSML｜tool_calls>\n<｜DSML｜invoke name="read">\n` +
+      `<｜DSML｜parameter name="path" string="true">x</｜DSML｜parameter>\n` +
+      `</｜DSML｜invoke>\n</｜DSML｜tool_calls>`;
+    const withTool = [
+      envelope(deltaChunk({ content: "hello " })),
+      envelope(deltaChunk({ content: dsmlCall })),
+      "data: [DONE]\n\n",
+    ].join("");
+    const tool = await runLegacyStream(withTool);
+    const toolEnd = tool.lastIndexOf("text_end");
+    expect(tool.lastIndexOf("text_delta", toolEnd)).toBeLessThan(toolEnd);
+    expect(toolEnd).toBeLessThan(tool.indexOf("toolcall_start"));
+
+    // A text block closed before a later thinking block sits before that
+    // block's thinking_start.
+    const twoThinking =
+      envelope(deltaChunk({ content: "alpha <thinking>one</thinking> beta <thinking>two</thinking>" })) +
+      envelope(finish("stop")) +
+      "data: [DONE]\n\n";
+    const nested = await runLegacyStream(twoThinking);
+    const beforeThinking = nested.indexOf("text_end", nested.lastIndexOf("text_delta"));
+    expect(beforeThinking, "the boundary text_end must exist").toBeGreaterThanOrEqual(0);
+    expect(beforeThinking).toBeLessThan(nested.lastIndexOf("thinking_start"));
   });
 });
 

@@ -133,6 +133,8 @@ The streamed response is normalized into pi thinking blocks regardless of how th
 
 The custom stream supports pi's `onPayload` (before encoding/signing), `onResponse` (before reading the body, including HTTP errors), injected `fetch` (chat and identity lookup), `headers`, `env`, `timeoutMs`, `temperature`, and model/request `maxTokens`. Header overrides are case-insensitive; `null` removes a default. Overriding COSY authentication headers can invalidate signatures. A model `baseUrl` override must point to a Qoder-compatible gateway, not a generic OpenAI endpoint.
 
+Legacy turns now close each text block with a `text_end` event, matching v2's event vocabulary. The host maps every `text_end` to a `message_update` frame, so `--json` output gains one frame per text block on legacy.
+
 ### Retry behavior
 
 This provider never retries a chat POST inside its own `fetch` layer. `src/retry.ts` retries non-billable requests only — `fetchWithRetry` forces a single attempt for every non-GET method — so that layer never replays a POST. That GET-only policy is unchanged. Transport remains SSE. (The one repo-side re-dispatch is the opt-in `QODER_FALLBACK` self-heal, which fires only when the v2 model-server rejects a model key before a generation starts.)

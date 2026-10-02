@@ -40,4 +40,13 @@ describe("README retry documentation", () => {
     expect(readme).toContain("retry patterns");
     expect(readme).toContain("history-repair dependency");
   });
+
+  it("names the text_end -> message_update frame class legacy now emits", () => {
+    // AC-06: legacy closes each text block, and the host renders every text_end
+    // as a --json message_update frame. The sentence ships in the published
+    // README, so a --json consumer is told the new frame exists.
+    expect(readme).toContain("close each text block with a `text_end` event");
+    expect(readme).toContain("maps every `text_end` to a `message_update` frame");
+    expect(readme).toContain("`--json` output gains one frame per text block on legacy");
+  });
 });
