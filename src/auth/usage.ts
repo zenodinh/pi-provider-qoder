@@ -25,6 +25,14 @@ export interface QoderUsageBucket {
   usedFraction?: number;
   /** `false` means the package exists but is not distributable right now ("Unavailable"). */
   available?: boolean;
+  /**
+   * Raw numeric amounts. The panel renders the preformatted `*Display`
+   * strings; a host usage surface (`omp usage`) draws its own bars and
+   * countdowns from numbers, so both forms are carried.
+   */
+  used?: number;
+  limit?: number;
+  remaining?: number;
 }
 
 export interface QoderProviderUsage {
@@ -52,6 +60,8 @@ export interface QoderProviderUsage {
   /** The same rollup in USD at the shared basis: cost so far / USD granted. */
   totalCostBucket?: QoderUsageBucket;
   raw?: Record<string, unknown>;
+  /** Raw `expiresAt` from the payload, for hosts that need a numeric reset. */
+  expiresAt?: number;
 }
 
 const CREDITS_FORMAT = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
@@ -187,6 +197,9 @@ function toBucket(input: BucketInput): MadeBucket {
       usedPercentDisplay: percent !== undefined ? `${Math.round(percent * 100)}%` : undefined,
       usedFraction: percent !== undefined ? Math.min(1, Math.max(0, percent)) : undefined,
       available: quota.available,
+      used: quota.used,
+      limit,
+      remaining,
     },
     limit,
     remaining,
@@ -297,8 +310,9 @@ export async function fetchQoderUsageForMode(
   return {
     summary,
     exceeded: usage.isQuotaExceeded === true,
-    subscriptionTitle: region.usageTitle,
     resetAt,
+    subscriptionTitle: region.usageTitle,
+    expiresAt: usage.expiresAt,
     manageUrl: region.manageUrl,
     usageUrl: getQoderUsagePageURL(mode),
     upgradeUrl: usage.upgradeUrl,
@@ -308,4 +322,46 @@ export async function fetchQoderUsageForMode(
     totalCostBucket,
     raw: isRecord(payload) ? payload : undefined,
   };
+}
+
+/**
+ * One quota read per mode per TTL, shared by every surface.
+ *
+ * The cache lives here, beside the fetch, rather than in the command: a host
+ * usage view can re-render or poll on its own schedule, and the command's
+ * documented 60s cache is worthless if the host path bypasses it and spends a
+ * fresh authenticated request per render. Keyed by mode because the regions are
+ * separate accounts with separate quotas.
+ */
+export const QUOTA_CACHE_TTL_MS = 60_000;
+const quotaCache = new Map<QoderMode, { usage: QoderProviderUsage; fetchedAt: number }>();
+const quotaInflight = new Map<QoderMode, Promise<QoderProviderUsage>>();
+
+/** Drop every cached quota read; the command's `r` key and the tests use it. */
+export function clearQoderQuotaCache(): void {
+  quotaCache.clear();
+  quotaInflight.clear();
+}
+
+/**
+ * `fetchQoderUsageForMode` with the shared TTL and single-flight dedupe.
+ *
+ * `force` skips the TTL only (a user-pressed refresh), never the in-flight
+ * dedupe: two callers already waiting on the same request should share it even
+ * if the second one asked for a refresh.
+ */
+export async function fetchQoderUsageCached(
+  credentials: OAuthCredentials,
+  mode: QoderMode,
+  options: QoderRequestOptions & { force?: boolean } = {},
+): Promise<QoderProviderUsage> {
+  const cached = quotaCache.get(mode);
+  if (!options.force && cached && Date.now() - cached.fetchedAt < QUOTA_CACHE_TTL_MS) return cached.usage;
+  const pending = quotaInflight.get(mode);
+  if (pending) return pending;
+  const request = fetchQoderUsageForMode(credentials, mode, options).finally(() => quotaInflight.delete(mode));
+  quotaInflight.set(mode, request);
+  const usage = await request;
+  quotaCache.set(mode, { usage, fetchedAt: Date.now() });
+  return usage;
 }

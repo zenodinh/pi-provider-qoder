@@ -1,38 +1,27 @@
-// shape: none — module-scope cache state (trigger #3, one instance per
-//   process) plus a straight-line collector; the tui/notify split is one branch
-//   on ctx.mode, below the dispatch-object threshold.
-import type { OAuthCredentials } from "@earendil-works/pi-ai";
+// shape: none — a straight-line collector over the shared quota cache; the
+//   tui/notify split is one branch on ctx.mode, below the dispatch-object
+//   threshold.
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { fetchQoderUsageForMode, type QoderProviderUsage, type QoderUsageBucket } from "../auth/usage.js";
+import {
+  clearQoderQuotaCache,
+  fetchQoderUsageCached,
+  type QoderProviderUsage,
+  type QoderUsageBucket,
+  QUOTA_CACHE_TTL_MS,
+} from "../auth/usage.js";
 import { debugLog } from "../debug.js";
 import { getQoderRegionConfig, QODER_MODES, type QoderMode } from "../region.js";
 
-const QUOTA_CACHE_TTL_MS = 60_000;
+/**
+ * The command renders into a local variable, so its own read is bounded
+ * tighter than the shared cache default. The host usage view is not
+ * user-blocked and keeps the cache's own budget.
+ */
 const QUOTA_FETCH_TIMEOUT_MS = 3_000;
 
-interface QuotaCacheEntry {
-  usage: QoderProviderUsage;
-  fetchedAt: number;
-}
-
-const quotaCache = new Map<QoderMode, QuotaCacheEntry>();
-const inflight = new Map<QoderMode, Promise<QoderProviderUsage>>();
-
-/** Test-only resetter, alongside the fork's existing resetter pattern. */
-export function clearQoderQuotaCache(): void {
-  quotaCache.clear();
-  inflight.clear();
-}
-
-function fetchUsage(credentials: OAuthCredentials, mode: QoderMode): Promise<QoderProviderUsage> {
-  const pending = inflight.get(mode);
-  if (pending) return pending;
-  const request = fetchQoderUsageForMode(credentials, mode, { timeoutMs: QUOTA_FETCH_TIMEOUT_MS }).finally(() => {
-    inflight.delete(mode);
-  });
-  inflight.set(mode, request);
-  return request;
-}
+// Re-exported so the command's public surface (and the tests) keep their
+// existing import path while the cache itself now lives beside the fetch.
+export { clearQoderQuotaCache };
 
 /** One region's collected data; both the panel and the text report render from it. */
 export interface QuotaSection {
@@ -49,21 +38,25 @@ async function collectQuotaSections(ctx: ExtensionCommandContext, forceRefresh =
     const region = getQoderRegionConfig(mode);
     const token = await ctx.modelRegistry.getApiKeyForProvider(region.providerID).catch(() => undefined);
     if (!token) continue;
-    const cached = quotaCache.get(mode);
-    const cacheAge = cached ? Date.now() - cached.fetchedAt : Number.POSITIVE_INFINITY;
-    if (!forceRefresh && cached && cacheAge < QUOTA_CACHE_TTL_MS) {
-      sections.push({
-        loginName: region.loginName,
-        state: { kind: "ready", usage: cached.usage, servedFromCache: true, cacheAgeMs: cacheAge },
-      });
-      continue;
-    }
+    const before = Date.now();
     try {
-      const usage = await fetchUsage({ access: token, refresh: "", expires: 0 }, mode);
-      quotaCache.set(mode, { usage, fetchedAt: Date.now() });
+      // One cache, one request: the shared cache is keyed by mode and already
+      // carries the TTL and the in-flight dedupe, so the command no longer
+      // keeps a private copy that a host usage view would bypass.
+      const usage = await fetchQoderUsageCached({ access: token, refresh: "", expires: 0 }, mode, {
+        timeoutMs: QUOTA_FETCH_TIMEOUT_MS,
+        force: forceRefresh,
+      });
+      const cacheAge = Date.now() - before;
       sections.push({
         loginName: region.loginName,
-        state: { kind: "ready", usage, servedFromCache: false, cacheAgeMs: 0 },
+        state: {
+          kind: "ready",
+          usage,
+          // A cache hit returns in well under the TTL; a miss spends a request.
+          servedFromCache: !forceRefresh && cacheAge < QUOTA_CACHE_TTL_MS,
+          cacheAgeMs: cacheAge,
+        },
       });
     } catch (error) {
       sections.push({

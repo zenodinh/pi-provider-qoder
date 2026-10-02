@@ -3,8 +3,9 @@
 // shape: closure returning an object literal — trigger #4, view state plus
 //   render/input methods, no subclassing or instanceof anywhere.
 import type { ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
-import { hyperlink, Key, matchesKey, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Key, matchesKey, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { QoderUsageBucket } from "../auth/usage.js";
+import { hyperlink } from "../host-compat.js";
 import { formatRenewalDate, type QuotaSection } from "./quota.js";
 
 const MIN_INNER_WIDTH = 40;

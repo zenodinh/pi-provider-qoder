@@ -12,9 +12,9 @@ import {
   type SimpleStreamOptions,
   type TranscriptContext,
 } from "@earendil-works/pi-ai";
-import { openAICompletionsApi } from "@earendil-works/pi-ai/compat";
 import type { QoderModelEntry } from "../catalog.js";
 import { debugLog } from "../debug.js";
+import { openAICompletionsApi } from "../host-compat.js";
 import { type RateSource, rateForUpstreamKey } from "../pricing.js";
 import type { QoderMode } from "../region.js";
 import { markLegacyOnly } from "./routing.js";

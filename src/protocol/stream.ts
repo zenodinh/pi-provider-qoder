@@ -5,23 +5,23 @@ import {
   type AssistantMessageEventStream,
   clampThinkingLevel,
   createAssistantMessageEventStream,
-  getCurrentSystemMessage,
-  getSystemMessageText,
   type Model,
   type SimpleStreamOptions,
   type ThinkingContent,
   type TranscriptContext,
-  withoutInitialSystemMessage,
 } from "@earendil-works/pi-ai";
 import { resolveQoderIdentity } from "../auth/oauth.js";
 import { getCachedModelConfig, MAX_OUTPUT_TOKENS } from "../catalog.js";
 import { buildAuthHeaders, getMachineId } from "../cosy.js";
+import { debugLog } from "../debug.js";
+import { resolveSystemAndTools, withoutInitialSystemMessage } from "../host-compat.js";
 import { readResponseText, withAbort } from "../http.js";
 import { priceTurnCost, type RateSource, rateForUpstreamKey } from "../pricing.js";
 import { getQoderChatURL, getQoderRegionConfig } from "../region.js";
 import { yieldToEventLoop } from "../yield.js";
 import { type DsmlParserEvent, DsmlToolCallParser } from "./dsml.js";
 import { qoderEncodeBodyAsync } from "./encoding.js";
+import { parseQoderQueueState, QoderQueueError } from "./queue.js";
 import { mergeQoderHeaders } from "./request.js";
 import { getQoderRunIdentity } from "./run-state.js";
 import { stripThinkingTags, ThinkingTagParser } from "./thinking.js";
@@ -29,6 +29,18 @@ import { ToolCallAccumulator } from "./tool-calls.js";
 import { contentToText, transformMessagesForQoder, transformTools } from "./transform.js";
 import { parseQoderCreditsUsage, type QoderCreditsUsage } from "./usage.js";
 
+/**
+ * How many times one turn will wait out a queue before surfacing the refusal.
+ *
+ * Qoder's own wait is honoured each round, so this is a ceiling on a genuinely
+ * stuck model rather than a retry budget: three rounds at the provider's
+ * stated cadence is enough for a busy-window queue to clear, and past that the
+ * host is better placed to decide — its retry/fallback policy is visible to
+ * the user, a silent provider loop is not.
+ */
+const QUEUE_HOLD_MAX_ATTEMPTS = 3;
+/** Used only when the queue payload omits its own wait; Qoder always sends it. */
+const QUEUE_HOLD_DEFAULT_WAIT_SECONDS = 30;
 type QoderAssistantUsage = AssistantMessage["usage"] & QoderCreditsUsage & { rateSource?: RateSource };
 
 /** False only when the host explicitly disabled thinking for this request. */
@@ -136,6 +148,12 @@ export function streamQoder(
     );
   };
   const pushEvent = (event: QoderStreamEvent): void => {
+    // Output-bearing events that reached the consumer make a re-run unsafe
+    // (it would duplicate them), so the queue hold checks this before
+    // re-issuing. `start` is excluded on purpose: it is emitted before the
+    // first byte of the reply, carries no content, and is re-emitted
+    // identically on a re-run — a queue refusal lands right after it.
+    if (event.type !== "start") emittedEvent = true;
     if (event.type === "text_delta" || event.type === "thinking_delta" || event.type === "toolcall_delta") {
       if (pendingDelta && pendingDelta.type === event.type && pendingDelta.contentIndex === event.contentIndex) {
         // Mutate in place rather than spreading a new object on every merged
@@ -180,7 +198,43 @@ export function streamQoder(
     throw reason instanceof Error ? reason : new Error("Qoder request aborted");
   };
 
-  (async () => {
+  /**
+   * Sleep, but stop early if the turn is aborted while we wait out a queue.
+   *
+   * Hand-rolled rather than a bare `setTimeout` promise because the wait has
+   * to be interruptible: a turn the user cancelled must not sit out the rest
+   * of a 30s window. The extension's TS target predates
+   * `Promise.withResolvers`, so the resolvers are captured by hand.
+   */
+  const sleepWithSignal = (ms: number, signal: AbortSignal): Promise<void> => {
+    let onAbort: (() => void) | undefined;
+    const promise = new Promise<void>((resolve, reject) => {
+      onAbort = (): void => {
+        clearTimeout(timer);
+        reject(signal.reason instanceof Error ? signal.reason : new Error("Qoder request aborted"));
+      };
+      const timer = setTimeout(() => {
+        if (onAbort) signal.removeEventListener("abort", onAbort);
+        resolve();
+      }, ms);
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    });
+    return promise;
+  };
+
+  // Bounded in-provider hold for a busy model. Qoder answers a queued model
+  // with its own retry window, and the honest thing to do with that is wait
+  // and re-issue the SAME model — not hand the host a transient it may rotate
+  // off to a fallback on (hosts apply their fallback chain on the first
+  // retryable error, without waiting for the retry budget). The hold lives
+  // here, below the host, which is the only layer that can honour it. It only
+  // applies before any event reached the consumer: a queue refusal arrives in
+  // the first envelope, so re-running is safe, and a re-run after partial
+  // output would duplicate it.
+  let queueAttempt = 0;
+  let emittedEvent = false;
+  const runAttempt = async (): Promise<void> => {
     try {
       throwIfAborted();
       const providerMode = model.provider === "qoder-cn" ? "cn" : "global";
@@ -222,19 +276,16 @@ export function streamQoder(
 
       await yieldToEventLoop();
       throwIfAborted();
-      // 0.86.0+ passes a normalized TranscriptContext: the system prompt and
-      // tool declarations are folded into the transcript's leading system
-      // message instead of being top-level fields. Read them back with the
-      // transcript helpers, and strip that system message from the list before
-      // mapping history to Qoder's OpenAI-shaped messages. The resolved prompt
-      // is then sent as one leading system message.
+      // pi 0.86+ passes a normalized TranscriptContext (system prompt and tool
+      // declarations folded into the transcript's leading system message);
+      // other hosts (OMP) still pass the legacy Context with top-level
+      // systemPrompt/tools. resolveSystemAndTools reads either shape, and
+      // withoutInitialSystemMessage strips the folded prompt before mapping
+      // history to Qoder's OpenAI-shaped messages — the resolved prompt is
+      // re-sent as one leading system message below.
       const transcriptMessages = withoutInitialSystemMessage(context.messages);
       const normalizedMessages = transformMessagesForQoder(transcriptMessages);
-      // Resolve the current prompt and tool set in a single transcript pass:
-      // getCurrentSystemPrompt() would re-walk the messages (and re-resolve the
-      // tools internally) on top of the getCurrentTools() call below.
-      const currentSystem = getCurrentSystemMessage(context.messages);
-      const systemText = currentSystem ? getSystemMessageText(currentSystem) : "";
+      const { systemText, tools: currentTools } = resolveSystemAndTools(context);
 
       let lastUserText = "";
       for (let i = normalizedMessages.length - 1; i >= 0; i--) {
@@ -271,7 +322,6 @@ export function streamQoder(
         maxTokens = Math.min(maxTokens, limit);
       }
 
-      const currentTools = currentSystem?.toolsAdded ?? [];
       const toolsRaw = currentTools.length > 0 ? transformTools(currentTools) : undefined;
       // Map pi's thinking level (options.reasoning) to Qoder's request fields.
       // Confirmed from @qoder-ai/qodercli: the chat body carries `reasoning_effort`
@@ -460,6 +510,10 @@ export function streamQoder(
 
       if (!response.ok) {
         const errText = await readResponseText(response, requestController.signal);
+        // Same queue state can be carried on the HTTP status path; keep the
+        // classification identical so a queue never reads as a 403 auth fault.
+        const queueState = parseQoderQueueState(errText);
+        if (queueState) throw new QoderQueueError(queueState);
         throw new Error(`Qoder API request failed: ${response.status} ${response.statusText}. Response: ${errText}`);
       }
 
@@ -597,6 +651,12 @@ export function streamQoder(
           try {
             const envelope = JSON.parse(dataStr);
             if (envelope.statusCodeValue && envelope.statusCodeValue !== 200) {
+              // A busy model arrives as a queue-admission payload inside a
+              // non-200 envelope. Throw it as the transient wait the payload
+              // describes — the raw body's bare `403` reads as an auth failure
+              // to host classifiers and would never be retried (queue.ts).
+              const queueState = typeof envelope.body === "string" ? parseQoderQueueState(envelope.body) : undefined;
+              if (queueState) throw new QoderQueueError(queueState);
               throw new Error(`Upstream status ${envelope.statusCodeValue}: ${envelope.body}`);
             }
 
@@ -760,6 +820,24 @@ export function streamQoder(
       });
       stream.end();
     } catch (e: unknown) {
+      // A queued model is the one error the provider itself can resolve: wait
+      // out the window Qoder asked for and re-issue the same model, so the
+      // host never sees a failure and never walks its fallback chain. Every
+      // other error keeps the original path.
+      const queueState = e instanceof QoderQueueError ? e.state : undefined;
+      if (queueState && !emittedEvent && queueAttempt < QUEUE_HOLD_MAX_ATTEMPTS) {
+        queueAttempt += 1;
+        const waitSeconds = queueState.waitSeconds ?? QUEUE_HOLD_DEFAULT_WAIT_SECONDS;
+        debugLog(
+          `provider.queue hold attempt=${queueAttempt}/${QUEUE_HOLD_MAX_ATTEMPTS} wait=${waitSeconds}s model=${queueState.modelKey ?? "unknown"}`,
+        );
+        try {
+          await sleepWithSignal(waitSeconds * 1000, requestController.signal);
+        } catch {
+          // Aborted while waiting: fall through and report the abort.
+        }
+        if (!requestController.signal.aborted) return runAttempt();
+      }
       output.stopReason = options?.signal?.aborted ? "aborted" : "error";
       output.errorMessage = e instanceof Error ? e.message : String(e);
       pushEvent({ type: "error", reason: output.stopReason, error: output });
@@ -774,7 +852,9 @@ export function streamQoder(
       if (reader) void reader.cancel().catch(() => {});
       else if (response) void response.body?.cancel().catch(() => {});
     }
-  })();
+  };
+
+  void runAttempt();
 
   return stream;
 }

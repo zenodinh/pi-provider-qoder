@@ -285,6 +285,93 @@ describe("streamQoder", () => {
     expect(events.find((e) => e.type === "done")).toBeUndefined();
   });
 
+  it("surfaces a busy-model queue as a transient wait once the hold budget is spent", async () => {
+    // Live payload (Qwen3.8-Flash, 2026-10-01): the queue state sits under two
+    // nested `message` envelopes and the legacy envelope carries it with a
+    // non-200 statusCodeValue. The raw text's bare `403` classifies as an auth
+    // failure on host retry tables — wrong lane and non-retryable — so what
+    // eventually reaches the host must be the transient wait the payload
+    // describes, not the envelope. The provider holds first (see the next
+    // test); this one pins the exhausted-budget surface. retryAfterSeconds is
+    // 30 in the real payload and 0 here so the test does not sit out 3×30s.
+    const queueState = {
+      isQueued: true,
+      modelKey: "qfmodel",
+      queueCount: 0,
+      queueType: "p3",
+      retryAfterSeconds: 0,
+      serviceAvailable: false,
+      waitTime: 0,
+    };
+    const queued = sseEnvelope(
+      { code: "403", message: JSON.stringify({ code: "10605", message: JSON.stringify(queueState) }) },
+      403,
+      "Forbidden",
+    );
+    let served = 0;
+    globalThis.fetch = vi.fn(async () => {
+      served += 1;
+      return new Response(queued, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as unknown as typeof fetch;
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    // One initial attempt plus every hold the provider is willing to spend.
+    expect(served).toBe(4);
+    const err = events.find((e) => e.type === "error");
+    expect(err?.type, "expected an error event").toBe("error");
+    if (err?.type !== "error") throw new Error("expected an error event");
+    const message = err.error.errorMessage ?? "";
+    expect(message).toBe(
+      "Qoder service unavailable (code 10605): model qfmodel is queued (queue p3, 0 ahead); try again in 0s.",
+    );
+    // Host-facing contract: transient lane, parseable wait hint, and no token
+    // that host retry tables read as an authentication failure.
+    expect(message).toMatch(/service ?unavailable/i);
+    expect(message).toMatch(/try again in ([\d.]+)(ms|s)/i);
+    expect(message).not.toMatch(/\b(?:401|403|unauthorized|forbidden|authentication)\b/i);
+  });
+
+  it("holds out a busy-model queue and re-issues instead of failing the turn", async () => {
+    // The host contract: a host applies its fallback chain on the FIRST
+    // retryable error, so surfacing the queue — even correctly classified as
+    // transient — rotates the turn to another model. The wait therefore has to
+    // happen below the host, inside the provider, and the turn must then
+    // succeed on the same model. The payload says wait 0s so the test does not
+    // sit out 30 real seconds; that the provider read the wait at all is
+    // covered by the queue unit tests.
+    const queueState = {
+      isQueued: true,
+      modelKey: "qfmodel",
+      queueCount: 0,
+      queueType: "p3",
+      retryAfterSeconds: 0,
+      serviceAvailable: false,
+    };
+    const queued = sseEnvelope(
+      { code: "403", message: JSON.stringify({ code: "10605", message: JSON.stringify(queueState) }) },
+      403,
+      "Forbidden",
+    );
+    let served = 0;
+    globalThis.fetch = vi.fn(async () => {
+      served += 1;
+      return new Response(served === 1 ? queued : SUCCESS_SSE, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    }) as unknown as typeof fetch;
+
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    expect(served, "the queue must be re-issued, not surfaced").toBe(2);
+    const done = events.find((e) => e.type === "done");
+    expect(done?.type, "expected a done event after the hold").toBe("done");
+    if (done?.type !== "done") throw new Error("expected a done event");
+    const text = done.message.content.find((c) => c.type === "text");
+    expect(text && "text" in text ? text.text : "").toBe("OK");
+    expect(events.some((e) => e.type === "error")).toBe(false);
+  });
+
   it.each(["", sseEnvelope(chunk({ content: "partial" }))])("rejects premature EOF (%s)", async (sse) => {
     globalThis.fetch = mockFetch(sse);
     const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
