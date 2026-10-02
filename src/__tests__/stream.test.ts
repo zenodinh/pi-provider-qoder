@@ -1419,6 +1419,41 @@ describe("plan seam on the legacy transport", () => {
     }
   });
 
+  it("T-10 a legacy capture record carries the same wire session id the body did", async () => {
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { readDebugRecords } = await import("./debug-sink.js");
+    const dir = mkdtempSync(join(tmpdir(), "qoder-plan-legacy-"));
+    process.env.QODER_DEBUG = "1";
+    process.env.QODER_DEBUG_DIR = dir;
+    process.env.QODER_CORE_PLAN = "1";
+    try {
+      const { streamQoderRouter } = await import("../protocol/router.js");
+      const model = staticModels.find((candidate) => candidate.id === "DeepSeek-V4-Flash") as Model<Api>;
+      const bodies: Record<string, unknown>[] = [];
+      globalThis.fetch = mockFetch(SUCCESS_SSE);
+      await consume(
+        streamQoderRouter(model, makeContext(), {
+          apiKey: "fake",
+          sessionId: "session-capture",
+          onPayload: (payload: unknown) => {
+            bodies.push(payload as Record<string, unknown>);
+            return undefined;
+          },
+        }),
+      );
+      // The request record is written before dispatch, so it is on disk already.
+      const record = readDebugRecords(dir, "session-capture").find((entry) => entry.type === "request");
+      expect(record?.wireSessionId).toBe(bodies[0].session_id);
+      expect(record?.wireSessionId).toBe("qoder-session-test-user-dfmodel-session-capture");
+    } finally {
+      delete process.env.QODER_DEBUG;
+      delete process.env.QODER_DEBUG_DIR;
+      delete process.env.QODER_CORE_PLAN;
+    }
+  });
+
   it("T-11 an onPayload rewrite of model_config.key still decides X-Model-Key", async () => {
     vi.stubEnv("QODER_CORE_PLAN", "1");
     const { streamQoderRouter } = await import("../protocol/router.js");

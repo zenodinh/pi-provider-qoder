@@ -11,6 +11,18 @@ import {
 } from "../protocol/routing.js";
 import { clearQoderFilterMemCache } from "../protocol/sampling.js";
 
+// Counting seam for T-08's second clause (AC-07): with byte-identical bodies the
+// gate's only remaining observable effect is whether the plan is produced at
+// all, so the producer's two entry points are wrapped with pass-through spies.
+vi.mock("../protocol/plan.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../protocol/plan.js")>();
+  return {
+    ...actual,
+    planQoderTurn: vi.fn(actual.planQoderTurn),
+    planSyncProjection: vi.fn(actual.planSyncProjection),
+  };
+});
+
 const context = normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: 0 }] });
 
 function modelNamed(id: string): Model<Api> {
@@ -212,6 +224,11 @@ describe("streamQoderRouter", () => {
  * gate as a real rollback — same body, same filter position, either setting.
  */
 describe("the plan seam keeps the registered entry synchronous (T-07/T-08)", () => {
+  afterEach(() => {
+    vi.doUnmock("../auth/oauth.js");
+    vi.resetModules();
+  });
+
   /** A per-protocol fixture fetch, so one row can drive both transports. */
   function bothProtocols(): { urls: string[]; fetch: typeof globalThis.fetch } {
     const urls: string[] = [];
@@ -285,6 +302,42 @@ describe("the plan seam keeps the registered entry synchronous (T-07/T-08)", () 
       }
       expect(bodies.get("1"), `${modelId}: gate on matches gate off`).toEqual(bodies.get(""));
     }
+  });
+
+  it("T-08 with the gate unset no plan work happens; with it set the seed is produced", async () => {
+    // A fresh registry so the counting plan mock reaches every importer in the
+    // graph (plan.ts, stream.ts and v2.ts sit in one cycle), plus a resolved
+    // identity so neither dispatch needs the network.
+    vi.doMock("../auth/oauth.js", () => ({
+      resolveQoderIdentity: vi.fn().mockResolvedValue({
+        access: "fake",
+        refresh: "",
+        expires: 0,
+        userID: "user",
+        name: "Test",
+        email: "test@example.com",
+        machineID: "machine",
+      }),
+    }));
+    vi.resetModules();
+    const planModule = await import("../protocol/plan.js");
+    const { streamQoderRouter: freshRouter } = await import("../protocol/router.js");
+    const projectionSpy = vi.mocked(planModule.planSyncProjection);
+    const planSpy = vi.mocked(planModule.planQoderTurn);
+    const { fetch } = bothProtocols();
+    const model = modelNamed("DeepSeek-V4-Flash");
+
+    vi.stubEnv("QODER_CORE_PLAN", "");
+    projectionSpy.mockClear();
+    planSpy.mockClear();
+    await freshRouter(model, context, { apiKey: "fake", fetch }).result();
+    expect(projectionSpy, "no seed is built with the gate off").not.toHaveBeenCalled();
+    expect(planSpy, "no plan is produced with the gate off").not.toHaveBeenCalled();
+
+    vi.stubEnv("QODER_CORE_PLAN", "1");
+    await freshRouter(model, context, { apiKey: "fake", fetch }).result();
+    expect(projectionSpy, "the sync seed is built with the gate on").toHaveBeenCalledTimes(1);
+    expect(planSpy, "the adapter awaits one plan with the gate on").toHaveBeenCalledTimes(1);
   });
 
   it("T-08 a fail-fast dispatch exits before the sampling filter", async () => {
