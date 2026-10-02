@@ -11,6 +11,7 @@ import {
   type Model,
   type SimpleStreamOptions,
   type TranscriptContext,
+  withoutInitialSystemMessage,
 } from "@earendil-works/pi-ai";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/compat";
 import type { QoderModelEntry } from "../catalog.js";
@@ -19,8 +20,10 @@ import { createDebugFetch } from "../debug-log.js";
 import { type RateSource, rateForUpstreamKey } from "../pricing.js";
 import type { QoderMode } from "../region.js";
 import { markLegacyOnly } from "./routing.js";
+import { classifyTurnKind, type QoderRunMessage, type QoderTurnKind, resolveRunIdentity } from "./run-identity.js";
 import { createReframedFetch } from "./sse-reframe.js";
 import { MAX_PROMPT_CACHE_KEY_LENGTH, streamQoder } from "./stream.js";
+import { contentToText } from "./transform.js";
 
 interface V2Route {
   mode: QoderMode;
@@ -57,18 +60,16 @@ function isAllowedV2Host(baseUrl: string, options?: SimpleStreamOptions): boolea
 // resolution is legacy-local by design).
 const processFallbackSessionId = crypto.randomUUID();
 
-// Run-scope id: qodercli keeps ONE request_set_id per logical run and
-// propagates it to every nested call via AsyncLocalStorage / parentRequestSetId
-// (decoded from its bundled JS, 2026-09-29) — it is not per HTTP call. The pi
-// session is our run scope, so one uuid per session is reused for all its calls.
-const requestSetIds = new Map<string, string>();
-function requestSetIdFor(sessionId: string): string {
-  let id = requestSetIds.get(sessionId);
-  if (id === undefined) {
-    id = crypto.randomUUID();
-    requestSetIds.set(sessionId, id);
+/**
+ * The current user prompt's text, for the run display name. v2 omits the
+ * `business` object (see injectQoderFields), so this value never reaches the
+ * wire — it only fills the slot the shared registry records.
+ */
+function lastUserTextOf(messages: readonly QoderRunMessage[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user") return contentToText(messages[i].content);
   }
-  return id;
+  return "";
 }
 
 function osType(): string {
@@ -122,22 +123,33 @@ function injectQoderFields(
   body: Record<string, unknown>,
   route: V2Route,
   model: Model<Api>,
-  options?: SimpleStreamOptions,
+  options: SimpleStreamOptions | undefined,
+  messages: readonly QoderRunMessage[],
+  turnKind: QoderTurnKind,
 ): void {
   // metadata.context — required envelope; session_id keys prompt caching.
   // qodercli's bundled JS (decoded 2026-09-29) additionally sends
-  // request_set_id (run-scoped, see requestSetIdFor), source_session_id, and
-  // context_length INSIDE this metadata object (string-valued); the top-level
-  // context_length number alone proved ineffective against the ~60K-token
-  // wall, so the envelope is mirrored here.
+  // request_set_id (run-scoped, resolved by the shared run-identity module),
+  // source_session_id, and context_length INSIDE this metadata object
+  // (string-valued); the top-level context_length number alone proved
+  // ineffective against the ~60K-token wall, so the envelope is mirrored here.
   const metadata = isRecord(body.metadata) ? body.metadata : {};
   const sessionId = options?.sessionId ?? processFallbackSessionId;
   const tier = resolveContextLength(route.modelConfig.context_config, model.contextWindow);
+  const { requestSetId } = resolveRunIdentity({
+    mode: route.mode,
+    upstreamKey: route.upstreamKey,
+    wireSessionId: sessionId,
+    messages,
+    lastUserText: lastUserTextOf(messages),
+    product: "cli",
+    turnKind,
+  });
   body.metadata = {
     ...metadata,
     context: {
       request_id: crypto.randomUUID(),
-      request_set_id: requestSetIdFor(sessionId),
+      request_set_id: requestSetId,
       session_id: sessionId,
       source_session_id: sessionId,
       os_type: osType(),
@@ -282,7 +294,10 @@ export function streamQoderV2(
   const callerOnPayload = options?.onPayload;
   const wrappedOnPayload = async (payload: unknown, selected: Model<Api>): Promise<unknown> => {
     const body = isRecord(payload) ? payload : {};
-    injectQoderFields(body, route, v2Model, options);
+    // The raw transcript view, matching the legacy transport's input. Both
+    // adapters read the same view so one predicate serves both protocols.
+    const messages = withoutInitialSystemMessage(context.messages);
+    injectQoderFields(body, route, v2Model, options, messages, classifyTurnKind(options?.maxTokens));
     if (callerOnPayload) {
       const next = await callerOnPayload(body, selected);
       return next !== undefined ? next : body;
