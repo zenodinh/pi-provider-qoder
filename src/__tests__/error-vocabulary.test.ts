@@ -643,13 +643,20 @@ describe("FS-5 — EOF alignment is the one intended verdict flip", () => {
     expect(isRetryableAssistantError(error.error)).toBe(true);
   });
 
-  it("T-03 pins the aligned text exactly, so dropping the added word turns this red", () => {
-    expect(ALIGNED_EOF_TEXT).toBe("Qoder stream ended before a terminal response event (unexpected EOF)");
-    expect(ALIGNED_EOF_TEXT).toContain(HOST_EOF_PATTERN);
+  it("T-03 pins the rendered text exactly, so dropping the added word turns this red", async () => {
+    // Rendered through the real transport and compared against the literal this
+    // pin owns, so a wording drift at stream.ts:754 fails here, not only in the
+    // table row above.
+    const message = await renderedError({
+      apiKey: "fake",
+      fetch: mockFetch(sseEnvelope(chunk({ content: "hi" }))),
+    });
+    expect(message).toBe("Qoder stream ended before a terminal response event (unexpected EOF)");
+    expect(message).toContain(HOST_EOF_PATTERN);
     // The pre-alignment wording the classifier missed: "before a terminal event"
     // is not a substring of "before a terminal response event", so its absence
     // proves the added word really is in the text.
-    expect(ALIGNED_EOF_TEXT.includes("before a terminal event")).toBe(false);
+    expect(message.includes("before a terminal event")).toBe(false);
   });
 
   it("T-02 keeps the four documented misses non-retryable", () => {
