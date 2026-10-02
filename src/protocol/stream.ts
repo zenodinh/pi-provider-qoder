@@ -751,7 +751,7 @@ export function streamQoder(
 
       throwIfAborted();
       if (output.stopReason === "pending") {
-        if (!sawDone) throw new Error("Qoder stream ended before a terminal event (unexpected EOF)");
+        if (!sawDone) throw new Error("Qoder stream ended before a terminal response event (unexpected EOF)");
         // Some gateway variants send only [DONE], without a finish_reason.
         output.stopReason = "stop";
       }
