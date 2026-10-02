@@ -59,8 +59,7 @@ import {
  * Beyond the spec's 22, two more texts reach the host through `abort(new Error(...))`
  * rather than a `throw` statement, so a census scoped to throw sites misses them:
  * `Qoder request timeout` (`stream.ts:166`) and `Qoder stream idle timeout`
- * (`stream.ts:414`). Both are pinned below and both classify as RETRYABLE — they are
- * the only two transient-looking legacy failures the host retries today.
+ * (`stream.ts:414`). Both are pinned below and both classify as RETRYABLE.
  */
 
 function makeModel(provider: "qoder" | "qoder-cn" = "qoder", id = "Lite"): Model<Api> {
@@ -171,6 +170,15 @@ interface BoundedSite {
   render: () => Promise<string>;
 }
 
+/**
+ * FS-5's one-word alignment: the rendered EOF text now contains the host's
+ * purpose-built pattern verbatim, so pi's agent-level retry re-dispatches the
+ * turn. One spelling, shared by the exact-instance row, the verdict table and
+ * the FS-5 rows below, so a drift cannot leave them disagreeing.
+ */
+const ALIGNED_EOF_TEXT = "Qoder stream ended before a terminal response event (unexpected EOF)";
+const HOST_EOF_PATTERN = "stream ended before a terminal response event";
+
 const BOUNDED_SITES: BoundedSite[] = [
   {
     site: "stream.ts:181",
@@ -250,7 +258,7 @@ const BOUNDED_SITES: BoundedSite[] = [
   },
   {
     site: "stream.ts:754",
-    text: "Qoder stream ended before a terminal event (unexpected EOF)",
+    text: ALIGNED_EOF_TEXT,
     // A content delta, no finish_reason and no sentinel: the body just closes.
     render: () => renderedError({ apiKey: "fake", fetch: mockFetch(sseEnvelope(chunk({ content: "hi" }))) }),
   },
@@ -507,12 +515,11 @@ function failedMessage(errorMessage: string, stopReason: AssistantMessage["stopR
  * calling the real classifier imported read-only from the devDep copy of pi-ai —
  * never stubbed.
  *
- * The shape of the table is the finding: of 24 rendered texts, exactly four
- * retry, and three of those four retry only because a bare HTTP status or the
- * word "timeout" happens to appear in the prose. The EOF row is the accepted
- * miss FS-5 inverts — the host pattern is "stream ended before a terminal
- * response event" and this repo renders "...before a terminal event", so the
- * substring never matches.
+ * The shape of the table is the finding: of 24 rendered texts, exactly five
+ * retry. Four retry only because a bare HTTP status or the word "timeout"
+ * happens to appear in the prose; the fifth — the EOF text — retries because
+ * FS-5 (CU-01) aligned it to the host's purpose-built pattern "stream ended
+ * before a terminal response event", which is the one intended flip here.
  */
 const CLASSIFIER_VERDICTS: Array<{ text: string; retryable: boolean; note?: string }> = [
   { text: "Qoder generation ended with content_filter", retryable: false },
@@ -541,9 +548,9 @@ const CLASSIFIER_VERDICTS: Array<{ text: string; retryable: boolean; note?: stri
   { text: 'Qoder upstream error: {"message":"boom"}', retryable: false },
   { text: "Malformed Qoder SSE data", retryable: false },
   {
-    text: "Qoder stream ended before a terminal event (unexpected EOF)",
-    retryable: false,
-    note: "the accepted miss FS-5 inverts: the host pattern says 'terminal response event'",
+    text: ALIGNED_EOF_TEXT,
+    retryable: true,
+    note: "FS-5 CU-01: contains the host pattern 'terminal response event' verbatim — the one intended flip",
   },
   { text: "Qoder tool call was truncated by the output token limit", retryable: false },
   { text: "Qoder finished with tool_calls but returned no tool calls", retryable: false },
@@ -564,7 +571,7 @@ describe("host classifier verdicts, executed rather than inferred", () => {
     },
   );
 
-  it("retries exactly four of the shipped texts, and all four are transient by nature", () => {
+  it("retries exactly five of the shipped texts, and each is transient by nature", () => {
     const retryable = CLASSIFIER_VERDICTS.filter((row) => isRetryableAssistantError(failedMessage(row.text)));
     expect(retryable.map((row) => row.text).sort()).toEqual(
       [
@@ -572,6 +579,7 @@ describe("host classifier verdicts, executed rather than inferred", () => {
         "Qoder API request failed: 500 Internal Server Error. Response: upstream blew up",
         "Qoder request timeout",
         "Qoder stream idle timeout",
+        ALIGNED_EOF_TEXT,
       ].sort(),
     );
   });
@@ -603,5 +611,60 @@ describe("host classifier verdicts, executed rather than inferred", () => {
         failedMessage('Qoder upstream error: {"code":"insufficient_quota","message":"billing"}'),
       ),
     ).toBe(false);
+  });
+});
+
+/**
+ * FS-5 — the intended flip, executed end to end.
+ *
+ * T-01 runs the real legacy transport over a body that closes without the DONE
+ * sentinel and hands the rendered text straight to the real host classifier: the
+ * prose is the only thing deciding whether pi re-dispatches the turn.
+ * T-03 pins that same text as an exact instance, so losing the added word turns
+ * the pin red instead of silently reverting the behaviour.
+ * T-02 pins that the intended flip does not widen: the four documented misses
+ * stay non-retryable, so aligning one text cannot start replaying a billable
+ * POST for a deterministic failure.
+ */
+describe("FS-5 — EOF alignment is the one intended verdict flip", () => {
+  it("T-01 retries a legacy stream that ends without a terminal response event", async () => {
+    const events = await consume(
+      streamQoder(makeModel(), makeContext(), {
+        apiKey: "fake",
+        fetch: mockFetch(sseEnvelope(chunk({ content: "hi" }))),
+      }),
+    );
+    const error = events.find(isErrorEvent);
+    if (!error) throw new Error("expected the no-sentinel dispatch to terminate with an error event");
+
+    // The rendered string the legacy dispatch actually produces. The classifier
+    // is imported read-only from the devDep pi-ai and never stubbed.
+    expect(error.error.errorMessage).toBe(ALIGNED_EOF_TEXT);
+    expect(isRetryableAssistantError(error.error)).toBe(true);
+  });
+
+  it("T-03 pins the aligned text exactly, so dropping the added word turns this red", () => {
+    expect(ALIGNED_EOF_TEXT).toBe("Qoder stream ended before a terminal response event (unexpected EOF)");
+    expect(ALIGNED_EOF_TEXT).toContain(HOST_EOF_PATTERN);
+    // The pre-alignment wording the classifier missed: "before a terminal event"
+    // is not a substring of "before a terminal response event", so its absence
+    // proves the added word really is in the text.
+    expect(ALIGNED_EOF_TEXT.includes("before a terminal event")).toBe(false);
+  });
+
+  it("T-02 keeps the four documented misses non-retryable", () => {
+    const misses: Array<{ site: string; text: string }> = [
+      { site: "stream.ts:745", text: "Malformed Qoder SSE data" },
+      {
+        site: "stream.ts:594",
+        text: `Qoder SSE buffer exceeded ${MAX_SSE_BUFFER_LENGTH} characters without a complete line`,
+      },
+      { site: "stream.ts:499", text: "No response body" },
+      { site: "stream.ts:648", text: 'Qoder upstream error: {"message":"boom"}' },
+    ];
+    for (const { text } of misses) {
+      expect(isRetryableAssistantError(failedMessage(text))).toBe(false);
+    }
+    expect(isRetryableAssistantError(failedMessage(ALIGNED_EOF_TEXT))).toBe(true);
   });
 });
