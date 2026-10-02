@@ -20,6 +20,7 @@ afterEach(() => {
   }
   vi.unstubAllGlobals();
   vi.doUnmock("@earendil-works/pi-ai/compat");
+  vi.doUnmock("../host-seam.js");
   vi.resetModules();
 });
 
@@ -149,6 +150,10 @@ describe("qoder-api registry", () => {
     vi.doMock("@earendil-works/pi-ai/compat", () => ({
       // OMP bundled pi-ai/compat does not export registerApiProvider.
     }));
+    // Not the seam's typeof guard: vitest's factory-mock proxy throws on a key the
+    // factory omits, so this row reaches host-seam.ts's catch branch — the same one
+    // the pre-seam index.ts:70-78 read took. The absent-export branch (typeof guard)
+    // is witnessed directly in host-seam.test.ts, T-01.
 
     const { default: registerProviders } = await import("../index.js");
 
@@ -171,6 +176,50 @@ describe("qoder-api registry", () => {
     expect(providers.get("qoder-cn")?.api).toBe("qoder-api");
     expect(typeof providers.get("qoder")?.streamSimple).toBe("function");
     expect(typeof providers.get("qoder-cn")?.streamSimple).toBe("function");
+  });
+});
+
+/**
+ * The registration handed to the seam (spec fs-qoder-host-seam CU-03, T-06).
+ *
+ * T-06 pins what the relocation must not change: the api name, the router bound
+ * to both `stream` and `streamSimple`, the `provider:qoder` source id — and a
+ * factory that still completes when the seam reports no compat registry, which
+ * is the OMP path the extension has supported since the a238e42 rename break.
+ */
+describe("host seam registration (T-06, AC-06)", () => {
+  it("T-06 passes the unchanged config and starts on a compat-less host", async () => {
+    for (const name of patEnvNames) delete process.env[name];
+    // `false` is the seam's answer on a host without a compat registry.
+    const seamCalls: { config: Record<string, unknown>; source: string }[] = [];
+    const registerQoderApiProvider = vi.fn(async (config: unknown, source: string) => {
+      seamCalls.push({ config: config as Record<string, unknown>, source });
+      return false;
+    });
+    vi.doMock("../host-seam.js", () => ({ registerQoderApiProvider }));
+
+    const providers = new Map<string, Record<string, unknown>>();
+    const registerProvider = vi.fn((providerID: string, config: Record<string, unknown>) => {
+      providers.set(providerID, config);
+    });
+    const pi = { registerProvider, registerCommand: vi.fn(), on: vi.fn() };
+
+    const { default: registerProviders } = await import("../index.js");
+    await expect(registerProviders(pi as never)).resolves.toBeUndefined();
+
+    // A compat-less host still starts and still registers both regions.
+    expect(registerProvider).toHaveBeenCalledTimes(2);
+    expect(providers.has("qoder")).toBe(true);
+    expect(providers.has("qoder-cn")).toBe(true);
+
+    expect(seamCalls.length).toBe(1);
+    const [{ config, source }] = seamCalls;
+    expect(config.api).toBe("qoder-api");
+    expect(config.stream).toBe(config.streamSimple);
+    expect(typeof config.stream).toBe("function");
+    // Same module graph, so this is the identical router binding the host gets.
+    expect(config.stream).toBe(providers.get("qoder")?.streamSimple);
+    expect(source).toBe("provider:qoder");
   });
 });
 

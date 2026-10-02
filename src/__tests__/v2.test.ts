@@ -7,6 +7,7 @@ import {
   type AssistantMessage,
   type AssistantMessageEvent,
   type Context,
+  lazyStream,
   type Model,
   normalizeContext,
   type SimpleStreamOptions,
@@ -793,5 +794,66 @@ describe("stamp tail on the v2 transport", () => {
     // dfmodel's v2 lookup would say "rate-table"; legacy's assembly priced the
     // Credits and wrote "credits". The forwarded value is legacy's, untouched.
     expect((result.usage as AssistantMessage["usage"] & { rateSource?: string }).rateSource).toBe("credits");
+  });
+});
+
+/**
+ * The host seam at the registered entry (spec fs-qoder-host-seam CU-02, T-05).
+ *
+ * T-05 pins both halves of AC-03: the guarded acquisition keeps the synchronous
+ * return the host's warm path calls `.result()` on, and a seam failure reaches
+ * the host as a terminal error event rather than an exception. The host's
+ * provider composer calls the extension inside `lazyStream`
+ * (`provider-composer.js` `streamWith`), which converts a synchronous setup
+ * throw into an error event on a synchronously returned stream — so the failure
+ * row drives the router exactly the way the host does.
+ */
+describe("the host seam keeps the registered entry synchronous (T-05)", () => {
+  afterEach(() => {
+    vi.doUnmock("@earendil-works/pi-ai/compat");
+    vi.resetModules();
+  });
+
+  it("T-05 returns a stream with a callable .result, never a thenable", async () => {
+    seedCatalogWithTiers();
+    const { calls, fetch } = v2FetchCapture();
+    const returned = streamQoderRouter(modelNamed("Ultimate"), context, {
+      apiKey: "fake",
+      fetch,
+      sessionId: "sess-seam",
+    });
+
+    // A promise would pass `await` here and only fail on the host's warm path.
+    expect(returned).not.toBeInstanceOf(Promise);
+    expect((returned as { then?: unknown }).then).toBeUndefined();
+    expect(typeof (returned as { result?: unknown }).result).toBe("function");
+    expect((await returned.result()).stopReason).toBe("stop");
+    expect(calls.length).toBe(1);
+  });
+
+  it("T-05 turns a missing compat export into a terminal error event, not a host exception", async () => {
+    // A host whose compat facade lost its exports: the name resolves to undefined.
+    vi.doMock("@earendil-works/pi-ai/compat", () => ({
+      openAICompletionsApi: undefined,
+      registerApiProvider: undefined,
+    }));
+    vi.resetModules();
+    seedCatalogWithTiers();
+    const { streamQoderRouter: routerOnCompatlessHost } = await import("../protocol/router.js");
+    const { fetch } = v2FetchCapture();
+    const model = modelNamed("Ultimate");
+    const options = { apiKey: "fake", fetch };
+
+    // The adapter surfaces the named seam error rather than degrading to undefined…
+    expect(() => routerOnCompatlessHost(model, context, options)).toThrow(/Qoder host seam/);
+
+    // …and the host's own wrapper turns that throw into a terminal error event.
+    const stream = lazyStream(model, async () => routerOnCompatlessHost(model, context, options));
+    expect(stream).not.toBeInstanceOf(Promise);
+    expect((stream as { then?: unknown }).then).toBeUndefined();
+    const result = await stream.result();
+    expect(result.stopReason).toBe("error");
+    expect(result.errorMessage).toContain("Qoder host seam");
+    expect(result.errorMessage).toContain("openAICompletionsApi");
   });
 });

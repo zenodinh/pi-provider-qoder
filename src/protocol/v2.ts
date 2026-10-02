@@ -13,10 +13,10 @@ import {
   type TranscriptContext,
   withoutInitialSystemMessage,
 } from "@earendil-works/pi-ai";
-import { openAICompletionsApi } from "@earendil-works/pi-ai/compat";
 import type { QoderModelEntry } from "../catalog.js";
 import { debugLog } from "../debug.js";
 import { createDebugFetch } from "../debug-log.js";
+import { openAICompletionsApi } from "../host-seam.js";
 import { type RateSource, rateForUpstreamKey } from "../pricing.js";
 import type { QoderMode } from "../region.js";
 import { PROCESS_FALLBACK_SESSION_ID, planQoderTurn, type TurnPlan, type TurnPlanSeed } from "./plan.js";
