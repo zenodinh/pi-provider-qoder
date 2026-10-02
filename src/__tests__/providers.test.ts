@@ -150,6 +150,10 @@ describe("qoder-api registry", () => {
     vi.doMock("@earendil-works/pi-ai/compat", () => ({
       // OMP bundled pi-ai/compat does not export registerApiProvider.
     }));
+    // Not the seam's typeof guard: vitest's factory-mock proxy throws on a key the
+    // factory omits, so this row reaches host-seam.ts's catch branch — the same one
+    // the pre-seam index.ts:70-78 read took. The absent-export branch (typeof guard)
+    // is witnessed directly in host-seam.test.ts, T-01.
 
     const { default: registerProviders } = await import("../index.js");
 

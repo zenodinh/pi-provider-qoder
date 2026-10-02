@@ -16,7 +16,7 @@
  * Scanner scope (second substitution, sanctioned 2026-10-03): the spec's literal
  * "the only pi-ai subpath specifier anywhere in src is /compat" is falsified by
  * pre-existing, deliberate test imports — `error-vocabulary.test.ts:13` imports
- * `@earendil-works/pi-ai/utils/retry`, and `providers.test.ts:22,95,99,104,149`
+ * `@earendil-works/pi-ai/utils/retry`, and `providers.test.ts:22,96,100,105,150`
  * carry compat mocks. Those modules are never loaded by the host (pi loads only
  * `src/index.ts` and its import graph), so T-03 is scoped to the host-loadable
  * production surface.
@@ -392,6 +392,15 @@ describe("host seam acquisition", () => {
     await expect(seam.registerQoderApiProvider({ api: "qoder-api" }, "provider:qoder")).resolves.toBe(false);
   });
 
+  it("T-01 refuses a facade whose accessor no longer returns an Api", async () => {
+    vi.doMock(compatSpecifier, () => ({ openAICompletionsApi: () => undefined }));
+
+    const seam = await import("../host-seam.js");
+    // "never returns undefined": the call site must not have to null-check.
+    expect(() => seam.openAICompletionsApi()).toThrow(/Qoder host seam/);
+    expect(() => seam.openAICompletionsApi()).toThrow(/openAICompletionsApi\(\)\.streamSimple/);
+  });
+
   it("T-04 keeps the absent-compat diagnostics when a present export throws", async () => {
     const debugLog = vi.fn();
     vi.doMock("../debug.js", () => ({ debugLog }));
@@ -442,7 +451,8 @@ describe("host seam scanner", () => {
   });
 
   it("T-03 imports only /compat from pi-ai in the host-loadable modules", () => {
-    const files = typescriptFiles(srcRoot).filter((file) => !file.includes("/__tests__/"));
+    const testsRoot = join(srcRoot, "__tests__");
+    const files = typescriptFiles(srcRoot).filter((file) => !file.startsWith(testsRoot));
     expect(files.length).toBeGreaterThan(10);
     expect(files).toContain(seamFile);
 

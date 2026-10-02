@@ -729,6 +729,7 @@ describe("the host seam keeps the registered entry synchronous (T-05)", () => {
 
     // A promise would pass `await` here and only fail on the host's warm path.
     expect(returned).not.toBeInstanceOf(Promise);
+    expect((returned as { then?: unknown }).then).toBeUndefined();
     expect(typeof (returned as { result?: unknown }).result).toBe("function");
     expect((await returned.result()).stopReason).toBe("stop");
     expect(calls.length).toBe(1);
@@ -753,6 +754,7 @@ describe("the host seam keeps the registered entry synchronous (T-05)", () => {
     // …and the host's own wrapper turns that throw into a terminal error event.
     const stream = lazyStream(model, async () => routerOnCompatlessHost(model, context, options));
     expect(stream).not.toBeInstanceOf(Promise);
+    expect((stream as { then?: unknown }).then).toBeUndefined();
     const result = await stream.result();
     expect(result.stopReason).toBe("error");
     expect(result.errorMessage).toContain("Qoder host seam");
