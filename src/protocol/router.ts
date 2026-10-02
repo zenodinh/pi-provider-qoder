@@ -4,6 +4,7 @@
 import type { Api, Model, SimpleStreamOptions, TranscriptContext } from "@earendil-works/pi-ai";
 import { getCachedModelConfig } from "../catalog.js";
 import { debugLog } from "../debug.js";
+import { setDebugSession } from "../debug-log.js";
 import type { QoderMode } from "../region.js";
 import { getRoutingData, isMarkedLegacyOnly, PROTOCOL, type Protocol } from "./routing.js";
 import { filterSamplingParams } from "./sampling.js";
@@ -46,6 +47,9 @@ export function resolveProtocol(upstreamKey: string, mode: QoderMode, options?: 
  */
 export function streamQoderRouter(model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions) {
   const mode: QoderMode = model.provider === "qoder-cn" ? "cn" : "global";
+  // Attribute extension-level debug records (catalog refresh, routing notes)
+  // to the session that triggered them; no-op when QODER_DEBUG is unset.
+  setDebugSession(options?.sessionId);
   const modelConfig = getCachedModelConfig(model.id, mode);
   if (!modelConfig?.key) {
     // Mirror the legacy path's fail-fast: unknown model ids error before any

@@ -22,6 +22,7 @@ import { handleCacheCommand } from "./commands/cache.js";
 import { handleContextCommand } from "./commands/context.js";
 import { handleQuotaCommand } from "./commands/quota.js";
 import { debugLog } from "./debug.js";
+import { setDebugSession } from "./debug-log.js";
 import { getPiAgentDir } from "./home.js";
 import {
   clampLifetimeSeconds,
@@ -229,6 +230,9 @@ export default async function (pi: ExtensionAPI, deps: QoderExtensionDeps = {}) 
   // Refresh once per session at startup if the cache is missing or stale,
   // rather than on every message in the stream hot path.
   pi.on("session_start", async (_event, ctx) => {
+    // Attribute startup debug records (catalog refresh, lifetime learning) to
+    // this session's file; requests re-attribute per call in the router.
+    setDebugSession(ctx.sessionManager?.getSessionId?.());
     if (legacy.present) {
       // Post-bind re-check: a user-reordered package list can make the
       // factory-time eviction miss; post-bind unregister closes that gap.

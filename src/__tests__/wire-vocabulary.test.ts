@@ -1,4 +1,5 @@
-import { writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Api, type Context, type Model, normalizeContext, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -7,6 +8,7 @@ import { clearQoderModelsMemCache, staticModels } from "../catalog.js";
 import { streamQoderRouter } from "../protocol/router.js";
 import { clearQoderFallbackCache, clearQoderRoutingMemCache } from "../protocol/routing.js";
 import { clearQoderFilterMemCache } from "../protocol/sampling.js";
+import { debugMessages } from "./debug-sink.js";
 
 // SA rows 1/2/7/8/9 regression: the wire vocabulary the host contract promises.
 // Everything enters through the registered streamSimple (streamQoderRouter) with
@@ -124,6 +126,8 @@ function bodyOf(calls: { url: unknown; body?: Record<string, unknown> }[], index
 describe("v2 wire vocabulary (SA rows 1, 8, 9, 10)", () => {
   it("keeps the transcript contract: exactly one system message, the tool set, the upstream key, and the provider.request debug line", async () => {
     vi.stubEnv("QODER_DEBUG", "1");
+    const debugDir = mkdtempSync(join(tmpdir(), "wire-vocab-debug-"));
+    vi.stubEnv("QODER_DEBUG_DIR", debugDir);
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const { calls, fetch } = v2FetchCapture();
     const result = await streamQoderRouter(modelNamed("Ultimate"), context, {
@@ -150,9 +154,12 @@ describe("v2 wire vocabulary (SA rows 1, 8, 9, 10)", () => {
     const metadata = body.metadata as { context: { session_id?: string } };
     expect(metadata.context.session_id).toBe("session-1");
 
-    const debugLines = errorSpy.mock.calls.map((call) => String(call[0]));
+    // Sink contract (owner directive 2026-10-02): the provider.request debug
+    // line lands in the session's JSONL file; the console stays silent.
+    expect(errorSpy).not.toHaveBeenCalled();
+    const sinkMessages = debugMessages(debugDir, "session-1");
     expect(
-      debugLines.some((line) => line.includes("provider.request model_key=ultimate protocol=v2 source=routing-data")),
+      sinkMessages.some((line) => line.includes("provider.request model_key=ultimate protocol=v2 source=routing-data")),
     ).toBe(true);
   });
 

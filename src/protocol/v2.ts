@@ -15,6 +15,7 @@ import {
 import { openAICompletionsApi } from "@earendil-works/pi-ai/compat";
 import type { QoderModelEntry } from "../catalog.js";
 import { debugLog } from "../debug.js";
+import { createDebugFetch } from "../debug-log.js";
 import { type RateSource, rateForUpstreamKey } from "../pricing.js";
 import type { QoderMode } from "../region.js";
 import { markLegacyOnly } from "./routing.js";
@@ -291,9 +292,19 @@ export function streamQoderV2(
 
   // The gateway intermittently splits event JSON across lines (recorded
   // 2026-09-28); repair the framing before the SDK's strict SSE parser sees it.
+  // Debug capture wraps the base fetch INSIDE the reframe wrapper: the capture
+  // tees raw server bytes, and reframe still repairs the framing downstream.
+  const debugSession = options?.sessionId ?? processFallbackSessionId;
   const inner = openAICompletionsApi().streamSimple(v2Model, context, {
     ...options,
-    fetch: createReframedFetch(options?.fetch ?? globalThis.fetch),
+    fetch: createReframedFetch(
+      createDebugFetch(options?.fetch ?? globalThis.fetch, {
+        protocol: "v2",
+        session: debugSession,
+        model: model.id,
+        upstreamKey: route.upstreamKey,
+      }),
+    ),
     onPayload: wrappedOnPayload,
   });
 
