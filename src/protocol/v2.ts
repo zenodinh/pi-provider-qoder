@@ -4,7 +4,6 @@
 import {
   type Api,
   type AssistantMessage,
-  type AssistantMessageEvent,
   type AssistantMessageEventStream,
   clampThinkingLevel,
   createAssistantMessageEventStream,
@@ -24,6 +23,7 @@ import { PROCESS_FALLBACK_SESSION_ID, planQoderTurn, type TurnPlan, type TurnPla
 import { markLegacyOnly } from "./routing.js";
 import { classifyTurnKind, type QoderRunMessage, resolveRunIdentity } from "./run-identity.js";
 import { createReframedFetch } from "./sse-reframe.js";
+import { withTerminalStamp } from "./stamp.js";
 import { MAX_PROMPT_CACHE_KEY_LENGTH, streamQoder } from "./stream.js";
 import { contentToText } from "./transform.js";
 
@@ -206,9 +206,9 @@ function isInvalidModelErrorEvent(event: unknown): boolean {
   return /^400\D/.test(message) && message.includes("invalid_model_error");
 }
 
-function errorStream(model: Model<Api>, message: string): AssistantMessageEventStream {
-  const stream = createAssistantMessageEventStream();
-  const output: AssistantMessage = {
+/** The terminal error message the pre-dispatch error streams and the tail's failure path both report. */
+function errorMessage(model: Model<Api>, message: string): AssistantMessage {
+  return {
     role: "assistant",
     content: [],
     api: model.api,
@@ -226,38 +226,22 @@ function errorStream(model: Model<Api>, message: string): AssistantMessageEventS
     errorMessage: message,
     timestamp: Date.now(),
   };
-  stream.push({ type: "error", reason: "error", error: output });
+}
+
+function errorStream(model: Model<Api>, message: string): AssistantMessageEventStream {
+  const stream = createAssistantMessageEventStream();
+  stream.push({ type: "error", reason: "error", error: errorMessage(model, message) });
   stream.end();
   return stream;
 }
 
-type V2QoderUsage = AssistantMessage["usage"] & { rateSource?: RateSource };
-
-/** Stamp the pricing source on a terminal event's message; the cost fields stay pi-ai's. */
-function stampRateSource(event: AssistantMessageEvent, rateSource: RateSource): void {
-  const message = event.type === "done" ? event.message : event.type === "error" ? event.error : undefined;
-  if (message) (message.usage as V2QoderUsage).rateSource = rateSource;
-}
-
 /**
- * Pass-through wrapper that stamps `rateSource` on the terminal message without
- * touching pi-ai's computed cost. Every event is otherwise forwarded unchanged.
+ * Pass-through tail that stamps `rateSource` on a priced terminal message
+ * without touching pi-ai's computed cost; the shared wrapper supplies the
+ * ordered terminal-before-end guarantee.
  */
 function withRateSourceStamp(inner: AssistantMessageEventStream, rateSource: RateSource): AssistantMessageEventStream {
-  const out = createAssistantMessageEventStream();
-  void (async () => {
-    for await (const event of inner) {
-      stampRateSource(event, rateSource);
-      out.push(event);
-    }
-    out.end();
-  })().catch((error: unknown) => {
-    debugLog(`provider.v2 rate-source stamp failed: ${error instanceof Error ? error.message : String(error)}`);
-    try {
-      out.end();
-    } catch {}
-  });
-  return out;
+  return withTerminalStamp(inner, { rateSource });
 }
 
 /**
@@ -337,7 +321,10 @@ export function streamQoderV2(
   // came from without touching the cost fields. A legacy self-heal forwards its
   // own events, whose cost stream.ts already stamped at its assembly site.
   const rateSource: RateSource = rateForUpstreamKey(route.upstreamKey) ? "rate-table" : "fallback";
-  if (!fallbackEnabled) return withRateSourceStamp(inner, rateSource);
+  // The v2 side gains the shared ordered tail here; the self-heal below only
+  // decides whether the first event hands the turn to legacy.
+  const stamped = withRateSourceStamp(inner, rateSource);
+  if (!fallbackEnabled) return stamped;
 
   // Self-heal (opt-in): on a pre-start 400 invalid_model_error, the routing
   // row is wrong — retry exactly once on legacy with the UNWRAPPED options and
@@ -345,24 +332,32 @@ export function streamQoderV2(
   const out = createAssistantMessageEventStream();
   void (async () => {
     let firstEvent = true;
-    for await (const event of inner) {
+    for await (const event of stamped) {
       if (firstEvent) {
         firstEvent = false;
         if (isInvalidModelErrorEvent(event)) {
           markLegacyOnly(route.upstreamKey);
           debugLog(`provider.fallback model_key=${route.upstreamKey} from=v2 to=legacy`);
+          // Legacy's own assembly already stamped its events; forwarding them
+          // untouched keeps a priced row's credits-or-rate-table value instead
+          // of overwriting it with v2's two-value lookup.
           const legacyStream = streamQoder(model, context, options, route.plan);
           for await (const legacyEvent of legacyStream) out.push(legacyEvent);
           out.end();
           return;
         }
       }
-      stampRateSource(event, rateSource);
       out.push(event);
     }
     out.end();
   })().catch((error: unknown) => {
-    debugLog(`provider.fallback wrapper failed: ${error instanceof Error ? error.message : String(error)}`);
+    const text = error instanceof Error ? error.message : String(error);
+    debugLog(`provider.fallback wrapper failed: ${text}`);
+    // A failure in this wrapper must still push a terminal before ending, or
+    // the host's await on result() never returns.
+    try {
+      out.push({ type: "error", reason: "error", error: errorMessage(model, text) });
+    } catch {}
     try {
       out.end();
     } catch {}
