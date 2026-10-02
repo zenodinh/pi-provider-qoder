@@ -672,6 +672,7 @@ describe("event vocabulary parity (SA FR-5)", () => {
       "data: [DONE]\n\n";
     const nested = await runLegacyStream(twoThinking);
     const beforeThinking = nested.indexOf("text_end", nested.lastIndexOf("text_delta"));
+    expect(beforeThinking, "the boundary text_end must exist").toBeGreaterThanOrEqual(0);
     expect(beforeThinking).toBeLessThan(nested.lastIndexOf("thinking_start"));
   });
 });
