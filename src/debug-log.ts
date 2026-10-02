@@ -143,8 +143,15 @@ export interface DebugFetchMeta {
   session?: string;
   model?: string;
   upstreamKey?: string;
+  /** The session id this request actually put on the wire (legacy's session_id / v2's metadata.context.session_id). */
+  wireSessionId?: string;
   /** legacy logs its own request record (logical body pre-encoding); the wire body it would see here is COSY-encoded. */
   logRequest?: boolean;
+}
+
+/** The wire-session field for a response record; absent stays absent (no invented values). */
+function wireSessionField(meta: DebugFetchMeta): { wireSessionId?: string } {
+  return meta.wireSessionId !== undefined ? { wireSessionId: meta.wireSessionId } : {};
 }
 
 // shape: wrapper function — trigger #12 (adds capture behavior to an inner
@@ -182,6 +189,7 @@ export function createDebugFetch(inner: typeof fetch, meta: DebugFetchMeta): typ
         protocol: meta.protocol,
         model: meta.model,
         upstreamKey: meta.upstreamKey,
+        ...wireSessionField(meta),
         url,
         status: response.status,
       });
@@ -196,6 +204,7 @@ export function createDebugFetch(inner: typeof fetch, meta: DebugFetchMeta): typ
         protocol: meta.protocol,
         model: meta.model,
         upstreamKey: meta.upstreamKey,
+        ...wireSessionField(meta),
         url,
         status: response.status,
         sse: capped.text,

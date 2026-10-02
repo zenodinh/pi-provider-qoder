@@ -1394,3 +1394,156 @@ describe("streamQoder closes text blocks additively (FS-6)", () => {
     expect(lastEnd).toBeLessThan(sequence.indexOf("done"));
   });
 });
+
+/**
+ * The plan seam on the legacy transport (spec fs-qoder-turn-plan CU-04, T-09..T-11).
+ *
+ * T-09 pins the plan-failure rule through the adapter's existing terminal-error
+ * catch; T-10 pins gate parity on the transport carrying all current traffic;
+ * T-11 pins the outgoing-key precedence the plan must not flatten.
+ */
+describe("plan seam on the legacy transport", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+  });
+
+  /** The router's seed shape, built inline so this suite needs no plan-module import. */
+  const legacySeed = {
+    protocol: "legacy",
+    mode: "global",
+    upstreamKey: "dfmodel",
+    rejectedSamplingKeys: [],
+    piSessionId: "session-plan",
+    wireSessionV2: { promptCacheKey: "session-plan", envelopeAndHeaders: "session-plan" },
+    turnKind: "real",
+    capture: { protocol: "legacy", model: "Lite", session: "session-plan" },
+  } as const;
+
+  /** The ids the run registry rotates per dispatch (OD-5) — not the wire contract under test. */
+  function withoutRotationIds(body: Record<string, unknown>): Record<string, unknown> {
+    const clone = structuredClone(body);
+    for (const key of ["request_id", "request_set_id", "chat_record_id", "business"]) delete clone[key];
+    return clone;
+  }
+
+  it("T-09 a rejected identity becomes a terminal error event, and result() settles", async () => {
+    const { resolveQoderIdentity } = await import("../auth/oauth.js");
+    vi.mocked(resolveQoderIdentity).mockRejectedValueOnce(new Error("identity lookup refused"));
+    const fetchSpy = vi.fn(async () => {
+      throw new Error("the plan rejects before any request is built");
+    });
+
+    const stream = streamQoder(
+      makeModel(),
+      makeContext(),
+      { apiKey: "fake", sessionId: "session-plan", fetch: fetchSpy as unknown as typeof fetch },
+      legacySeed,
+    );
+    const events = await consume(stream);
+    const terminal = events.at(-1) as { type: string; error: AssistantMessage };
+    expect(terminal.type).toBe("error");
+    expect(terminal.error.stopReason).toBe("error");
+    expect(terminal.error.errorMessage).toContain("identity lookup refused");
+    // The host awaits this; an end without a terminal event would leave it pending.
+    expect((await stream.result()).stopReason).toBe("error");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("T-10 the legacy body is identical across the gate, session-bearing and session-less alike", async () => {
+    const { streamQoderRouter } = await import("../protocol/router.js");
+    const model = staticModels.find((candidate) => candidate.id === "DeepSeek-V4-Flash") as Model<Api>;
+
+    for (const sessionId of ["session-gate-parity", undefined]) {
+      const bodies: Record<string, unknown>[] = [];
+      for (const gate of ["", "1"]) {
+        vi.stubEnv("QODER_CORE_PLAN", gate);
+        globalThis.fetch = mockFetch(SUCCESS_SSE);
+        await consume(
+          streamQoderRouter(model, makeContext(), {
+            apiKey: "fake",
+            sessionId,
+            onPayload: (payload: unknown) => {
+              bodies.push(withoutRotationIds(payload as Record<string, unknown>));
+              return undefined;
+            },
+          }),
+        );
+      }
+      expect(bodies, `two dispatches for sessionId=${sessionId ?? "(none)"}`).toHaveLength(2);
+      expect(bodies[1], `gate parity for sessionId=${sessionId ?? "(none)"}`).toEqual(bodies[0]);
+      // The session really is on the wire, so the parity is not vacuous.
+      expect(typeof bodies[0].session_id).toBe("string");
+    }
+  });
+
+  it("T-10 a legacy capture record carries the same wire session id the body did", async () => {
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { readDebugRecords } = await import("./debug-sink.js");
+    const dir = mkdtempSync(join(tmpdir(), "qoder-plan-legacy-"));
+    process.env.QODER_DEBUG = "1";
+    process.env.QODER_DEBUG_DIR = dir;
+    process.env.QODER_CORE_PLAN = "1";
+    try {
+      const { streamQoderRouter } = await import("../protocol/router.js");
+      const model = staticModels.find((candidate) => candidate.id === "DeepSeek-V4-Flash") as Model<Api>;
+      const bodies: Record<string, unknown>[] = [];
+      globalThis.fetch = mockFetch(SUCCESS_SSE);
+      await consume(
+        streamQoderRouter(model, makeContext(), {
+          apiKey: "fake",
+          sessionId: "session-capture",
+          onPayload: (payload: unknown) => {
+            bodies.push(payload as Record<string, unknown>);
+            return undefined;
+          },
+        }),
+      );
+      // The request record is written before dispatch, so it is on disk already.
+      const record = readDebugRecords(dir, "session-capture").find((entry) => entry.type === "request");
+      expect(record?.wireSessionId).toBe(bodies[0].session_id);
+      expect(record?.wireSessionId).toBe("qoder-session-test-user-dfmodel-session-capture");
+    } finally {
+      delete process.env.QODER_DEBUG;
+      delete process.env.QODER_DEBUG_DIR;
+      delete process.env.QODER_CORE_PLAN;
+    }
+  });
+
+  it("T-11 an onPayload rewrite of model_config.key still decides X-Model-Key", async () => {
+    vi.stubEnv("QODER_CORE_PLAN", "1");
+    const { streamQoderRouter } = await import("../protocol/router.js");
+    const model = staticModels.find((candidate) => candidate.id === "DeepSeek-V4-Flash") as Model<Api>;
+    const captured: Record<string, unknown>[] = [];
+    let init: RequestInit | undefined;
+    const fetch = vi.fn(async (_input: unknown, request?: RequestInit) => {
+      init = request;
+      return new Response(SUCCESS_SSE, { headers: { "content-type": "text/event-stream" } });
+    }) as unknown as typeof globalThis.fetch;
+
+    const result = await streamQoderRouter(model, makeContext(), {
+      apiKey: "fake",
+      fetch,
+      sessionId: "session-model-key",
+      onPayload: (payload: unknown) => {
+        const body = payload as Record<string, unknown>;
+        captured.push(body);
+        return { ...body, model_config: { ...(body.model_config as Record<string, unknown>), key: "remapped-key" } };
+      },
+    }).result();
+
+    expect(result.stopReason).toBe("stop");
+    const headers = new Headers(init?.headers as HeadersInit);
+    expect(headers.get("X-Model-Key")).toBe("remapped-key");
+    // The plan's own upstream key and the body's key keep their values.
+    expect((captured[0].model_config as { key: string }).key).toBe("dfmodel");
+    expect((captured[0].chat_context as { extra: { modelConfig: { key: string } } }).extra.modelConfig.key).toBe(
+      "dfmodel",
+    );
+  });
+});

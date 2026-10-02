@@ -2,6 +2,13 @@ import type { CacheWarmingDecisionEvent } from "@earendil-works/pi-coding-agent"
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { assistantEntry, warmEntry } from "./session-fixtures.js";
 
+// Spy seam for T-15: the mode the handler derives is only observable through the
+// guard call it makes, so the guard module is wrapped with its real behavior.
+vi.mock("../warm-guard.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../warm-guard.js")>();
+  return { ...actual, evaluateGuard: vi.fn(actual.evaluateGuard) };
+});
+
 // Keep the extension's startup path offline and deterministic: a visible PAT
 // would make it attempt a login exchange against the network (same guard as
 // providers.test.ts), and QODER_CACHE_WARM decides the hook under test.
@@ -121,5 +128,35 @@ describe("cache warming decision hook", () => {
 
     process.env.QODER_CACHE_WARM = "1";
     expect(await handler?.({ ...stopDecision, action: "stop" }, qoderCtx)).toEqual({ action: "warm" });
+  });
+});
+
+/**
+ * The warming handler's mode now comes from the shared derivation (spec
+ * fs-qoder-turn-plan CU-06, T-15/AC-01). The guard receives it, so the spy is
+ * the only honest witness of the value handed over.
+ */
+describe("cache warming mode derivation (T-15/AC-01)", () => {
+  it("T-15 passes cn for a qoder-cn model and global otherwise, as the inline ternary did", async () => {
+    process.env.QODER_CACHE_WARM = "1";
+    const handler = (await loadHandlers()).get("cache_warming_decision");
+    expect(handler, "extension did not register a cache_warming_decision handler").toBeDefined();
+    // Same registry generation the freshly imported index.js used, so this is
+    // the very function the handler calls.
+    const { evaluateGuard } = await import("../warm-guard.js");
+    const guardSpy = vi.mocked(evaluateGuard);
+    guardSpy.mockClear();
+
+    await handler?.(stopDecision, {
+      model: { provider: "qoder", id: "Lite" },
+      sessionManager: { getBranch: () => [] },
+    });
+    expect(guardSpy.mock.calls.at(-1)?.[1]).toMatchObject({ mode: "global" });
+
+    await handler?.(stopDecision, {
+      model: { provider: "qoder-cn", id: "Qwen3.7-Plus" },
+      sessionManager: { getBranch: () => [] },
+    });
+    expect(guardSpy.mock.calls.at(-1)?.[1]).toMatchObject({ mode: "cn" });
   });
 });
