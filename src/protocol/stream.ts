@@ -49,7 +49,7 @@ export const MAX_PROMPT_CACHE_KEY_LENGTH = 64;
  */
 const DELTA_FLUSH_INTERVAL_MS = 50;
 
-function stableHash(prefix: string, ...inputs: string[]): string {
+export function stableHash(prefix: string, ...inputs: string[]): string {
   const hash = crypto.createHash("sha256");
   hash.update(prefix);
   for (const input of inputs) {

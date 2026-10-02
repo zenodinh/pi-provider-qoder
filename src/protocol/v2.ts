@@ -81,7 +81,8 @@ function osType(): string {
 // shape: none — dispatch object does not apply: a single length guard on one value.
 // Truncation (not hashing) mirrors pi-ai's clampOpenAIPromptCacheKey; this is
 // the same 64-character prompt_cache_key bound the legacy path enforces in stream.ts.
-function clampPromptCacheKey(id: string): string {
+// Exported so the plan's producer applies the identical bound.
+export function clampPromptCacheKey(id: string): string {
   return id.length <= MAX_PROMPT_CACHE_KEY_LENGTH ? id : id.slice(0, MAX_PROMPT_CACHE_KEY_LENGTH);
 }
 
