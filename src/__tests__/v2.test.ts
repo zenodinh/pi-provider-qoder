@@ -480,7 +480,7 @@ describe("self-heal", () => {
 
   it("retries once on legacy with QODER_FALLBACK=1 and caches the correction", async () => {
     const urls: string[] = [];
-    const fetch = vi.fn(async (input: unknown, init?: RequestInit) => {
+    const fetch = vi.fn(async (input: unknown, _init?: RequestInit) => {
       const url = String(input);
       urls.push(url);
       if (url.includes("chat/completions")) return invalidModelResponse();

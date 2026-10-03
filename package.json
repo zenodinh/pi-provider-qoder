@@ -37,14 +37,14 @@
     ]
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.13",
-    "@earendil-works/pi-ai": "^0.87.1",
-    "@earendil-works/pi-coding-agent": "^0.87.1",
-    "@earendil-works/pi-tui": "^0.87.1",
-    "@vitest/coverage-v8": "^5.0.1",
-    "tsx": "^4.23.13",
+    "@biomejs/biome": "2.5.15",
+    "@earendil-works/pi-ai": "^1.0.0",
+    "@earendil-works/pi-coding-agent": "^1.0.0",
+    "@earendil-works/pi-tui": "^1.0.0",
+    "@vitest/coverage-v8": "^5.0.3",
+    "tsx": "^4.23.15",
     "typescript": "^7.0.2",
-    "vitest": "^5.0.1"
+    "vitest": "^5.0.3"
   },
   "repository": {
     "type": "git",
