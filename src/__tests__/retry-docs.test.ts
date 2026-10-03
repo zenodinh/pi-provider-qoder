@@ -49,4 +49,16 @@ describe("README retry documentation", () => {
     expect(readme).toContain("maps every `text_end` to a `message_update` frame");
     expect(readme).toContain("`--json` output gains one frame per text block on legacy");
   });
+
+  it("documents the transitional core gates in the environment table", () => {
+    // The two QODER_CORE_* gates are the migration's env-flip rollback units; an
+    // undocumented gate cannot be reviewed or deliberately unset. The rows also
+    // state the OD-8 truth: the run-identity fixes are ungated, so flipping
+    // QODER_CORE_PLAN off restores none of them.
+    expect(readme).toContain("`QODER_CORE_PLAN`");
+    expect(readme).toContain("`QODER_CORE_STAMP`");
+    expect(readme).toContain("pre-migration dispatch path");
+    expect(readme).toContain("assembly-site stamps");
+    expect(readme).toContain("stay on with the gate off");
+  });
 });

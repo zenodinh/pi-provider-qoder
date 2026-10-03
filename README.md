@@ -115,6 +115,8 @@ The streamed response is normalized into pi thinking blocks regardless of how th
 | `QODER_DEBUG_MAX_BYTES` | Per-record cap for request bodies and response SSE text (default `2000000`; longer values are truncated and flagged). |
 | `QODER_FALLBACK` | Set to `1` to retry a turn once on the legacy transport when the v2 model-server rejects a model key (stale routing); the correction is cached for the session. Off by default. |
 | `QODER_PROTOCOL` | Force `v2` or `legacy` for every request, overriding the routing table. |
+| `QODER_CORE_PLAN` | Set to `1` to route every dispatch through the turn-plan producer (one awaited plan feeding both adapters the session forms, affinity placements, thinking inputs and capture metadata). Off (default) keeps the pre-migration dispatch path — an env-flip rollback kept for one release. The run-identity fixes are ungated and stay on with the gate off. |
+| `QODER_CORE_STAMP` | Set to `1` to wrap the legacy tail in the shared ordered terminal stamp (terminal-before-end guarantee, priced-only rate-source stamps). Off (default) keeps the pre-migration assembly-site stamps. Transitional, kept one release. |
 | `QODER_MODEL_SERVER_HOST` | Override the v2 model-server base URL (for example to reach a v2 host from the China region). |
 | `QODER_CACHE_WARM` | Set to `1` to approve pi's cache-warming refreshes (requires pi's `cacheWarming` setting; refreshes spend Credits). With the gate on, refreshes are budget-governed per opportunity (`QODER_WARM_BUDGET`). |
 | `QODER_WARM_BUDGET` | Fraction of the protected cache miss an idle window may spend on refreshes (default `0.5`); `off` disables the cap. Invalid values fall back to `0.5` with one debug entry. |
