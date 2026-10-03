@@ -316,6 +316,30 @@ describe("lockfile rules (package-lock.json)", () => {
     );
   });
 
+  it("fails a same-version integrity swap but not an in-place version upgrade", () => {
+    const lock = (version: string, integrity: string) =>
+      JSON.stringify({
+        lockfileVersion: 3,
+        packages: {
+          "": { name: "root" },
+          "node_modules/vitest": {
+            version,
+            resolved: `https://registry.npmjs.org/vitest/-/vitest-${version}.tgz`,
+            integrity,
+          },
+        },
+      });
+
+    // Same version, different tarball: the substitution this rule exists for.
+    const swapped = scan("", { baseLockText: baseLock, headLockText: lock("5.0.1", "sha512-TAMPERED") });
+    expect(rules(swapped, "fail")).toContain("LOCK-INTEGRITY-CHANGED");
+
+    // New version under the same key: an upgrade, not a swap. The manifest
+    // rule already reports the dependency change; the lock rule stays silent.
+    const upgraded = scan("", { baseLockText: baseLock, headLockText: lock("5.0.3", "sha512-ccc") });
+    expect(rules(upgraded, "fail")).toEqual([]);
+  });
+
   it("still fails a non-npm registry without a baseline, without calling every package new", () => {
     const head = JSON.stringify({
       lockfileVersion: 3,

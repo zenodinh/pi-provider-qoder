@@ -427,9 +427,22 @@ export function scanLockfile(baseText: string | undefined, headText: string | un
       });
     }
 
+    // A version change under the same lock path is an in-place upgrade: the new
+    // artifact legitimately carries a new integrity, and the manifest rule
+    // already reports the dependency change. The substitution this rule exists
+    // for — a tarball swapped under an unchanged (or unprovable) version —
+    // keeps failing.
     const previousIntegrity = readStringField(previous, "integrity");
     const integrity = readStringField(entry, "integrity");
-    if (previousIntegrity !== undefined && integrity !== undefined && previousIntegrity !== integrity) {
+    const previousVersion = readStringField(previous, "version");
+    const version = readStringField(entry, "version");
+    const upgradedInPlace = previousVersion !== undefined && version !== undefined && previousVersion !== version;
+    if (
+      previousIntegrity !== undefined &&
+      integrity !== undefined &&
+      previousIntegrity !== integrity &&
+      !upgradedInPlace
+    ) {
       findings.push({
         severity: "fail",
         rule: "LOCK-INTEGRITY-CHANGED",
