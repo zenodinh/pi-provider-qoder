@@ -24,6 +24,7 @@ import { handleQuotaCommand } from "./commands/quota.js";
 import { debugLog } from "./debug.js";
 import { setDebugSession } from "./debug-log.js";
 import { getPiAgentDir } from "./home.js";
+import { registerQoderApiProvider } from "./host-seam.js";
 import {
   clampLifetimeSeconds,
   LEARNER_BUDGET_MS,
@@ -37,6 +38,7 @@ import {
   writeProfile,
 } from "./lifetime.js";
 import { CREDITS_PER_USD, rateForUpstreamKey } from "./pricing.js";
+import { qoderModeFor } from "./protocol/plan.js";
 import { streamQoderRouter } from "./protocol/router.js";
 import { getQoderBaseUrl, getQoderRegionConfig, QODER_MODES, type QoderMode } from "./region.js";
 import { evaluateGuard, parseBudgetEnv } from "./warm-guard.js";
@@ -64,19 +66,17 @@ export interface QoderExtensionDeps {
 
 const QODER_API = "qoder-api" as Api;
 
+/**
+ * Register qoder-api with the host's compat registry. The acquisition, the
+ * registration call and the best-effort failure posture live in host-seam.ts;
+ * a host without a compat registry still starts, because the independent
+ * `pi.registerProvider` path below serves dispatch.
+ */
 async function registerQoderApi(): Promise<void> {
-  try {
-    const compat = await import("@earendil-works/pi-ai/compat");
-    const register = (compat as Record<string, unknown>).registerApiProvider;
-    if (typeof register !== "function") return; // OMP / hosts without the export
-    (register as (config: unknown, source: string) => void)(
-      { api: QODER_API, stream: streamQoderRouter, streamSimple: streamQoderRouter },
-      "provider:qoder",
-    );
-  } catch (error) {
-    // Host has no compat registry; registerProvider(streamSimple) is enough.
-    debugLog("pi-ai/compat registerApiProvider unavailable", error);
-  }
+  await registerQoderApiProvider(
+    { api: QODER_API, stream: streamQoderRouter, streamSimple: streamQoderRouter },
+    "provider:qoder",
+  );
 }
 
 /** USD per 1M tokens from a learned Credits-per-token fit (cacheWrite mirrors input). */
@@ -294,7 +294,7 @@ export default async function (pi: ExtensionAPI, deps: QoderExtensionDeps = {}) 
     if (process.env.QODER_CACHE_WARM !== "1") return undefined;
     const model = ctx.model;
     if (!model || (model.provider !== "qoder" && model.provider !== "qoder-cn")) return undefined;
-    const mode: QoderMode = model.provider === "qoder-cn" ? "cn" : "global";
+    const mode: QoderMode = qoderModeFor(model.provider);
     const budget = parseBudgetEnv(process.env.QODER_WARM_BUDGET);
     const verdict = evaluateGuard(event, {
       entries: ctx.sessionManager.getBranch(),

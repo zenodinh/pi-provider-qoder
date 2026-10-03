@@ -115,6 +115,8 @@ The streamed response is normalized into pi thinking blocks regardless of how th
 | `QODER_DEBUG_MAX_BYTES` | Per-record cap for request bodies and response SSE text (default `2000000`; longer values are truncated and flagged). |
 | `QODER_FALLBACK` | Set to `1` to retry a turn once on the legacy transport when the v2 model-server rejects a model key (stale routing); the correction is cached for the session. Off by default. |
 | `QODER_PROTOCOL` | Force `v2` or `legacy` for every request, overriding the routing table. |
+| `QODER_CORE_PLAN` | Set to `1` to route every dispatch through the turn-plan producer (one awaited plan feeding both adapters the session forms, affinity placements, thinking inputs and capture metadata). Off (default) keeps the pre-migration dispatch path — an env-flip rollback kept for one release. The run-identity fixes are ungated and stay on with the gate off. |
+| `QODER_CORE_STAMP` | Set to `1` to wrap the legacy tail in the shared ordered terminal stamp (terminal-before-end guarantee, priced-only rate-source stamps). Off (default) keeps the pre-migration assembly-site stamps. Transitional, kept one release. |
 | `QODER_MODEL_SERVER_HOST` | Override the v2 model-server base URL (for example to reach a v2 host from the China region). |
 | `QODER_CACHE_WARM` | Set to `1` to approve pi's cache-warming refreshes (requires pi's `cacheWarming` setting; refreshes spend Credits). With the gate on, refreshes are budget-governed per opportunity (`QODER_WARM_BUDGET`). |
 | `QODER_WARM_BUDGET` | Fraction of the protected cache miss an idle window may spend on refreshes (default `0.5`); `off` disables the cap. Invalid values fall back to `0.5` with one debug entry. |
@@ -131,9 +133,27 @@ The streamed response is normalized into pi thinking blocks regardless of how th
 
 ## Host request compatibility
 
-The custom stream supports pi's `onPayload` (before encoding/signing), `onResponse` (before reading the body, including HTTP errors), injected `fetch` (chat and identity lookup), `headers`, `env`, `timeoutMs`, `temperature`, and model/request `maxTokens`. Header overrides are case-insensitive; `null` removes a default. Overriding COSY authentication headers can invalidate signatures. A model `baseUrl` override must point to a Qoder-compatible gateway, not a generic OpenAI endpoint.
+The custom stream supports pi's `onPayload` (before encoding/signing), `onResponse` (before reading the body, including HTTP errors), injected `fetch` (chat and identity lookup), `headers`, `env`, `timeoutMs`, `temperature`, and model/request `maxTokens`. Header overrides are case-insensitive; `null` removes a default. Overriding COSY authentication headers can invalidate signatures. A model `baseUrl` override must point to a Qoder-compatible gateway, not a generic OpenAI endpoint. `onProviderStreamEvent` is honored on the v2 transport only: pi-ai's completions stream invokes the host hook for each parsed event before normalization, while the legacy transport does not call it.
 
-Chat POST requests are not automatically retried, even when `maxRetries` is supplied: replaying a generation may duplicate billing. The host can decide when to retry. Transport remains SSE.
+Legacy turns now close each text block with a `text_end` event, matching v2's event vocabulary. The host maps every `text_end` to a `message_update` frame, so `--json` output gains one frame per text block on legacy.
+
+### Retry behavior
+
+This provider never retries a chat POST inside its own `fetch` layer. `src/retry.ts` retries non-billable requests only — `fetchWithRetry` forces a single attempt for every non-GET method — so that layer never replays a POST. That GET-only policy is unchanged. Transport remains SSE. (The one repo-side re-dispatch is the opt-in `QODER_FALLBACK` self-heal, which fires only when the v2 model-server rejects a model key before a generation starts.)
+
+Two retry layers sit above it, and they differ:
+
+- **Agent-level retry (pi; both protocols).** pi's agent loop retries a failed assistant turn by matching the rendered error text against `isRetryableAssistantError`. It is armed by default in pi (`settings.retry.enabled`), covers both the legacy COSY transport and v2, and re-dispatches the turn with bounded exponential backoff. This provider writes its error text to match that classifier, so a stream that ends without a terminal response event is retried where it previously was not.
+- **Provider-level HTTP retry (pi-ai; v2's model-server calls).** pi-ai can retry the HTTP request itself, but it is disarmed unless you set `settings.retry.provider.maxRetries`. Arming it silently retries v2's billable chat POSTs, which can duplicate billing and spend — it changes spend with no code change and no test. This is the tripwire: leave it unset unless you have measured the cost. The owner's settings leave it unset.
+
+### Re-check after upgrading pi
+
+The retry classifier and the compat facade are host-owned prose and symbols this provider does not control, so a pi upgrade is a contract review, not just a version bump. Re-check:
+
+- the **host seam module** — the single place the two pi-compat symbols (`openAICompletionsApi`, `registerApiProvider`) are acquired, and where a renamed or deleted facade becomes a named error instead of a silent break;
+- the **parity suite** (`src/__tests__/wire-vocabulary.test.ts`, `src/__tests__/error-vocabulary.test.ts`) — body, header and event vocabularies plus every rendered error text;
+- the **retry patterns** in `@earendil-works/pi-ai/utils/retry` — an upstream edit to that alternation silently changes which failures this provider retries, and the executed verdict table in `src/__tests__/error-vocabulary.test.ts` is where the change shows;
+- the **history-repair dependency** (`src/protocol/transform.ts`) — errored and aborted turns are dropped before dispatch by this repo, not by pi, and the cache-neutral retry rotation rests on it.
 
 ## Usage reporting
 

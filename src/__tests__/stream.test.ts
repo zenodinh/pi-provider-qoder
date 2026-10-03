@@ -5,12 +5,16 @@ import type {
   AssistantMessageEventStream,
   Context,
   Model,
+  SimpleStreamOptions,
   ToolCall,
   TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { normalizeContext } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { staticModels } from "../catalog.js";
+import { clearQoderRunRegistry } from "../protocol/run-identity.js";
 import { streamQoder } from "../protocol/stream.js";
+import { streamQoderV2 } from "../protocol/v2.js";
 import { loadLiveFixture } from "./live-fixture.js";
 
 // Pin the identity so the mocked fetch below only ever serves the chat request.
@@ -1177,5 +1181,496 @@ describe("streamQoder", () => {
       { type: "toolCall", id: "native_1", name: "search", arguments: { q: "x" } },
     ]);
     expect(done.message.stopReason).toBe("toolUse");
+  });
+});
+
+/**
+ * Run identity on the wire (spec CU-05, T-08..T-10).
+ *
+ * The legacy body is COSY-encoded before it leaves, so it is captured
+ * pre-signing through onPayload — the same harness wire-vocabulary.test.ts uses.
+ */
+describe("run identity on the wire", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    clearQoderRunRegistry();
+    vi.restoreAllMocks();
+  });
+
+  function contextWith(messages: unknown[]): TranscriptContext {
+    return normalizeContext({ systemPrompt: "test", messages, tools: [] } as unknown as Context);
+  }
+
+  /** The raw pi shape the transform consumes for a completed tool round. */
+  function imageToolRound(): TranscriptContext {
+    return contextWith([
+      { role: "user", content: "read the screenshot" },
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "reading" },
+          { type: "toolCall", id: "call_1", name: "read_file", arguments: { path: "/tmp/shot.png" } },
+        ],
+      },
+      {
+        role: "toolResult",
+        toolCallId: "call_1",
+        content: [
+          { type: "text", text: "Read image file [image/png]" },
+          { type: "image", data: "abc123", mimeType: "image/png" },
+        ],
+      },
+    ]);
+  }
+
+  /** Capture the pre-signing legacy body once per dispatch. */
+  function captureBody(bodies: Record<string, unknown>[]) {
+    return (payload: unknown) => {
+      bodies.push(payload as Record<string, unknown>);
+      return undefined;
+    };
+  }
+
+  it("continues the run for a tool round that returned an image (T-08/AC-01)", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const options = { apiKey: "fake", sessionId: "session-image", onPayload: captureBody(bodies) };
+
+    globalThis.fetch = mockFetch(SUCCESS_SSE);
+    await consume(
+      streamQoder(makeModel("qoder", "Lite"), contextWith([{ role: "user", content: "read the screenshot" }]), options),
+    );
+
+    globalThis.fetch = mockFetch(SUCCESS_SSE);
+    await consume(streamQoder(makeModel("qoder", "Lite"), imageToolRound(), options));
+
+    expect(bodies, "one captured body per dispatch").toHaveLength(2);
+    const prompt = bodies[0];
+    const round = bodies[1];
+    expect(round.request_set_id, "the image round continues the run").toBe(prompt.request_set_id);
+    expect((round.business as { id: string }).id).toBe((prompt.business as { id: string }).id);
+    expect((round.business as { begin_at: number }).begin_at).toBe((prompt.business as { begin_at: number }).begin_at);
+  });
+
+  it("rotates the run identity across a retry while the cache key stays identical (T-09/AC-05)", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const options = { apiKey: "fake", sessionId: "session-retry", onPayload: captureBody(bodies) };
+
+    // Attempt 1 ends in an errored turn.
+    globalThis.fetch = mockFetch(sseEnvelope({ error: { message: "upstream boom" } }) + DONE_SSE);
+    await consume(streamQoder(makeModel("qoder", "Lite"), makeContext(), options));
+
+    // Attempt 2 of the same options: history repair drops the errored assistant
+    // turn, so the raw tail is again a fresh user prompt and the run rotates.
+    globalThis.fetch = mockFetch(SUCCESS_SSE);
+    await consume(
+      streamQoder(
+        makeModel("qoder", "Lite"),
+        contextWith([
+          { role: "user", content: "hi" },
+          { role: "assistant", content: [], stopReason: "error" },
+        ]),
+        options,
+      ),
+    );
+
+    expect(bodies, "one captured body per attempt").toHaveLength(2);
+    expect(bodies[1].request_set_id, "the retry is billed as its own run").not.toBe(bodies[0].request_set_id);
+    expect(bodies[1].session_id, "rotation is cache-neutral").toBe(bodies[0].session_id);
+  });
+
+  it("makes one run-identity call per dispatch, visible as the wire stage (T-10/AC-08)", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    globalThis.fetch = mockFetch(SUCCESS_SSE);
+    await consume(
+      streamQoder(makeModel("qoder", "Lite"), makeContext(), {
+        apiKey: "fake",
+        sessionId: "session-stage",
+        onPayload: captureBody(bodies),
+      }),
+    );
+    expect((bodies[0].business as { stage: string }).stage, "a run's first request reports start").toBe("start");
+
+    // Self-heal: a v2 dispatch falls back to legacy. v2 resolves its own run
+    // identity for metadata.context.request_set_id; the legacy re-dispatch makes
+    // its own single call, so the captured legacy body is a fresh "start"
+    // rather than a slot v2 had already advanced to "processing".
+    clearQoderRunRegistry();
+    const selfHealBodies: Record<string, unknown>[] = [];
+    const fetch = vi.fn(async (input: unknown) => {
+      if (String(input).includes("chat/completions")) {
+        return new Response(
+          JSON.stringify({ error: { type: "invalid_model_error", message: "model not supported" } }),
+          {
+            status: 400,
+            headers: { "content-type": "application/json" },
+          },
+        );
+      }
+      return new Response(SUCCESS_SSE);
+    }) as unknown as typeof globalThis.fetch;
+    const ultimate = staticModels.find((model) => model.id === "Ultimate");
+    if (!ultimate) throw new Error("fixture model missing from static seed: Ultimate");
+    await consume(
+      streamQoderV2(
+        ultimate as Model<Api>,
+        makeContext(),
+        {
+          apiKey: "fake",
+          fetch,
+          sessionId: "session-heal",
+          env: { QODER_FALLBACK: "1" },
+          onPayload: captureBody(selfHealBodies),
+        } as SimpleStreamOptions,
+        { mode: "global", modelConfig: { key: "ultimate" }, upstreamKey: "ultimate" },
+      ),
+    );
+    const legacyBodies = selfHealBodies.filter((body) => "business" in body);
+    expect(legacyBodies, "the self-heal produced exactly one legacy body").toHaveLength(1);
+    expect((legacyBodies[0].business as { stage: string }).stage, "stage reflects only the legacy dispatch").toBe(
+      "start",
+    );
+  });
+});
+
+/**
+ * FS-6 T-03 — legacy's text_end is purely additive.
+ *
+ * The fixture carries text, thinking and a tool call, so every block type the
+ * legacy parser owns is in one sequence. The assertions are the pre-change
+ * outcomes (final content, block order, stop reason) plus the new event's
+ * presence, payload and boundary. Nothing here counts events: legacy coalesces
+ * text_delta by design, so a count could only be wrong.
+ */
+describe("streamQoder closes text blocks additively (FS-6)", () => {
+  const originalFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it("T-03 keeps the message content and block order while adding text_end", async () => {
+    const sse =
+      sseEnvelope(chunk({ content: "before <thinking>reason</thinking> after" })) +
+      sseEnvelope(chunk({ tool_calls: [{ index: 0, id: "call_1", function: { name: "lookup", arguments: "{}" } }] })) +
+      sseEnvelope(finishChunk("tool_calls")) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+    const done = events.find((event) => event.type === "done") as { message: AssistantMessage };
+
+    // The pre-change outcome: same content, same block order, same tool call.
+    expect(done.message.content).toEqual([
+      { type: "text", text: "before " },
+      { type: "thinking", thinking: "reason" },
+      { type: "text", text: " after" },
+      { type: "toolCall", id: "call_1", name: "lookup", arguments: {} },
+    ]);
+    expect(done.message.stopReason).toBe("toolUse");
+
+    // The addition: one text_end per closed block, each carrying the block's
+    // full text at the index its text_start opened.
+    const textEnds = events.filter(
+      (event): event is Extract<AssistantMessageEvent, { type: "text_end" }> => event.type === "text_end",
+    );
+    expect(textEnds.map((event) => event.contentIndex)).toEqual([0, 2]);
+    for (const end of textEnds) {
+      const streamed = events
+        .filter(
+          (event): event is Extract<AssistantMessageEvent, { type: "text_delta" }> =>
+            event.type === "text_delta" && event.contentIndex === end.contentIndex,
+        )
+        .reduce((acc, event) => acc + event.delta, "");
+      expect(end.content).toBe(streamed);
+    }
+    expect(textEnds.at(-1)?.content).toBe(" after");
+
+    // Ordering boundary: the closing event follows its last delta and precedes
+    // the terminal. indexOf, not a fixed position.
+    const sequence = events.map((event) => event.type);
+    const lastEnd = sequence.lastIndexOf("text_end");
+    expect(sequence.lastIndexOf("text_delta", lastEnd)).toBeLessThan(lastEnd);
+    expect(lastEnd).toBeLessThan(sequence.indexOf("done"));
+  });
+});
+
+/**
+ * The plan seam on the legacy transport (spec fs-qoder-turn-plan CU-04, T-09..T-11).
+ *
+ * T-09 pins the plan-failure rule through the adapter's existing terminal-error
+ * catch; T-10 pins gate parity on the transport carrying all current traffic;
+ * T-11 pins the outgoing-key precedence the plan must not flatten.
+ */
+describe("plan seam on the legacy transport", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+  });
+
+  /** The router's seed shape, built inline so this suite needs no plan-module import. */
+  const legacySeed = {
+    protocol: "legacy",
+    mode: "global",
+    upstreamKey: "dfmodel",
+    rejectedSamplingKeys: [],
+    piSessionId: "session-plan",
+    wireSessionV2: { promptCacheKey: "session-plan", envelopeAndHeaders: "session-plan" },
+    turnKind: "real",
+    capture: { protocol: "legacy", model: "Lite", session: "session-plan" },
+  } as const;
+
+  /** The ids the run registry rotates per dispatch (OD-5) — not the wire contract under test. */
+  function withoutRotationIds(body: Record<string, unknown>): Record<string, unknown> {
+    const clone = structuredClone(body);
+    for (const key of ["request_id", "request_set_id", "chat_record_id", "business"]) delete clone[key];
+    return clone;
+  }
+
+  it("T-09 a rejected identity becomes a terminal error event, and result() settles", async () => {
+    const { resolveQoderIdentity } = await import("../auth/oauth.js");
+    vi.mocked(resolveQoderIdentity).mockRejectedValueOnce(new Error("identity lookup refused"));
+    const fetchSpy = vi.fn(async () => {
+      throw new Error("the plan rejects before any request is built");
+    });
+
+    const stream = streamQoder(
+      makeModel(),
+      makeContext(),
+      { apiKey: "fake", sessionId: "session-plan", fetch: fetchSpy as unknown as typeof fetch },
+      legacySeed,
+    );
+    const events = await consume(stream);
+    const terminal = events.at(-1) as { type: string; error: AssistantMessage };
+    expect(terminal.type).toBe("error");
+    expect(terminal.error.stopReason).toBe("error");
+    expect(terminal.error.errorMessage).toContain("identity lookup refused");
+    // The host awaits this; an end without a terminal event would leave it pending.
+    expect((await stream.result()).stopReason).toBe("error");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("T-10 the legacy body is identical across the gate, session-bearing and session-less alike", async () => {
+    const { streamQoderRouter } = await import("../protocol/router.js");
+    const model = staticModels.find((candidate) => candidate.id === "DeepSeek-V4-Flash") as Model<Api>;
+
+    for (const sessionId of ["session-gate-parity", undefined]) {
+      const bodies: Record<string, unknown>[] = [];
+      for (const gate of ["", "1"]) {
+        vi.stubEnv("QODER_CORE_PLAN", gate);
+        globalThis.fetch = mockFetch(SUCCESS_SSE);
+        await consume(
+          streamQoderRouter(model, makeContext(), {
+            apiKey: "fake",
+            sessionId,
+            onPayload: (payload: unknown) => {
+              bodies.push(withoutRotationIds(payload as Record<string, unknown>));
+              return undefined;
+            },
+          }),
+        );
+      }
+      expect(bodies, `two dispatches for sessionId=${sessionId ?? "(none)"}`).toHaveLength(2);
+      expect(bodies[1], `gate parity for sessionId=${sessionId ?? "(none)"}`).toEqual(bodies[0]);
+      // The session really is on the wire, so the parity is not vacuous.
+      expect(typeof bodies[0].session_id).toBe("string");
+    }
+  });
+
+  it("T-10 a legacy capture record carries the same wire session id the body did", async () => {
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { readDebugRecords } = await import("./debug-sink.js");
+    const dir = mkdtempSync(join(tmpdir(), "qoder-plan-legacy-"));
+    process.env.QODER_DEBUG = "1";
+    process.env.QODER_DEBUG_DIR = dir;
+    process.env.QODER_CORE_PLAN = "1";
+    try {
+      const { streamQoderRouter } = await import("../protocol/router.js");
+      const model = staticModels.find((candidate) => candidate.id === "DeepSeek-V4-Flash") as Model<Api>;
+      const bodies: Record<string, unknown>[] = [];
+      globalThis.fetch = mockFetch(SUCCESS_SSE);
+      await consume(
+        streamQoderRouter(model, makeContext(), {
+          apiKey: "fake",
+          sessionId: "session-capture",
+          onPayload: (payload: unknown) => {
+            bodies.push(payload as Record<string, unknown>);
+            return undefined;
+          },
+        }),
+      );
+      // The request record is written before dispatch, so it is on disk already.
+      const record = readDebugRecords(dir, "session-capture").find((entry) => entry.type === "request");
+      expect(record?.wireSessionId).toBe(bodies[0].session_id);
+      expect(record?.wireSessionId).toBe("qoder-session-test-user-dfmodel-session-capture");
+    } finally {
+      delete process.env.QODER_DEBUG;
+      delete process.env.QODER_DEBUG_DIR;
+      delete process.env.QODER_CORE_PLAN;
+    }
+  });
+
+  it("T-11 an onPayload rewrite of model_config.key still decides X-Model-Key", async () => {
+    vi.stubEnv("QODER_CORE_PLAN", "1");
+    const { streamQoderRouter } = await import("../protocol/router.js");
+    const model = staticModels.find((candidate) => candidate.id === "DeepSeek-V4-Flash") as Model<Api>;
+    const captured: Record<string, unknown>[] = [];
+    let init: RequestInit | undefined;
+    const fetch = vi.fn(async (_input: unknown, request?: RequestInit) => {
+      init = request;
+      return new Response(SUCCESS_SSE, { headers: { "content-type": "text/event-stream" } });
+    }) as unknown as typeof globalThis.fetch;
+
+    const result = await streamQoderRouter(model, makeContext(), {
+      apiKey: "fake",
+      fetch,
+      sessionId: "session-model-key",
+      onPayload: (payload: unknown) => {
+        const body = payload as Record<string, unknown>;
+        captured.push(body);
+        return { ...body, model_config: { ...(body.model_config as Record<string, unknown>), key: "remapped-key" } };
+      },
+    }).result();
+
+    expect(result.stopReason).toBe("stop");
+    const headers = new Headers(init?.headers as HeadersInit);
+    expect(headers.get("X-Model-Key")).toBe("remapped-key");
+    // The plan's own upstream key and the body's key keep their values.
+    expect((captured[0].model_config as { key: string }).key).toBe("dfmodel");
+    expect((captured[0].chat_context as { extra: { modelConfig: { key: string } } }).extra.modelConfig.key).toBe(
+      "dfmodel",
+    );
+  });
+});
+
+/**
+ * The shared stamp tail on the legacy transport (spec qoder-stamp-tail CU-02,
+ * T-04/T-05).
+ *
+ * AC-01's kill evidence lives here: cost is written at the assembly site inside
+ * the read loop, so the post-loop toolcall_end frame and every preceding frame
+ * are serialized to `--json` already priced. Moving that write into the tail
+ * would freeze cost zeros into stdout for every tool-use turn — the in-memory
+ * message self-corrects (the frames share the usage object), stdout does not.
+ */
+describe("stamp tail on the legacy transport", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.unstubAllEnvs();
+  });
+
+  /** A tool-use turn whose usage chunk arrives BEFORE the tool deltas. */
+  const toolTurnSse =
+    sseEnvelope(chunk({ content: "working", role: "assistant" })) +
+    sseEnvelope(
+      chunk(
+        {},
+        {
+          usage: {
+            prompt_tokens: 250_000,
+            completion_tokens: 1_000,
+            total_tokens: 251_000,
+            credits: 100.0,
+          },
+        },
+      ),
+    ) +
+    sseEnvelope(
+      chunk({ tool_calls: [{ index: 0, id: "call_1", function: { name: "bash", arguments: '{"command":"ls"}' } }] }),
+    ) +
+    sseEnvelope(finishChunk("tool_calls")) +
+    DONE_SSE;
+
+  async function toolTurnEvents(gate: string): Promise<AssistantMessageEvent[]> {
+    vi.stubEnv("QODER_CORE_STAMP", gate);
+    globalThis.fetch = mockFetch(toolTurnSse);
+    return consume(streamQoder(makeModel("qoder", "DeepSeek-V4-Flash"), makeContext(), { apiKey: "fake" }));
+  }
+
+  /** The tool turn up to (and including) its finish chunk, without the sentinel. */
+  const toolTurnPrefix = toolTurnSse.slice(0, toolTurnSse.length - DONE_SSE.length);
+
+  it("T-04 a tool-use turn's pre-terminal frames carry the priced usage on both gate settings", async () => {
+    for (const gate of ["", "1"]) {
+      const label = `gate=${gate || "(off)"}`;
+      vi.stubEnv("QODER_CORE_STAMP", gate);
+      let controller!: ReadableStreamDefaultController<Uint8Array>;
+      const body = new ReadableStream<Uint8Array>({
+        start(c) {
+          controller = c;
+        },
+      });
+      globalThis.fetch = vi.fn(
+        async () => new Response(body, { headers: { "content-type": "text/event-stream" } }),
+      ) as unknown as typeof fetch;
+
+      const events: AssistantMessageEvent[] = [];
+      const task = (async () => {
+        for await (const event of streamQoder(makeModel("qoder", "DeepSeek-V4-Flash"), makeContext(), {
+          apiKey: "fake",
+        })) {
+          events.push(event);
+        }
+      })();
+      const encoder = new TextEncoder();
+      // Everything except the sentinel, so the body stays open and no terminal
+      // exists yet. Only in this window can a terminal-only cost write be
+      // distinguished from the in-loop one — after the terminal the shared
+      // usage object self-corrects in memory.
+      controller.enqueue(encoder.encode(toolTurnPrefix));
+      for (let i = 0; i < 10; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+
+      const openFrames = events.filter((event) => event.type !== "done" && event.type !== "error");
+      expect(openFrames.length, `${label} expected pre-terminal frames while open`).toBeGreaterThan(0);
+      const priced = openFrames
+        .map((event) => (event as { partial: AssistantMessage }).partial.usage as StoredUsage)
+        .filter((usage) => usage.totalTokens > 0);
+      expect(priced.length, `${label} expected a priced pre-terminal frame`).toBeGreaterThan(0);
+      for (const usage of priced) {
+        expect(usage.cost.total, `${label} pre-terminal frame`).toBeCloseTo(1.3333333, 6);
+        expect(usage.rateSource, `${label} pre-terminal frame`).toBe("credits");
+      }
+
+      // Close the turn: the post-loop toolcall_end and the terminal agree.
+      controller.enqueue(encoder.encode(DONE_SSE));
+      await task;
+      const done = events.find((event) => event.type === "done") as
+        | Extract<AssistantMessageEvent, { type: "done" }>
+        | undefined;
+      const toolEnd = events.find((event) => event.type === "toolcall_end") as
+        | Extract<AssistantMessageEvent, { type: "toolcall_end" }>
+        | undefined;
+      if (!toolEnd || !done) throw new Error(`${label} expected the post-loop toolcall_end and done frames`);
+      expect(toolEnd.partial.usage.cost.total).toBeCloseTo(1.3333333, 6);
+      expect((toolEnd.partial.usage as StoredUsage).rateSource).toBe("credits");
+      expect((done.message.usage as StoredUsage).rateSource).toBe("credits");
+    }
+  });
+
+  it("T-05 gate off is the pre-migration tail; gate on adds the wrapper without an observable change", async () => {
+    const off = await toolTurnEvents("");
+    const on = await toolTurnEvents("1");
+    expect(on.map((event) => event.type)).toEqual(off.map((event) => event.type));
+    const terminalOf = (events: AssistantMessageEvent[]) =>
+      (events.at(-1) as Extract<AssistantMessageEvent, { type: "done" }>).message.usage;
+    expect(terminalOf(on)).toEqual(terminalOf(off));
+
+    // The same plain fixture under both settings: the ordered event sequence is
+    // identical, so the gate is a real off-path, not a behavior fork.
+    vi.stubEnv("QODER_CORE_STAMP", "1");
+    globalThis.fetch = mockFetch(SUCCESS_SSE);
+    const wrapped = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+    expect(wrapped.at(-1)?.type).toBe("done");
+    vi.stubEnv("QODER_CORE_STAMP", "");
+    globalThis.fetch = mockFetch(SUCCESS_SSE);
+    const plain = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+    expect(plain.map((event) => event.type)).toEqual(wrapped.map((event) => event.type));
   });
 });

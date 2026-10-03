@@ -13,7 +13,7 @@ import {
   type TranscriptContext,
   withoutInitialSystemMessage,
 } from "@earendil-works/pi-ai";
-import { resolveQoderIdentity } from "../auth/oauth.js";
+import { type QoderIdentity, resolveQoderIdentity } from "../auth/oauth.js";
 import { getCachedModelConfig, MAX_OUTPUT_TOKENS } from "../catalog.js";
 import { buildAuthHeaders, getMachineId } from "../cosy.js";
 import { capText, createDebugFetch, debugEnabled, redactHeadersForDebug, writeDebugRecord } from "../debug-log.js";
@@ -23,8 +23,12 @@ import { getQoderChatURL, getQoderRegionConfig } from "../region.js";
 import { yieldToEventLoop } from "../yield.js";
 import { type DsmlParserEvent, DsmlToolCallParser } from "./dsml.js";
 import { qoderEncodeBodyAsync } from "./encoding.js";
+import { PROCESS_FALLBACK_SESSION_ID, planQoderTurn, qoderModeFor, type TurnPlanSeed } from "./plan.js";
 import { mergeQoderHeaders } from "./request.js";
-import { getQoderRunIdentity } from "./run-state.js";
+import { PROTOCOL } from "./routing.js";
+import { classifyTurnKind, resolveRunIdentity } from "./run-identity.js";
+import { MAX_PROMPT_CACHE_KEY_LENGTH, stableHash } from "./session-key.js";
+import { withTerminalStamp } from "./stamp.js";
 import { stripThinkingTags, ThinkingTagParser } from "./thinking.js";
 import { ToolCallAccumulator } from "./tool-calls.js";
 import { contentToText, transformMessagesForQoder, transformTools } from "./transform.js";
@@ -38,7 +42,6 @@ function isThinkingRequested(reasoning: unknown): boolean {
 }
 
 const SSE_LINES_PER_YIELD = 32;
-export const MAX_PROMPT_CACHE_KEY_LENGTH = 64;
 
 /**
  * Minimum wall-clock interval between coalesced delta pushes. Hosts (pi) rebuild
@@ -48,16 +51,6 @@ export const MAX_PROMPT_CACHE_KEY_LENGTH = 64;
  * bounding that render work. Override with QODER_STREAM_DELTA_INTERVAL_MS.
  */
 const DELTA_FLUSH_INTERVAL_MS = 50;
-
-function stableHash(prefix: string, ...inputs: string[]): string {
-  const hash = crypto.createHash("sha256");
-  hash.update(prefix);
-  for (const input of inputs) {
-    hash.update("\0");
-    hash.update(input);
-  }
-  return hash.digest("hex").slice(0, 16);
-}
 
 type QoderStreamEvent = Parameters<AssistantMessageEventStream["push"]>[0];
 type QoderDeltaEvent = Extract<QoderStreamEvent, { type: "text_delta" | "thinking_delta" | "toolcall_delta" }>;
@@ -83,6 +76,7 @@ export function streamQoder(
   model: Model<Api>,
   context: TranscriptContext,
   options?: SimpleStreamOptions,
+  seed?: TurnPlanSeed,
 ): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
 
@@ -107,6 +101,11 @@ export function streamQoder(
   let pendingDelta: QoderDeltaEvent | null = null;
   let lastDeltaFlushAt = Date.now();
   let deltaTimer: ReturnType<typeof setTimeout> | undefined;
+  // One gate read per request, resolved once rather than per chunk. Off means
+  // the returned stream is the closure's own — the pre-migration tail, whose
+  // rate source and cost are written at the assembly site inside the read loop.
+  // On wraps it in the shared ordered tail without changing an observable.
+  const stampTail = (options?.env?.QODER_CORE_STAMP ?? process.env.QODER_CORE_STAMP) === "1";
   const configuredDeltaInterval = Number(
     options?.env?.QODER_STREAM_DELTA_INTERVAL_MS ?? process.env.QODER_STREAM_DELTA_INTERVAL_MS,
   );
@@ -184,7 +183,7 @@ export function streamQoder(
   (async () => {
     try {
       throwIfAborted();
-      const providerMode = model.provider === "qoder-cn" ? "cn" : "global";
+      const providerMode = seed?.mode ?? qoderModeFor(model.provider);
       const region = getQoderRegionConfig(providerMode);
       const accessToken = options?.apiKey;
       if (!accessToken) {
@@ -195,15 +194,37 @@ export function streamQoder(
         );
       }
 
+      // One awaited plan per dispatch when the router handed a seed. The
+      // identity resolver is injected as a per-dispatch memo so the plan's own
+      // await and this adapter's COSY needs share a single resolution.
+      let resolvedIdentity: QoderIdentity | undefined;
+      const plan = seed
+        ? await planQoderTurn(
+            model,
+            context,
+            options,
+            { ...seed, protocol: PROTOCOL.LEGACY },
+            {
+              resolveIdentity: async (token, provider, mode, requestOptions) => {
+                resolvedIdentity ??= await resolveQoderIdentity(token, provider, mode, requestOptions);
+                return resolvedIdentity;
+              },
+            },
+          )
+        : undefined;
+      throwIfAborted();
+
       // Resolve the real Qoder identity from the job token. OMP keeps login
       // credentials in its own agent.db, not in ~/.pi/agent/auth.json, so a
       // cache miss would otherwise send uid "qoder-user" and Qoder CN rejects
       // it with "Login expired" (105).
-      const ident = await resolveQoderIdentity(accessToken, model.provider, providerMode, {
-        signal: requestController.signal,
-        fetch: options?.fetch,
-        timeoutMs: options?.timeoutMs,
-      });
+      const ident =
+        resolvedIdentity ??
+        (await resolveQoderIdentity(accessToken, model.provider, providerMode, {
+          signal: requestController.signal,
+          fetch: options?.fetch,
+          timeoutMs: options?.timeoutMs,
+        }));
       throwIfAborted();
       const userID = ident.userID || "qoder-user";
       const name = ident.name || region.userNameFallback;
@@ -217,7 +238,7 @@ export function streamQoder(
       if (!modelConfig?.key) {
         throw new Error(`Unknown Qoder model id: ${model.id}`);
       }
-      const qoderModel = modelConfig.key;
+      const qoderModel = plan?.upstreamKey ?? modelConfig.key;
 
       const isReasoning = !!modelConfig.is_reasoning;
 
@@ -250,15 +271,18 @@ export function streamQoder(
       // requests. Qoder forwards session_id as prompt_cache_key upstream,
       // which has a maximum length of 64 characters. Preserve the readable
       // form when it fits; hash the complete identity when it does not so the
-      // bounded key remains stable for the same user/model/session.
-      const sessionID = options?.sessionId
-        ? (() => {
-            const readable = `qoder-session-${userID}-${qoderModel}-${options.sessionId}`;
-            return readable.length <= MAX_PROMPT_CACHE_KEY_LENGTH
-              ? readable
-              : `qoder-session-${stableHash("qoder-session", userID, qoderModel, options.sessionId)}`;
-          })()
-        : `${stableHash("qoder-session", userID, qoderModel)}-${crypto.randomUUID()}`;
+      // bounded key remains stable for the same user/model/session. Without a
+      // pi session id both protocols use the one per-process fallback (OD-6).
+      const sessionID =
+        plan?.wireSession.legacy ??
+        (options?.sessionId
+          ? (() => {
+              const readable = `qoder-session-${userID}-${qoderModel}-${options.sessionId}`;
+              return readable.length <= MAX_PROMPT_CACHE_KEY_LENGTH
+                ? readable
+                : `qoder-session-${stableHash("qoder-session", userID, qoderModel, options.sessionId)}`;
+            })()
+          : PROCESS_FALLBACK_SESSION_ID);
 
       // Qoder's catalog exposes no per-model output cap, so we use the
       // documented upstream ceiling (MAX_OUTPUT_TOKENS = 131072, see models.ts)
@@ -283,7 +307,7 @@ export function streamQoder(
       // requested level to what the model advertises via thinkingLevelMap, then
       // map to the upstream effort name. clampThinkingLevel returns "off" when
       // the level is unsupported or the user disabled thinking.
-      const requestedLevel = options?.reasoning;
+      const requestedLevel = plan?.thinkingInputs.level ?? options?.reasoning;
       const clamped = requestedLevel ? clampThinkingLevel(model, requestedLevel) : undefined;
       const reasoningLevel = clamped === "off" ? undefined : clamped;
       const parameters: Record<string, unknown> = { max_tokens: maxTokens };
@@ -313,13 +337,17 @@ export function streamQoder(
       // them from a hash of the whole (growing) history, so every tool round
       // looked like a separate never-finished run on the credit ledger. Infer
       // the run boundary from the message tail and reuse the run identity.
-      const { requestSetId, business } = getQoderRunIdentity({
+      const { requestSetId, business } = resolveRunIdentity({
         mode: providerMode,
-        model: qoderModel,
-        sessionId: sessionID,
-        messages: normalizedMessages,
+        upstreamKey: qoderModel,
+        wireSessionId: sessionID,
+        // The RAW transcript, not the normalized list: the transform defers an
+        // image-bearing tool result into a trailing synthetic user message, so
+        // the normalized tail reads as a fresh prompt and splits the run.
+        messages: transcriptMessages,
         lastUserText,
         product: "cli",
+        turnKind: classifyTurnKind(options?.maxTokens),
       });
       const requestID = crypto.randomUUID();
 
@@ -441,7 +469,7 @@ export function streamQoder(
           type: "request",
           protocol: "legacy",
           session: options?.sessionId,
-          wireSessionId: sessionID,
+          wireSessionId: plan?.capture.wireSessionId ?? sessionID,
           model: model.id,
           upstreamKey: qoderModel,
           url: chatURL,
@@ -751,7 +779,7 @@ export function streamQoder(
 
       throwIfAborted();
       if (output.stopReason === "pending") {
-        if (!sawDone) throw new Error("Qoder stream ended before a terminal event (unexpected EOF)");
+        if (!sawDone) throw new Error("Qoder stream ended before a terminal response event (unexpected EOF)");
         // Some gateway variants send only [DONE], without a finish_reason.
         output.stopReason = "stop";
       }
@@ -808,5 +836,7 @@ export function streamQoder(
     }
   })();
 
-  return stream;
+  // The gate wraps the closure's stream; it never moves the assembly write or
+  // the push order above. Off is the pre-migration tail.
+  return stampTail ? withTerminalStamp(stream, {}) : stream;
 }
