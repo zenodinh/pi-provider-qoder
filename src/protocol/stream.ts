@@ -27,6 +27,7 @@ import { PROCESS_FALLBACK_SESSION_ID, planQoderTurn, qoderModeFor, type TurnPlan
 import { mergeQoderHeaders } from "./request.js";
 import { PROTOCOL } from "./routing.js";
 import { classifyTurnKind, resolveRunIdentity } from "./run-identity.js";
+import { MAX_PROMPT_CACHE_KEY_LENGTH, stableHash } from "./session-key.js";
 import { withTerminalStamp } from "./stamp.js";
 import { stripThinkingTags, ThinkingTagParser } from "./thinking.js";
 import { ToolCallAccumulator } from "./tool-calls.js";
@@ -41,7 +42,6 @@ function isThinkingRequested(reasoning: unknown): boolean {
 }
 
 const SSE_LINES_PER_YIELD = 32;
-export const MAX_PROMPT_CACHE_KEY_LENGTH = 64;
 
 /**
  * Minimum wall-clock interval between coalesced delta pushes. Hosts (pi) rebuild
@@ -51,16 +51,6 @@ export const MAX_PROMPT_CACHE_KEY_LENGTH = 64;
  * bounding that render work. Override with QODER_STREAM_DELTA_INTERVAL_MS.
  */
 const DELTA_FLUSH_INTERVAL_MS = 50;
-
-export function stableHash(prefix: string, ...inputs: string[]): string {
-  const hash = crypto.createHash("sha256");
-  hash.update(prefix);
-  for (const input of inputs) {
-    hash.update("\0");
-    hash.update(input);
-  }
-  return hash.digest("hex").slice(0, 16);
-}
 
 type QoderStreamEvent = Parameters<AssistantMessageEventStream["push"]>[0];
 type QoderDeltaEvent = Extract<QoderStreamEvent, { type: "text_delta" | "thinking_delta" | "toolcall_delta" }>;

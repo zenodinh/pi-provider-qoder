@@ -8,7 +8,7 @@ import { clearQoderModelsMemCache, staticModels } from "../catalog.js";
 import { streamQoderRouter } from "../protocol/router.js";
 import { clearQoderFallbackCache, clearQoderRoutingMemCache } from "../protocol/routing.js";
 import { clearQoderFilterMemCache } from "../protocol/sampling.js";
-import { MAX_PROMPT_CACHE_KEY_LENGTH } from "../protocol/stream.js";
+import { MAX_PROMPT_CACHE_KEY_LENGTH } from "../protocol/session-key.js";
 
 /**
  * AC-04 — the two protocols' session-id wire forms.

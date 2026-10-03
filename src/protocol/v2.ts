@@ -22,9 +22,10 @@ import type { QoderMode } from "../region.js";
 import { PROCESS_FALLBACK_SESSION_ID, planQoderTurn, type TurnPlan, type TurnPlanSeed } from "./plan.js";
 import { markLegacyOnly } from "./routing.js";
 import { classifyTurnKind, type QoderRunMessage, resolveRunIdentity } from "./run-identity.js";
+import { clampPromptCacheKey } from "./session-key.js";
 import { createReframedFetch } from "./sse-reframe.js";
 import { withTerminalStamp } from "./stamp.js";
-import { MAX_PROMPT_CACHE_KEY_LENGTH, streamQoder } from "./stream.js";
+import { streamQoder } from "./stream.js";
 import { contentToText } from "./transform.js";
 
 interface V2Route {
@@ -79,14 +80,6 @@ function osType(): string {
   if (process.platform === "darwin") return "macos";
   if (process.platform === "win32") return "windows";
   return "linux";
-}
-
-// shape: none — dispatch object does not apply: a single length guard on one value.
-// Truncation (not hashing) mirrors pi-ai's clampOpenAIPromptCacheKey; this is
-// the same 64-character prompt_cache_key bound the legacy path enforces in stream.ts.
-// Exported so the plan's producer applies the identical bound.
-export function clampPromptCacheKey(id: string): string {
-  return id.length <= MAX_PROMPT_CACHE_KEY_LENGTH ? id : id.slice(0, MAX_PROMPT_CACHE_KEY_LENGTH);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

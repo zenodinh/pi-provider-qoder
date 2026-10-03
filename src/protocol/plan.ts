@@ -18,8 +18,7 @@ import { getCachedModelConfig, type QoderModelEntry } from "../catalog.js";
 import type { QoderMode } from "../region.js";
 import type { Protocol } from "./routing.js";
 import { classifyTurnKind, type QoderTurnKind } from "./run-identity.js";
-import { MAX_PROMPT_CACHE_KEY_LENGTH, stableHash } from "./stream.js";
-import { clampPromptCacheKey } from "./v2.js";
+import { clampPromptCacheKey, MAX_PROMPT_CACHE_KEY_LENGTH, stableHash } from "./session-key.js";
 import {
   affinityPlacements,
   carrierValue,
