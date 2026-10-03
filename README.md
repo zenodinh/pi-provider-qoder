@@ -133,7 +133,7 @@ The streamed response is normalized into pi thinking blocks regardless of how th
 
 ## Host request compatibility
 
-The custom stream supports pi's `onPayload` (before encoding/signing), `onResponse` (before reading the body, including HTTP errors), injected `fetch` (chat and identity lookup), `headers`, `env`, `timeoutMs`, `temperature`, and model/request `maxTokens`. Header overrides are case-insensitive; `null` removes a default. Overriding COSY authentication headers can invalidate signatures. A model `baseUrl` override must point to a Qoder-compatible gateway, not a generic OpenAI endpoint.
+The custom stream supports pi's `onPayload` (before encoding/signing), `onResponse` (before reading the body, including HTTP errors), injected `fetch` (chat and identity lookup), `headers`, `env`, `timeoutMs`, `temperature`, and model/request `maxTokens`. Header overrides are case-insensitive; `null` removes a default. Overriding COSY authentication headers can invalidate signatures. A model `baseUrl` override must point to a Qoder-compatible gateway, not a generic OpenAI endpoint. `onProviderStreamEvent` is honored on the v2 transport only: pi-ai's completions stream invokes the host hook for each parsed event before normalization, while the legacy transport does not call it.
 
 Legacy turns now close each text block with a `text_end` event, matching v2's event vocabulary. The host maps every `text_end` to a `message_update` frame, so `--json` output gains one frame per text block on legacy.
 

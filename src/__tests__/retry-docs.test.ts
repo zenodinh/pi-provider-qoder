@@ -61,4 +61,12 @@ describe("README retry documentation", () => {
     expect(readme).toContain("assembly-site stamps");
     expect(readme).toContain("stay on with the gate off");
   });
+
+  it("documents onProviderStreamEvent as v2-only (FR-5's second clause)", () => {
+    // The host's per-event observation hook is honored on the v2 transport
+    // only: pi-ai's completions stream calls it, the legacy adapter does not.
+    // The published README states the asymmetry so it is reviewable.
+    expect(readme).toContain("`onProviderStreamEvent`");
+    expect(readme).toContain("honored on the v2 transport only");
+  });
 });
