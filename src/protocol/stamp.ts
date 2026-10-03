@@ -130,7 +130,7 @@ export function withTerminalStamp(
     }
     if (!ended) {
       debugLog("provider.stamp tail: inner stream ended without a terminal event");
-      pushFailure(new Error("Qoder stream ended before a terminal event (stamp tail)"));
+      pushFailure(new Error("Qoder stream ended before a terminal response event (stamp tail)"));
     }
     out.end();
   })().catch((error: unknown) => {

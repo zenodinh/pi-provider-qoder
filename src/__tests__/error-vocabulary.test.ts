@@ -60,6 +60,12 @@ import {
  * rather than a `throw` statement, so a census scoped to throw sites misses them:
  * `Qoder request timeout` (`stream.ts:166`) and `Qoder stream idle timeout`
  * (`stream.ts:414`). Both are pinned below and both classify as RETRYABLE.
+ *
+ * A twenty-fifth text renders from the shared terminal tail rather than the
+ * legacy transport: the no-terminal backstop at `stamp.ts` pushes its error as
+ * `Qoder stream ended before a terminal response event (stamp tail)` — the
+ * same EOF class, so it deliberately carries the host pattern and classifies
+ * as RETRYABLE; `stamp.test.ts` pins the exact rendered instance.
  */
 
 function makeModel(provider: "qoder" | "qoder-cn" = "qoder", id = "Lite"): Model<Api> {
@@ -552,6 +558,11 @@ const CLASSIFIER_VERDICTS: Array<{ text: string; retryable: boolean; note?: stri
     retryable: true,
     note: "FS-5 CU-01: contains the host pattern 'terminal response event' verbatim — the one intended flip",
   },
+  {
+    text: "Qoder stream ended before a terminal response event (stamp tail)",
+    retryable: true,
+    note: "the shared tail's no-terminal backstop — same EOF class as the row above, its exact instance pinned by stamp.test.ts",
+  },
   { text: "Qoder tool call was truncated by the output token limit", retryable: false },
   { text: "Qoder finished with tool_calls but returned no tool calls", retryable: false },
   { text: "Qoder request timeout", retryable: true, note: 'matches "timeout"' },
@@ -571,7 +582,7 @@ describe("host classifier verdicts, executed rather than inferred", () => {
     },
   );
 
-  it("retries exactly five of the shipped texts, and each is transient by nature", () => {
+  it("retries exactly six of the shipped texts, and each is transient by nature", () => {
     const retryable = CLASSIFIER_VERDICTS.filter((row) => isRetryableAssistantError(failedMessage(row.text)));
     expect(retryable.map((row) => row.text).sort()).toEqual(
       [
@@ -580,6 +591,7 @@ describe("host classifier verdicts, executed rather than inferred", () => {
         "Qoder request timeout",
         "Qoder stream idle timeout",
         ALIGNED_EOF_TEXT,
+        "Qoder stream ended before a terminal response event (stamp tail)",
       ].sort(),
     );
   });

@@ -113,6 +113,11 @@ describe("withTerminalStamp", () => {
     const ended = withTerminalStamp(silent, {});
     const silentEvents = await consume(ended);
     expect(silentEvents.map((event) => event.type)).toEqual(["error"]);
+    // The backstop's own text carries the host classifier's EOF pattern, so the
+    // no-terminal class retries exactly like stream.ts's unexpected-EOF throw;
+    // the exact instance is pinned here so a wording drift in stamp.ts goes red.
+    const silentError = silentEvents[0] as Extract<AssistantMessageEvent, { type: "error" }>;
+    expect(silentError.error.errorMessage).toBe("Qoder stream ended before a terminal response event (stamp tail)");
     expect((await ended.result()).stopReason).toBe("error");
   });
 
