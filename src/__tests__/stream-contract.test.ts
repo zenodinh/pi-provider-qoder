@@ -386,6 +386,40 @@ describe("capture neutrality (QODER_DEBUG off vs on)", () => {
       },
     },
     {
+      name: "records an HTTP error body the transport reads itself",
+      recordsBody: true,
+      sseContains: "rate limited",
+      async run(sessionId) {
+        const cancel = vi.fn();
+        const seen: Record<string, unknown> = {};
+        const result = await run({
+          sessionId,
+          // A COMPLETE error body, unlike the stalled one above: the transport
+          // reads it itself in readResponseText and never reaches the read loop,
+          // so this is the path where consumer-side capture has no loop to ride.
+          fetch: vi.fn(async (input: unknown) => {
+            seen.requestedUrl = String(input);
+            return new Response(
+              new ReadableStream({
+                start(c) {
+                  c.enqueue(new TextEncoder().encode("rate limited"));
+                  c.close();
+                },
+                cancel,
+              }),
+              { status: 429 },
+            );
+          }),
+        });
+        return {
+          ...seen,
+          cancelCalls: cancel.mock.calls.length,
+          errorMessage: result.errorMessage,
+          stopReason: result.stopReason,
+        };
+      },
+    },
+    {
       name: "invokes onResponse before consuming a complete stream",
       recordsBody: true,
       sseContains: "[DONE]",
@@ -496,5 +530,22 @@ describe("capture neutrality (QODER_DEBUG off vs on)", () => {
     // record holds exactly the prefix the read loop decoded.
     expect(record?.sse).toBe(prefix);
     expect(record?.truncated).toBe(false);
+  });
+
+  it("T-02b a body-less response is recorded exactly once, by the wrapper", async () => {
+    vi.stubEnv("QODER_DEBUG", "1");
+    const sessionId = "neutral-bodyless";
+    const result = await run({
+      sessionId,
+      fetch: vi.fn(async () => new Response(null, { status: 500 })),
+    });
+    expect(result.stopReason).toBe("error");
+    const responses = readDebugRecords(debugDir, sessionId).filter((record) => record.type === "response");
+    // Exactly one record, in the wrapper's body-less shape: no sse field at all.
+    // A second record here would mean a consumer-side capture fired on a body it
+    // never read — the double-write the response.body gate exists to prevent.
+    expect(responses).toHaveLength(1);
+    expect(responses[0]?.status).toBe(500);
+    expect("sse" in (responses[0] as Record<string, unknown>)).toBe(false);
   });
 });

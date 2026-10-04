@@ -533,6 +533,16 @@ export function streamQoder(
 
       if (!response.ok) {
         const errText = await readResponseText(response, requestController.signal);
+        // readResponseText is this path's consumer-side read — the loop below never
+        // runs — so an HTTP error body is recorded here or not at all. Gated on
+        // response.body to hold the one-record-per-response partition: a body-less
+        // response is already recorded by createDebugFetch, which is the module
+        // that owns that case on both protocols.
+        if (response.body) {
+          capture = createResponseCapture(debugMeta, chatURL, response.status);
+          capture?.push(errText);
+          capture?.finish();
+        }
         throw new Error(`Qoder API request failed: ${response.status} ${response.statusText}. Response: ${errText}`);
       }
 
