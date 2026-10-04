@@ -41,6 +41,7 @@ import { CREDITS_PER_USD, rateForUpstreamKey } from "./pricing.js";
 import { qoderModeFor } from "./protocol/plan.js";
 import { streamQoderRouter } from "./protocol/router.js";
 import { getQoderBaseUrl, getQoderRegionConfig, QODER_MODES, type QoderMode } from "./region.js";
+import { resolveWarmGate } from "./warm-gate.js";
 import { evaluateGuard, parseBudgetEnv } from "./warm-guard.js";
 
 // pi reads a `fetchUsage` hook off the oauth config at runtime, but it is not
@@ -280,20 +281,26 @@ export default async function (pi: ExtensionAPI, deps: QoderExtensionDeps = {}) 
   // Cache warming is inert for these models by default: pi prices them at $0
   // (Qoder bills in Credits, which pi's monetary cost cannot express), so the
   // "$0.05 expected savings" floor can never be cleared and pi stops every
-  // refresh before sending it. QODER_CACHE_WARM=1 approves the refresh anyway;
-  // each one costs a cache read plus one output token, ~50x cheaper than the
-  // idle re-bill it prevents. Warming still requires the model's declared
-  // promptCache tier (catalog.ts) and pi's `cacheWarming: "idle"` setting, and
-  // the override is scoped to this extension's two providers so it never
-  // spends another provider's tokens. With the gate on, the refresh budget is
-  // governed per opportunity: spend since the last real turn is compared in
-  // USD against a fraction of the protected miss, and models without a usable
-  // rate keep the legacy force-warm (warm-guard.ts).
-  // shape: none — dispatch object does not apply: one env gate over pi's own decision.
+  // refresh before sending it. Arming is two-layer (warm-gate.ts): pi's own
+  // global `cacheWarming` master switch beside this extension's approval,
+  // resolved env QODER_CACHE_WARM > per-machine approval file > off. The env is
+  // no longer the only way in, so a process whose shell forgot the export still
+  // warms on a machine that approved it; each refresh costs a cache read plus
+  // one output token, ~50x cheaper than the idle re-bill it prevents. Warming
+  // still requires the model's declared promptCache tier (catalog.ts) and pi's
+  // `cacheWarming: "idle"` setting, and arming is scoped to this extension's two
+  // providers so it never spends another provider's tokens. With the gate on,
+  // the refresh budget is governed per opportunity: spend since the last real
+  // turn is compared in USD against a fraction of the protected miss, and
+  // models without a usable rate keep the legacy force-warm (warm-guard.ts).
+  // shape: none — dispatch object does not apply: one arming gate over pi's own decision.
   pi.on("cache_warming_decision", (event, ctx) => {
-    if (process.env.QODER_CACHE_WARM !== "1") return undefined;
     const model = ctx.model;
     if (!model || (model.provider !== "qoder" && model.provider !== "qoder-cn")) return undefined;
+    // The provider filter runs first, so the gate is only ever asked about one
+    // of this extension's own providers.
+    const gate = resolveWarmGate(model.provider);
+    if (!gate.armed) return undefined;
     const mode: QoderMode = qoderModeFor(model.provider);
     const budget = parseBudgetEnv(process.env.QODER_WARM_BUDGET);
     const verdict = evaluateGuard(event, {
@@ -305,7 +312,7 @@ export default async function (pi: ExtensionAPI, deps: QoderExtensionDeps = {}) 
     debugLog(
       `cache warming verdict: action=${verdict.action} reason=${verdict.reason} rateSource=${verdict.rateSource} ` +
         `spendUsd=${verdict.spendUsd.toFixed(6)} protectedUsd=${verdict.protectedUsd.toFixed(6)} ` +
-        `fraction=${budget.kind === "fraction" ? budget.fraction : "off"}`,
+        `fraction=${budget.kind === "fraction" ? budget.fraction : "off"} layer=${gate.layer}`,
     );
     if (verdict.action === undefined || verdict.action === event.action) return undefined;
     return { action: verdict.action };

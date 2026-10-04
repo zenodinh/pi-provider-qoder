@@ -15,6 +15,8 @@ import {
   scanLedgers,
 } from "../lifetime.js";
 import { CREDITS_PER_USD } from "../pricing.js";
+import { getQoderRegionConfig, QODER_MODES } from "../region.js";
+import { readPiCacheWarmingMode, resolveWarmGate } from "../warm-gate.js";
 import { type Budget, parseBudgetEnv } from "../warm-guard.js";
 
 /** On-demand scan budget: larger than the learner's 500 ms; files newest-first. */
@@ -198,13 +200,47 @@ function budgetLabel(budget: Budget): string {
   return budget.kind === "off" ? "off (uncapped)" : `${budget.fraction}`;
 }
 
+// shape: none — straight-line string assembly; one placeholder per gate layer.
+/**
+ * Both arming layers, and the layer that decided each provider's verdict.
+ *
+ * One verdict per provider the extension actually registers, sourced from the
+ * same `QODER_MODES` list `registerProviders` iterates — so the screen resolves
+ * the gate for exactly the providers the warming handler acts on and cannot
+ * drift from it when a region is added. pi's layer is one value for the machine
+ * (pi reads global-only), so it is named once; the extension's layer and its
+ * deciding layer are per provider, because the approval file is a per-provider
+ * map and the two regions genuinely diverge.
+ *
+ * Ordering is load-bearing: the panel renders this string through a single
+ * `bestFit` candidate and truncates it at the inner width (cache-view.ts:154),
+ * so the gate verdicts sit LEFT of the budget and a narrow panel eats
+ * `budget …` first while the arming truth survives. Do not reorder.
+ */
+function gateConfigLine(budget: Budget): string {
+  const resolved = QODER_MODES.map((mode) => {
+    const providerId = getQoderRegionConfig(mode).providerID;
+    return { providerId, verdict: resolveWarmGate(providerId) };
+  });
+  const gates = resolved
+    .map(({ providerId, verdict }) => `${providerId}=${verdict.armed ? "ON" : "OFF"}(${verdict.layer})`)
+    .join(" ");
+  // pi's layer comes off the same verdicts rather than a separate read, so one
+  // derivation feeds both halves of the line and a concurrent settings write
+  // cannot make the pi label disagree with the verdicts beside it. The fallback
+  // is unreachable — QODER_MODES is never empty — and exists only so the
+  // degenerate case still resolves through the gate's own default instead of a
+  // second spelling of it here.
+  const piMode = resolved[0]?.verdict.piMode ?? readPiCacheWarmingMode();
+  return `config: pi ${piMode} · gate ${gates} · budget ${budgetLabel(budget)}`;
+}
+
 /** One scan + profile read + assessment; the panel's initial and refreshed data. */
 function collectCachePanelData(): CachePanelData {
-  const gateOn = process.env.QODER_CACHE_WARM === "1";
   const budget = parseBudgetEnv(process.env.QODER_WARM_BUDGET);
   const scan = scanLedgers(CACHE_MONITOR_BUDGET_MS);
   return {
-    config: `config: gate ${gateOn ? "ON" : "OFF"} · budget ${budgetLabel(budget)}`,
+    config: gateConfigLine(budget),
     health: assessCacheHealth(scan, readProfile(), Date.now()),
   };
 }
