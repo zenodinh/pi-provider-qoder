@@ -15,6 +15,8 @@ import {
   scanLedgers,
 } from "../lifetime.js";
 import { CREDITS_PER_USD } from "../pricing.js";
+import { getQoderRegionConfig, QODER_MODES } from "../region.js";
+import { readPiCacheWarmingMode, resolveWarmGate } from "../warm-gate.js";
 import { type Budget, parseBudgetEnv } from "../warm-guard.js";
 
 /** On-demand scan budget: larger than the learner's 500 ms; files newest-first. */
@@ -198,13 +200,39 @@ function budgetLabel(budget: Budget): string {
   return budget.kind === "off" ? "off (uncapped)" : `${budget.fraction}`;
 }
 
+// shape: none — straight-line string assembly; one placeholder per gate layer.
+/**
+ * Both arming layers, and the layer that decided each provider's verdict.
+ *
+ * One verdict per provider the extension actually registers, sourced from the
+ * same `QODER_MODES` list `registerProviders` iterates — so the screen resolves
+ * the gate for exactly the providers the warming handler acts on and cannot
+ * drift from it when a region is added. pi's layer is one value for the machine
+ * (pi reads global-only), so it is named once; the extension's layer and its
+ * deciding layer are per provider, because the approval file is a per-provider
+ * map and the two regions genuinely diverge.
+ *
+ * Ordering is load-bearing: the panel renders this string through a single
+ * `bestFit` candidate and truncates it at the inner width (cache-view.ts:154),
+ * so the gate verdicts sit LEFT of the budget and a narrow panel eats
+ * `budget …` first while the arming truth survives. Do not reorder.
+ */
+function gateConfigLine(budget: Budget): string {
+  const piMode = readPiCacheWarmingMode();
+  const gates = QODER_MODES.map((mode) => {
+    const providerId = getQoderRegionConfig(mode).providerID;
+    const verdict = resolveWarmGate(providerId);
+    return `${providerId}=${verdict.armed ? "ON" : "OFF"}(${verdict.layer})`;
+  }).join(" ");
+  return `config: pi ${piMode} · gate ${gates} · budget ${budgetLabel(budget)}`;
+}
+
 /** One scan + profile read + assessment; the panel's initial and refreshed data. */
 function collectCachePanelData(): CachePanelData {
-  const gateOn = process.env.QODER_CACHE_WARM === "1";
   const budget = parseBudgetEnv(process.env.QODER_WARM_BUDGET);
   const scan = scanLedgers(CACHE_MONITOR_BUDGET_MS);
   return {
-    config: `config: gate ${gateOn ? "ON" : "OFF"} · budget ${budgetLabel(budget)}`,
+    config: gateConfigLine(budget),
     health: assessCacheHealth(scan, readProfile(), Date.now()),
   };
 }

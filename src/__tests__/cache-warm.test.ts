@@ -1,5 +1,8 @@
+import { rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { CacheWarmingDecisionEvent } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { getPiAgentDir } from "../home.js";
 import { assistantEntry, warmEntry } from "./session-fixtures.js";
 
 // Spy seam for T-15: the mode the handler derives is only observable through the
@@ -24,11 +27,32 @@ const patEnvNames = [
 const envNames = [...patEnvNames, "QODER_CACHE_WARM"] as const;
 const originalEnv = Object.fromEntries(envNames.map((name) => [name, process.env[name]]));
 
+// The gate's file layer (spec fs-qoder-warm-arming CU-02): a per-machine
+// approval record in the agent directory. Unset env is no longer sufficient for
+// OFF, so a row that expects OFF has to establish that this file is absent too.
+const APPROVAL_FILENAME = "qoder-warm-approval.json";
+
+function approvalPath(): string {
+  return join(getPiAgentDir(), APPROVAL_FILENAME);
+}
+
+/** recorded-from: SA §5.2 approval-file example, 2026-10-04. */
+function seedApproval(providers: Record<string, boolean>): void {
+  writeFileSync(approvalPath(), JSON.stringify({ version: 1, providers }), "utf8");
+}
+
+function clearApproval(): void {
+  rmSync(approvalPath(), { force: true });
+}
+
 afterEach(() => {
   for (const [name, value] of Object.entries(originalEnv)) {
     if (value === undefined) delete process.env[name];
     else process.env[name] = value;
   }
+  // The harness gives this file one HOME for all its rows, so a seeded approval
+  // file would otherwise arm every later row that expects OFF.
+  clearApproval();
   vi.resetModules();
 });
 
@@ -89,8 +113,12 @@ describe("cache warming decision hook", () => {
     expect(await handler?.(stopDecision, qoderCtx)).toEqual({ action: "warm" });
   });
 
-  it("leaves the decision untouched when QODER_CACHE_WARM is unset", async () => {
+  it("leaves the decision untouched when neither the env nor an approval file arms it", async () => {
     delete process.env.QODER_CACHE_WARM;
+    // Unset env alone no longer decides OFF: the file layer is the second way
+    // in. This harness's temp agent directory holds no approval file, which is
+    // what makes the outcome OFF rather than what the env says.
+    clearApproval();
     const handler = (await loadHandlers()).get("cache_warming_decision");
     expect(handler, "extension did not register a cache_warming_decision handler").toBeDefined();
     expect(await handler?.(stopDecision, qoderCtx)).toBeUndefined();
@@ -120,6 +148,7 @@ describe("cache warming decision hook", () => {
 
   it("leaves gate-off decisions untouched, and ungoverned models on the legacy path", async () => {
     delete process.env.QODER_CACHE_WARM;
+    clearApproval();
     const handler = (await loadHandlers()).get("cache_warming_decision");
     expect(handler, "extension did not register a cache_warming_decision handler").toBeDefined();
     const governed = governedCtxAtCap();
@@ -158,5 +187,101 @@ describe("cache warming mode derivation (T-15/AC-01)", () => {
       sessionManager: { getBranch: () => [] },
     });
     expect(guardSpy.mock.calls.at(-1)?.[1]).toMatchObject({ mode: "cn" });
+  });
+});
+
+/**
+ * Two-layer arming (spec fs-qoder-warm-arming T-08/T-09, SA §7.4). BUG-0002's
+ * whole extent was the env-only early return at index.ts:294, so a process whose
+ * shell forgot the export never reached the guard and pi's own economics stopped
+ * every refresh — the $3.5347/day idle-gap re-bill the bug register records.
+ */
+describe("two-layer arming gate (T-08/T-09, AC-02/AC-03/AC-06)", () => {
+  /** Same registry generation loadHandlers() created, so the spy sees the calls. */
+  async function spyOnGuard() {
+    const { evaluateGuard } = await import("../warm-guard.js");
+    return vi.mocked(evaluateGuard);
+  }
+
+  /** A ctx whose ledger read is observable, so "consults nothing" is witnessable. */
+  function watchedCtx() {
+    const getBranch = vi.fn(() => []);
+    return {
+      ctx: { model: { provider: "qoder", id: "Lite" }, sessionManager: { getBranch } },
+      getBranch,
+    };
+  }
+
+  it("T-08 arms from the approval file in a process that never exported the gate", async () => {
+    delete process.env.QODER_CACHE_WARM;
+    seedApproval({ qoder: true });
+    const handler = (await loadHandlers()).get("cache_warming_decision");
+    expect(handler, "extension did not register a cache_warming_decision handler").toBeDefined();
+    expect(await handler?.(stopDecision, qoderCtx)).toEqual({ action: "warm" });
+  });
+
+  it("T-08 declines the same event when the approval file is absent", async () => {
+    delete process.env.QODER_CACHE_WARM;
+    clearApproval();
+    const handler = (await loadHandlers()).get("cache_warming_decision");
+    expect(handler, "extension did not register a cache_warming_decision handler").toBeDefined();
+    expect(await handler?.(stopDecision, qoderCtx)).toBeUndefined();
+  });
+
+  it("T-08 arms only the providers the file approves, read at decision time", async () => {
+    delete process.env.QODER_CACHE_WARM;
+    seedApproval({ "qoder-cn": true });
+    const handler = (await loadHandlers()).get("cache_warming_decision");
+    expect(handler, "extension did not register a cache_warming_decision handler").toBeDefined();
+    // qoder is omitted from the map, so it is not approved.
+    expect(await handler?.(stopDecision, qoderCtx)).toBeUndefined();
+
+    // Re-seeded without re-registering: the gate is read per decision, not
+    // cached at registration, so pi's live mode reconciliation stays truthful.
+    seedApproval({ qoder: true });
+    expect(await handler?.(stopDecision, qoderCtx)).toEqual({ action: "warm" });
+
+    // An explicit false is a refusal, not an omission.
+    seedApproval({ qoder: false, "qoder-cn": true });
+    expect(await handler?.(stopDecision, qoderCtx)).toBeUndefined();
+  });
+
+  it("T-09 env wins in both directions over an approved machine", async () => {
+    seedApproval({ qoder: true });
+    const handler = (await loadHandlers()).get("cache_warming_decision");
+    expect(handler, "extension did not register a cache_warming_decision handler").toBeDefined();
+
+    // The per-process kill switch SA §10.2.3 documents for rollback.
+    process.env.QODER_CACHE_WARM = "0";
+    expect(await handler?.(stopDecision, qoderCtx)).toBeUndefined();
+
+    // And env 1 arms a machine that never seeded the file.
+    clearApproval();
+    process.env.QODER_CACHE_WARM = "1";
+    expect(await handler?.(stopDecision, qoderCtx)).toEqual({ action: "warm" });
+  });
+
+  it("T-09 a disarmed decision consults nothing, and an armed one returns action only", async () => {
+    delete process.env.QODER_CACHE_WARM;
+    clearApproval();
+    const handler = (await loadHandlers()).get("cache_warming_decision");
+    expect(handler, "extension did not register a cache_warming_decision handler").toBeDefined();
+    const spy = await spyOnGuard();
+    spy.mockClear();
+    const { ctx, getBranch } = watchedCtx();
+
+    expect(await handler?.(stopDecision, ctx)).toBeUndefined();
+    expect(spy, "guard consulted on a disarmed event").not.toHaveBeenCalled();
+    expect(getBranch, "ledger read on a disarmed event").not.toHaveBeenCalled();
+
+    // Armed, the same event reaches the guard and returns {action} alone: the
+    // host reads `action` and nothing else (runner.js:843-844), so a reason
+    // cannot be transported and must not appear here.
+    seedApproval({ qoder: true });
+    const result = (await handler?.(stopDecision, ctx)) as Record<string, unknown>;
+    expect(result).toEqual({ action: "warm" });
+    expect(Object.keys(result)).toEqual(["action"]);
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(getBranch).toHaveBeenCalledTimes(1);
   });
 });
