@@ -1,7 +1,7 @@
-// shape: module-scope memo plus a pure entry point — the run registry is one
-//   instance per process (routing.ts:1-4 states the same shape for its memo),
-//   and the adapters differ in their input view, not in a step sequence, so
-//   there is no dispatch object to build.
+// shape: module-scope memo plus a pure entry point — the run registry and the
+//   real-turn clock are one instance per process (routing.ts:1-4 states the same
+//   shape for its memo), and the adapters differ in their input view, not in a
+//   step sequence, so there is no dispatch object to build.
 import crypto from "node:crypto";
 import { QODER_GATEWAY_COSY_VERSION } from "../cosy.js";
 
@@ -108,6 +108,28 @@ const runStates = new Map<string, QoderRunState>();
 /** Empty the run registry. Exposed for tests only. */
 export function clearQoderRunRegistry(): void {
   runStates.clear();
+}
+
+// shape: inherited — module-scope state beside the run registry (DSG-3),
+//   trigger #3 one instance per process; the reader and the test-only clearer
+//   follow the clearQoderRunRegistry precedent directly above.
+/**
+ * Epoch milliseconds of the most recent real dispatch, or undefined until one
+ * happens. It lives here rather than at the two adapter call sites because both
+ * already resolve identity exactly once per dispatch with `turnKind` in hand, so
+ * the module that owns the real/warm distinction also owns the clock and
+ * neither adapter is edited (OD-D).
+ */
+let realTurnClock: number | undefined;
+
+/** The last real dispatch's epoch milliseconds; undefined in a process that had none. */
+export function lastRealRequestAt(): number | undefined {
+  return realTurnClock;
+}
+
+/** Reset the real-turn clock. Exposed for tests only. */
+export function clearQoderRealTurnClock(): void {
+  realTurnClock = undefined;
 }
 
 /**
@@ -224,6 +246,10 @@ function rememberRun(key: string, state: QoderRunState): void {
  * otherwise.
  */
 export function resolveRunIdentity(input: QoderRunRequest): QoderRunIdentity {
+  // Stamped before any branch so a rotating identity stamps too, and only for a
+  // real turn: a warm replay that advanced the clock would empty the guard's
+  // since-last-real-dispatch span and make its miss ceiling unreachable.
+  if (input.turnKind === "real") realTurnClock = Date.now();
   const key = `${input.mode}:${input.upstreamKey}:${input.wireSessionId}`;
   const existing = runStates.get(key);
 
