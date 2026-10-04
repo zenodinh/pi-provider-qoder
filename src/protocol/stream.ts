@@ -16,7 +16,16 @@ import {
 import { type QoderIdentity, resolveQoderIdentity } from "../auth/oauth.js";
 import { getCachedModelConfig, MAX_OUTPUT_TOKENS } from "../catalog.js";
 import { buildAuthHeaders, getMachineId } from "../cosy.js";
-import { capText, createDebugFetch, debugEnabled, redactHeadersForDebug, writeDebugRecord } from "../debug-log.js";
+import {
+  capText,
+  createDebugFetch,
+  createResponseCapture,
+  type DebugFetchMeta,
+  debugEnabled,
+  type ResponseCapture,
+  redactHeadersForDebug,
+  writeDebugRecord,
+} from "../debug-log.js";
 import { readResponseText, withAbort } from "../http.js";
 import { priceTurnCost, type RateSource, rateForUpstreamKey } from "../pricing.js";
 import { getQoderChatURL, getQoderRegionConfig } from "../region.js";
@@ -158,6 +167,9 @@ export function streamQoder(
 
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   let response: Response | undefined;
+  // Declared beside the reader because the response record is written from the
+  // teardown block below, which must see it on the done, catch and abort paths.
+  let capture: ResponseCapture | undefined;
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
   const requestController = new AbortController();
   const requestTimer =
@@ -479,13 +491,14 @@ export function streamQoder(
           bodyTruncated: capped.truncated,
         });
       }
-      const debugFetch = createDebugFetch(options?.fetch ?? fetch, {
+      const debugMeta: DebugFetchMeta = {
         protocol: "legacy",
         session: options?.sessionId,
         model: model.id,
         upstreamKey: qoderModel,
         logRequest: false,
-      });
+      };
+      const debugFetch = createDebugFetch(options?.fetch ?? fetch, debugMeta);
 
       const fetchPromise = debugFetch(chatURL, {
         method: "POST",
@@ -520,6 +533,16 @@ export function streamQoder(
 
       if (!response.ok) {
         const errText = await readResponseText(response, requestController.signal);
+        // readResponseText is this path's consumer-side read — the loop below never
+        // runs — so an HTTP error body is recorded here or not at all. Gated on
+        // response.body to hold the one-record-per-response partition: a body-less
+        // response is already recorded by createDebugFetch, which is the module
+        // that owns that case on both protocols.
+        if (response.body) {
+          capture = createResponseCapture(debugMeta, chatURL, response.status);
+          capture?.push(errText);
+          capture?.finish();
+        }
         throw new Error(`Qoder API request failed: ${response.status} ${response.statusText}. Response: ${errText}`);
       }
 
@@ -527,6 +550,10 @@ export function streamQoder(
       if (!reader) throw new Error("No response body");
       const decoder = new TextDecoder();
       let buffer = "";
+      // Response capture rides this loop: the decoder below already traverses
+      // every byte in order to parse it, so observing here adds no wrapper,
+      // cannot reorder events, and records exactly what the transport processed.
+      capture = createResponseCapture(debugMeta, chatURL, response.status);
 
       let thinkingBlockIndex = -1;
       const toolCalls = new ToolCallAccumulator(output, pushEvent);
@@ -617,7 +644,9 @@ export function streamQoder(
         throwIfAborted();
         if (!done) resetIdleTimer();
 
-        buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+        const decoded = done ? decoder.decode() : decoder.decode(value, { stream: true });
+        capture?.push(decoded);
+        buffer += decoded;
         if (buffer.length > MAX_SSE_BUFFER_LENGTH && !buffer.includes("\n")) {
           throw new Error(`Qoder SSE buffer exceeded ${MAX_SSE_BUFFER_LENGTH} characters without a complete line`);
         }
@@ -834,6 +863,11 @@ export function streamQoder(
       if (requestTimer) clearTimeout(requestTimer);
       if (idleTimer) clearTimeout(idleTimer);
       removeExternalAbortListener?.();
+      // One response record per turn, holding the prefix actually processed: the
+      // done path, the catch path and an external abort all land here, and
+      // finish() is idempotent, so this is the single write site. An aborted turn
+      // therefore records what it saw instead of draining the body it cancelled.
+      capture?.finish();
       if (reader) void reader.cancel().catch(() => {});
       else if (response) void response.body?.cancel().catch(() => {});
     }
