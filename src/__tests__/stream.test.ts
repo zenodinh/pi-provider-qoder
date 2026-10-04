@@ -1691,6 +1691,13 @@ describe("stamp tail on the legacy transport", () => {
  * namespace on v2, whose wire dispatch uses an upstream key instead.
  */
 describe("qoder-warm-attribution: one ledger namespace", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
   // boundary: `onPayload` hands back the adapter's own outbound body as
   // `unknown`; narrow with a record predicate before reading a field (BND-1),
   // the idiom debug-sink.ts and four production modules already use. No shared
