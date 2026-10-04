@@ -12,12 +12,19 @@ import { debugLog } from "../debug.js";
 import type { RateSource } from "../pricing.js";
 
 /**
- * The tail's per-turn values, both optional: the rate source an adapter produced
- * for a priced row, and the reserved hook a later concern (defects-SA CU-6's
- * prefix stamp) rides without editing either adapter.
+ * The tail's per-turn values, all optional: the rate source an adapter produced
+ * for a priced row, the friendly model id a terminal must be normalized to, and
+ * the reserved hook a later concern (defects-SA CU-6's prefix stamp) rides
+ * without editing either adapter.
  */
 export interface TerminalStamp {
   rateSource?: RateSource;
+  /**
+   * The catalog id the persisted row must key by. An adapter that dispatches
+   * under an upstream key passes its friendly id here, so one model is one
+   * ledger namespace on both transports. Absent means "leave `model` alone".
+   */
+  modelId?: string;
   onTerminal?: (message: AssistantMessage) => void;
 }
 
@@ -44,12 +51,18 @@ function terminalMessage(event: AssistantMessageEvent): AssistantMessage | undef
 /**
  * Apply the tail's stamps in place, before the event is pushed: the rate source
  * rides only a row a usage chunk actually priced (an unpriced error row claims
- * no ladder priced it), and the hook sees the same live message the stream
- * pushes. Non-terminal events pass through untouched.
+ * no ladder priced it), model normalization rides every terminal regardless of
+ * price, and the hook sees the same live message the stream pushes. Non-terminal
+ * events pass through untouched.
  */
 export function stampTerminal(event: AssistantMessageEvent, stamp: TerminalStamp): void {
   const message = terminalMessage(event);
   if (!message) return;
+  // Not priced-gated, unlike `rateSource` below: an error or aborted terminal is
+  // still persisted and still keys a ledger bucket, so it must carry the same
+  // namespace as the assistant rows around it. Written before the hook so a
+  // rider (CU-6's prefix stamp) observes the normalized message.
+  if (stamp.modelId !== undefined) message.model = stamp.modelId;
   if (stamp.rateSource !== undefined && hasUsage(message)) {
     (message.usage as RateStampedUsage).rateSource = stamp.rateSource;
   }

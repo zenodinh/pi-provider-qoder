@@ -229,12 +229,17 @@ function errorStream(model: Model<Api>, message: string): AssistantMessageEventS
 }
 
 /**
- * Pass-through tail that stamps `rateSource` on a priced terminal message
+ * Pass-through tail that stamps `rateSource` on a priced terminal message and
+ * normalizes the terminal's `model` to the friendly catalog id `modelId`,
  * without touching pi-ai's computed cost; the shared wrapper supplies the
  * ordered terminal-before-end guarantee.
  */
-function withRateSourceStamp(inner: AssistantMessageEventStream, rateSource: RateSource): AssistantMessageEventStream {
-  return withTerminalStamp(inner, { rateSource });
+function withRateSourceStamp(
+  inner: AssistantMessageEventStream,
+  rateSource: RateSource,
+  modelId: string,
+): AssistantMessageEventStream {
+  return withTerminalStamp(inner, { rateSource, modelId });
 }
 
 /**
@@ -315,8 +320,10 @@ export function streamQoderV2(
   // own events, whose cost stream.ts already stamped at its assembly site.
   const rateSource: RateSource = rateForUpstreamKey(route.upstreamKey) ? "rate-table" : "fallback";
   // The v2 side gains the shared ordered tail here; the self-heal below only
-  // decides whether the first event hands the turn to legacy.
-  const stamped = withRateSourceStamp(inner, rateSource);
+  // decides whether the first event hands the turn to legacy. `model.id` is the
+  // friendly catalog id: pi-ai dispatched under `route.upstreamKey`, so without
+  // normalizing it back the persisted row would key by the wire key.
+  const stamped = withRateSourceStamp(inner, rateSource, model.id);
   if (!fallbackEnabled) return stamped;
 
   // Self-heal (opt-in): on a pre-start 400 invalid_model_error, the routing

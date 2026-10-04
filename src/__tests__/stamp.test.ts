@@ -250,3 +250,73 @@ describe("withTerminalStamp", () => {
     expect((await failing.result()).stopReason).toBe("error");
   });
 });
+
+/**
+ * qoder-warm-attribution (CU-02, T-03/T-04) — terminal-model normalization.
+ *
+ * The tail is the one seam both protocols' terminals cross, so normalizing here
+ * rather than in each adapter is what produces one ledger namespace. Every row
+ * enters through `withTerminalStamp`, the shipped entry point, and observes the
+ * events it pushes.
+ */
+describe("withTerminalStamp modelId normalization (qoder-warm-attribution T-03/T-04)", () => {
+  it("T-03/AC-02 normalizes the terminal model before the event is pushed and before the hook runs", async () => {
+    const inner = createAssistantMessageEventStream();
+    // invented: the upstream-key/friendly-id pair is the real catalog pair for
+    // DeepSeek-V4-Flash (catalog.ts:230) — an adapter that dispatched under the
+    // wire key produces a terminal carrying it, which matches no registered
+    // model in the ledger.
+    const terminal = assistantMessage({ model: "dfmodel", stopReason: "stop" });
+    const seenByHook: string[] = [];
+    const seenByConsumer: string[] = [];
+
+    const stream = withTerminalStamp(inner, {
+      modelId: "DeepSeek-V4-Flash",
+      onTerminal: (message) => {
+        seenByHook.push(message.model);
+      },
+    });
+    inner.push({ type: "done", reason: "stop", message: terminal });
+    inner.end();
+
+    for await (const event of stream) {
+      if (event.type === "done") seenByConsumer.push(event.message.model);
+    }
+
+    // The reserved hook observes the normalized message, so a rider (CU-6's
+    // prefix stamp) attributes its rows in the same namespace.
+    expect(seenByHook).toEqual(["DeepSeek-V4-Flash"]);
+    // The consumer's first and only observation is already normalized: the tail
+    // stamps in place before pushing, so there is no unstamped form to see.
+    expect(seenByConsumer).toEqual(["DeepSeek-V4-Flash"]);
+    expect(terminal.model).toBe("DeepSeek-V4-Flash");
+  });
+
+  it("T-03/AC-07 leaves model untouched when the stamp carries no modelId", async () => {
+    const inner = createAssistantMessageEventStream();
+    inner.push({ type: "done", reason: "stop", message: assistantMessage({ model: "Lite", stopReason: "stop" }) });
+    inner.end();
+
+    // The pre-existing call shape — every adapter that passes only a rate source
+    // keeps its terminal model exactly as it was.
+    const events = await consume(withTerminalStamp(inner, { rateSource: "rate-table" }));
+    const done = events.at(-1) as Extract<AssistantMessageEvent, { type: "done" }>;
+    expect(done.message.model).toBe("Lite");
+  });
+
+  it("T-04/AC-02,AC-06 normalizes an unpriced error terminal while the rateSource gate stays priced-only", async () => {
+    const inner = createAssistantMessageEventStream();
+    // An error terminal: every token bucket zero, so `hasUsage` is false and the
+    // rate-source gate must not fire. The row is still persisted and still keys
+    // a ledger bucket, so it must still carry the friendly namespace.
+    const errored = assistantMessage({ model: "dfmodel", stopReason: "error", errorMessage: "upstream 500" });
+    inner.push({ type: "error", reason: "error", error: errored });
+    inner.end();
+
+    expect(hasUsage(errored)).toBe(false);
+    const events = await consume(withTerminalStamp(inner, { rateSource: "rate-table", modelId: "DeepSeek-V4-Flash" }));
+    const errorEvent = events.at(-1) as Extract<AssistantMessageEvent, { type: "error" }>;
+    expect(errorEvent.error.model).toBe("DeepSeek-V4-Flash");
+    expect("rateSource" in errorEvent.error.usage).toBe(false);
+  });
+});

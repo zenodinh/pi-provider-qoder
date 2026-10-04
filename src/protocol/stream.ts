@@ -676,7 +676,10 @@ export function streamQoder(
               throw new Error(`Qoder upstream error: ${typeof error === "string" ? error : JSON.stringify(error)}`);
             }
             if (inner.id) output.responseId = inner.id as string;
-            if (inner.model) output.responseModel = inner.model as string;
+            // No `responseModel` copy here: the gateway's `model` echo is one
+            // constant for every requested model, so copying it would key every
+            // row by that constant instead of the request (pi resolves
+            // `responseModel ?? model`); `output.model` is already the friendly id.
             if (inner.usage) {
               const u = inner.usage as {
                 prompt_tokens?: number;
