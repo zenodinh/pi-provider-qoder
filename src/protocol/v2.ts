@@ -15,7 +15,7 @@ import {
 } from "@earendil-works/pi-ai";
 import type { QoderModelEntry } from "../catalog.js";
 import { debugLog } from "../debug.js";
-import { createDebugFetch } from "../debug-log.js";
+import { createDebugFetch, type DebugFetchMeta } from "../debug-log.js";
 import { openAICompletionsApi } from "../host-seam.js";
 import { type RateSource, rateForUpstreamKey } from "../pricing.js";
 import type { QoderMode } from "../region.js";
@@ -294,18 +294,19 @@ export function streamQoderV2(
   // Debug capture wraps the base fetch INSIDE the reframe wrapper: the capture
   // tees raw server bytes, and reframe still repairs the framing downstream.
   const syncSession = options?.sessionId ?? PROCESS_FALLBACK_SESSION_ID;
+  const debugMeta: DebugFetchMeta = {
+    protocol: "v2",
+    session: options?.sessionId,
+    model: model.id,
+    upstreamKey: route.upstreamKey,
+    // The value that actually went on the wire: metadata.context.session_id.
+    wireSessionId: route.plan?.wireSessionV2.envelopeAndHeaders ?? syncSession,
+  };
   const inner = openAICompletionsApi().streamSimple(v2Model, context, {
     ...options,
-    fetch: createReframedFetch(
-      createDebugFetch(options?.fetch ?? globalThis.fetch, {
-        protocol: "v2",
-        session: options?.sessionId,
-        model: model.id,
-        upstreamKey: route.upstreamKey,
-        // The value that actually went on the wire: metadata.context.session_id.
-        wireSessionId: route.plan?.wireSessionV2.envelopeAndHeaders ?? syncSession,
-      }),
-    ),
+    // One meta, two capture halves: createDebugFetch keeps the request record,
+    // createReframedFetch keeps the response record off the consumer-side read.
+    fetch: createReframedFetch(createDebugFetch(options?.fetch ?? globalThis.fetch, debugMeta), debugMeta),
     onPayload: wrappedOnPayload,
   });
 

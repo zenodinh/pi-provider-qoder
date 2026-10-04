@@ -10,6 +10,23 @@
  * `<QODER_DEBUG_DIR | ~/.pi/agent/logs/qoder-debug>/<sessionId>.jsonl` for
  * offline analytics (cache-miss root-cause work, protocol-parity checks).
  *
+ * CAPTURE SITES — response capture is CONSUMER-SIDE and never forks a body.
+ * `createDebugFetch` keeps only the request half and returns the inner fetch's
+ * own Response object, so the transport sees an unlocked, unconsumed body, the
+ * Response keeps its identity, and teardown cancels exactly once. The response
+ * half rides reads the transports already perform, through
+ * `createResponseCapture`:
+ *   1. the legacy read loop in `protocol/stream.ts`, which decodes every chunk
+ *      it is about to parse anyway;
+ *   2. the v2 reframe transform in `protocol/sse-reframe.ts`, which decodes
+ *      every raw chunk before repairing the framing — plus that module's
+ *      pass-through observer for the non-event-stream early return, where no
+ *      reframe transform exists to ride.
+ * Neither a `tee()` nor a `clone()` may be reintroduced here. `tee()` locks the
+ * body before `onResponse` runs, and `clone()` leaves a pending branch that
+ * makes the caller's `cancel()` never settle on a stalled body — measured, not
+ * theorized. Both perturb the transport they are meant to observe (BUG-0009).
+ *
  * Contract: this sink NEVER writes to console/TUI and never changes control
  * flow — every fs operation is fail-soft, mirroring the probe's posture.
  *
@@ -29,8 +46,8 @@ const DEFAULT_MAX_BYTES = 2_000_000;
 const AUTH_HEADER = /authorization|cookie|api[-_]?key|token|secret|cosy/i;
 
 let activeSession: string | undefined;
-// Assigned chain (never a floating statement): serializes the async clone
-// reads so response records land in request order, rejections handled.
+// Assigned chain (never a floating statement): serializes the capture-record
+// appends so response records land in terminal order, rejections handled.
 let writeChain: Promise<void> = Promise.resolve();
 const seenFiles = new Set<string>();
 
@@ -154,13 +171,94 @@ function wireSessionField(meta: DebugFetchMeta): { wireSessionId?: string } {
   return meta.wireSessionId !== undefined ? { wireSessionId: meta.wireSessionId } : {};
 }
 
-// shape: wrapper function — trigger #12 (adds capture behavior to an inner
-//   fetch; composes under createReframedFetch, which must see raw bytes).
+/**
+ * The request url both halves of a capture record name. Derived from the
+ * request, never from a Response: a constructed Response reads back
+ * `url === ""`, so reading it there would silently blank the field.
+ */
+// shape: none — dispatch object does not apply: one union narrowing with no
+//   discriminator value to dispatch on.
+// boundary: RequestInfo | URL is a standard fetch union (BND-3 — host type, not
+// re-declared), narrowed by typeof/instanceof before any property read.
+export function debugFetchUrl(input: RequestInfo | URL): string {
+  return typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+}
+
+/**
+ * Consumer-side response capture. A transport read pushes the raw text it just
+ * decoded and calls `finish()` at its terminal; the record is written from what
+ * was actually processed, so an aborted turn records the prefix it saw instead
+ * of draining a body the transport never read.
+ */
+export interface ResponseCapture {
+  /** Add raw response text. Bytes past the cap are dropped and set `truncated`. */
+  push(text: string): void;
+  /** Write the response record once. Idempotent, so teardown paths may repeat it. */
+  finish(): void;
+}
+
+/**
+ * Build a capture for one response, or `undefined` when debug is off — which is
+ * what lets every capture site be a bare `capture?.push(...)` that does no
+ * accumulator work and allocates nothing on the off path.
+ */
+// shape: closure returning an object literal — trigger #4 (per-response mutable
+//   state, the accumulated text and the written flag, behind two methods; no
+//   instanceof or subclassing, so a class would be ceremony).
+export function createResponseCapture(meta: DebugFetchMeta, url: string, status: number): ResponseCapture | undefined {
+  if (!debugEnabled()) return undefined;
+  // Read the cap once per response: bounding the accumulator is what bounds
+  // memory as well as disk, so it cannot wait for capText at write time.
+  // NUM-1 satisfied by envPositiveInt, which blank-checks before coercing.
+  const max = envPositiveInt("QODER_DEBUG_MAX_BYTES", DEFAULT_MAX_BYTES);
+  let text = "";
+  let truncated = false;
+  let written = false;
+  return {
+    push(chunk: string): void {
+      if (truncated) return;
+      const room = max - text.length;
+      if (chunk.length > room) {
+        text += chunk.slice(0, room);
+        truncated = true;
+        return;
+      }
+      text += chunk;
+    },
+    finish(): void {
+      // Idempotency (SA §7.10 4Q): the terminal event is the dedup key, so the
+      // done, catch and teardown paths may each call this and still append one
+      // line. `text`/`truncated` are snapshotted by value here, before the
+      // serialized append runs, so a late push cannot reshape the record.
+      if (written) return;
+      written = true;
+      const record = {
+        type: "response",
+        protocol: meta.protocol,
+        model: meta.model,
+        upstreamKey: meta.upstreamKey,
+        ...wireSessionField(meta),
+        url,
+        status,
+        sse: text,
+        truncated,
+      };
+      enqueueDebugWrite(async () => {
+        writeDebugRecord(meta.session, record);
+      });
+    },
+  };
+}
+
+// shape: wrapper function — trigger #12 (adds request capture to an inner fetch
+//   and hands back that fetch's own Response object; composes under
+//   createReframedFetch, which must see raw bytes). The response half is not
+//   here — it rides the consumer-side reads named in the module header, so this
+//   wrapper neither tees nor re-wraps a body.
 export function createDebugFetch(inner: typeof fetch, meta: DebugFetchMeta): typeof fetch {
   if (!debugEnabled()) return inner;
   return async (input, init) => {
-    // boundary: RequestInfo union narrowed by typeof/instanceof (standard fetch types)
-    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const url = debugFetchUrl(input);
     if (meta.logRequest !== false) {
       const rawBody = init?.body;
       const bodyText =
@@ -184,6 +282,9 @@ export function createDebugFetch(inner: typeof fetch, meta: DebugFetchMeta): typ
     }
     const response = await inner(input, init);
     if (!response.body) {
+      // There is nothing for a consumer-side read to accumulate, so this record
+      // is complete here. A response WITH a body is recorded by the transport
+      // read that consumes it — see createResponseCapture.
       writeDebugRecord(meta.session, {
         type: "response",
         protocol: meta.protocol,
@@ -193,24 +294,9 @@ export function createDebugFetch(inner: typeof fetch, meta: DebugFetchMeta): typ
         url,
         status: response.status,
       });
-      return response;
     }
-    const [main, clone] = response.body.tee();
-    enqueueDebugWrite(async () => {
-      const text = await new Response(clone).text();
-      const capped = capText(text);
-      writeDebugRecord(meta.session, {
-        type: "response",
-        protocol: meta.protocol,
-        model: meta.model,
-        upstreamKey: meta.upstreamKey,
-        ...wireSessionField(meta),
-        url,
-        status: response.status,
-        sse: capped.text,
-        truncated: capped.truncated,
-      });
-    });
-    return new Response(main, { status: response.status, statusText: response.statusText, headers: response.headers });
+    // The caller receives this exact object: body unlocked and unconsumed, with
+    // no second Response layer between it and the transport's own teardown.
+    return response;
   };
 }

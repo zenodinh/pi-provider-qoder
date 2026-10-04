@@ -9,7 +9,7 @@
 //          in the session file; console.error is never called.
 //   SPEC-4 v2 route -> request record body carries prompt_cache_key and the
 //          affinity headers are captured; response record carries the SSE.
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Api, AssistantMessageEvent, Context, Model, TranscriptContext } from "@earendil-works/pi-ai";
@@ -350,18 +350,28 @@ describe("wireSessionId on the response records", () => {
   it("T-16 writes it into both response branches and omits the key when the meta has none", async () => {
     vi.stubEnv("QODER_DEBUG", "1");
 
-    const teed = createDebugFetch(async () => new Response("data: [DONE]\n\n", { status: 200 }), {
-      protocol: "v2",
-      session: "sess-wire-tee",
-      wireSessionId: "wire-tee",
-    });
-    await teed("https://example.test/chat/completions", { method: "POST", body: "{}" });
-    await vi.waitFor(() => {
-      expect(readDebugRecords(debugDir, "sess-wire-tee").some((r) => r.type === "response")).toBe(true);
-    });
-    expect(readDebugRecords(debugDir, "sess-wire-tee").find((r) => r.type === "response")?.wireSessionId).toBe(
-      "wire-tee",
+    // REWRITTEN by spec qoder-capture-neutrality CU-01. This movement used to
+    // drive createDebugFetch alone with a body-ful Response and assert the tee'd
+    // record. The wrapper no longer forks a body, so a streamed response record
+    // is written at the transport seam where the accumulation now happens (S3).
+    // Legacy's meta carries no wireSessionId, so absent stays absent — the
+    // relocation must not invent the field on a body-ful capture.
+    await drain(
+      streamQoder(makeModel("Lite"), makeContext(), {
+        apiKey: "fake",
+        fetch: mockFetch(SUCCESS_SSE),
+        sessionId: "sess-wire-legacy",
+      }),
     );
+    await vi.waitFor(() => {
+      expect(readDebugRecords(debugDir, "sess-wire-legacy").some((r) => r.type === "response")).toBe(true);
+    });
+    const legacyRecord = readDebugRecords(debugDir, "sess-wire-legacy").find((r) => r.type === "response") as Record<
+      string,
+      unknown
+    >;
+    expect(typeof legacyRecord.sse).toBe("string");
+    expect("wireSessionId" in legacyRecord).toBe(false);
 
     const bodyless = createDebugFetch(async () => new Response(null, { status: 204 }), {
       protocol: "v2",
@@ -436,5 +446,78 @@ describe("wireSessionId on the response records", () => {
     expect(response?.wireSessionId).toBe(metadata?.context.session_id);
     expect(response?.wireSessionId).toBe("sess-wire-e2e");
     expect(errSpy).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Spec qoder-capture-neutrality T-01 (AC-01, AC-02, AC-08).
+ *
+ * The one claim that cannot be made at a transport seam: the wrapped fetch hands
+ * back the inner fetch's OWN Response object, so the body reaches the transport
+ * unlocked and unconsumed. This is the exact perturbation BUG-0009 recorded —
+ * the wrapper tee'd the body, which locked it, and returned a re-wrapped
+ * Response, which lost the identity `onResponse` and teardown rely on.
+ */
+describe("createDebugFetch response neutrality (T-01)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("returns the inner fetch's own Response, unlocked, unconsumed and still readable", async () => {
+    vi.stubEnv("QODER_DEBUG", "1");
+    // invented: a two-event SSE body — enough to prove the caller can still read
+    // it to completion after the wrapper has observed the request.
+    const body = 'data: {"a":1}\n\ndata: [DONE]\n\n';
+    let produced: Response | undefined;
+    const inner = vi.fn(async () => {
+      produced = new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+      return produced;
+    });
+    // AC-01's "no tee() call occurs", witnessed directly rather than inferred
+    // from the lock state alone.
+    const tee = vi.spyOn(ReadableStream.prototype, "tee");
+
+    const wrapped = createDebugFetch(inner as unknown as typeof fetch, {
+      protocol: "v2",
+      session: "sess-t01",
+      wireSessionId: "wire-t01",
+    });
+    const response = await wrapped("https://example.test/chat/completions", { method: "POST", body: "{}" });
+
+    expect(response).toBe(produced);
+    expect(response.body?.locked).toBe(false);
+    expect(response.bodyUsed).toBe(false);
+    expect(tee).not.toHaveBeenCalled();
+    // The caller — the transport — can still consume the whole body.
+    expect(await response.text()).toBe(body);
+
+    // AC-08: the request half is untouched. A body-ful response writes no record
+    // here, because that record now belongs to the consumer-side read.
+    await vi.waitFor(() => {
+      expect(readDebugRecords(debugDir, "sess-t01").some((r) => r.type === "request")).toBe(true);
+    });
+    expect(readDebugRecords(debugDir, "sess-t01").filter((r) => r.type === "response")).toHaveLength(0);
+  });
+});
+
+/**
+ * Spec qoder-capture-neutrality T-06 (AC-07, CU-05) — structural.
+ *
+ * The module header is where the next reader looks first, and a stale "the
+ * wrapper tees the response" claim is how the fork gets reintroduced. Asserted
+ * the way retry-docs.test.ts asserts documentation against the code it
+ * describes: the source is read as text, not executed.
+ */
+describe("debug-log header names the consumer-side capture sites (T-06)", () => {
+  const source = readFileSync(new URL("../debug-log.ts", import.meta.url), "utf8");
+
+  it("names both capture sites and no longer describes a tee-and-re-wrap", () => {
+    expect(source).toContain("CONSUMER-SIDE");
+    expect(source).toContain("createResponseCapture");
+    expect(source).toContain("protocol/stream.ts");
+    expect(source).toContain("protocol/sse-reframe.ts");
+    // The defect's own two mechanisms must be absent from the wrapper.
+    expect(source).not.toContain("body.tee()");
+    expect(source).not.toContain("new Response(main");
   });
 });

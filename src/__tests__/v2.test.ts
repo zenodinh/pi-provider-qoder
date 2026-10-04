@@ -469,6 +469,52 @@ describe("fragmented SSE repair", () => {
     expect(terminal.type).toBe("error");
     expect(String(terminal.error?.errorMessage)).toContain("invalid_model_error");
   });
+
+  /**
+   * Spec qoder-capture-neutrality T-04 (AC-02, AC-04) — the v2 half of FR-8.
+   *
+   * The same fragmented fixture is driven twice, capture off then on. Capture
+   * rides reframe's existing transform rather than adding a Response layer, so
+   * the repaired framing and the terminal message must be identical in both
+   * states; the only difference is that the on-run leaves a record behind.
+   */
+  it("repairs a fragmented stream identically with capture off and on, recording once", async () => {
+    seedCatalogWithTiers();
+    const runs: { stopReason: string; text: string; dir: string }[] = [];
+    for (const debug of ["", "1"]) {
+      const dir = mkdtempSync(join(tmpdir(), "qoder-v2-neutral-"));
+      vi.stubEnv("QODER_DEBUG", debug);
+      vi.stubEnv("QODER_DEBUG_DIR", dir);
+      clearQoderFallbackCache();
+      clearQoderRoutingMemCache();
+      const fetch = vi.fn(async () => sseResponse(fixture, 7)) as unknown as typeof globalThis.fetch;
+      const result = await streamQoderRouter(modelNamed("Ultimate"), context, {
+        apiKey: "fake",
+        fetch,
+        sessionId: "sess-v2-neutral",
+      }).result();
+      runs.push({ stopReason: result.stopReason, text: answerText(result), dir });
+    }
+    const [off, on] = runs;
+    // Neutrality: one repaired event sequence and one terminal message, whatever
+    // the capture state — and both equal the fixture's known-good answer.
+    expect(off.stopReason).toBe("toolUse");
+    expect(on.stopReason).toBe(off.stopReason);
+    expect(on.text).toBe(off.text);
+    expect(on.text).toBe(EXPECTED_TEXT);
+
+    // Capture off writes nothing; capture on writes exactly one response record,
+    // holding the raw pre-repair bytes the transform decoded.
+    expect(readDebugRecords(off.dir, "sess-v2-neutral").filter((r) => r.type === "response")).toHaveLength(0);
+    await vi.waitFor(() => {
+      expect(readDebugRecords(on.dir, "sess-v2-neutral").filter((r) => r.type === "response")).toHaveLength(1);
+    });
+    const record = readDebugRecords(on.dir, "sess-v2-neutral").find((r) => r.type === "response");
+    expect(record?.protocol).toBe("v2");
+    expect(record?.status).toBe(200);
+    expect(String(record?.sse)).toContain("[DONE]");
+    expect(record?.truncated).toBe(false);
+  });
 });
 
 describe("self-heal", () => {
@@ -553,6 +599,71 @@ describe("self-heal", () => {
     expect(events.at(-1)?.type).toBe("error");
     expect(urls).toHaveLength(1);
     expect(isMarkedLegacyOnly("ultimate")).toBe(false);
+  });
+
+  /**
+   * Spec qoder-capture-neutrality T-05 (CU-04, AC-04, AC-06) — SA §7.10 OD-F.
+   *
+   * `createReframedFetch` hands a non-event-stream response back without
+   * reframing it, so a capture living only inside the reframe transform would
+   * never see this 400 `invalid_model_error` body — which is exactly the
+   * evidence the self-heal branch reads to decide, and that the FS-G probe
+   * collects. The record set must be identical before and after the relocation,
+   * and the branch must decide identically in both capture states.
+   */
+  it("records a non-SSE 400 while the self-heal branch still reads the same body", async () => {
+    seedCatalogWithTiers();
+    const runs: { stopReason: string; urls: string[]; dir: string }[] = [];
+    for (const debug of ["", "1"]) {
+      const dir = mkdtempSync(join(tmpdir(), "qoder-v2-400-"));
+      vi.stubEnv("QODER_DEBUG", debug);
+      vi.stubEnv("QODER_DEBUG_DIR", dir);
+      // The first run marks the key legacy-only, which would suppress the second
+      // run's v2 attempt entirely; clear so both states dispatch identically.
+      clearQoderFallbackCache();
+      clearQoderRoutingMemCache();
+      const urls: string[] = [];
+      const fetch = vi.fn(async (input: unknown) => {
+        const url = String(input);
+        urls.push(url);
+        if (url.includes("chat/completions")) return invalidModelResponse();
+        return new Response(legacySuccess);
+      }) as typeof globalThis.fetch;
+      const result = await streamQoderRouter(modelNamed("Ultimate"), context, {
+        apiKey: "fake",
+        fetch,
+        sessionId: "sess-v2-400",
+        env: { QODER_FALLBACK: "1" },
+      } as SimpleStreamOptions).result();
+      runs.push({ stopReason: result.stopReason, urls, dir });
+    }
+    const [off, on] = runs;
+    // The 400 body stayed readable by the self-heal branch in both states, so
+    // the turn healed to legacy exactly once, from the same two dispatches.
+    for (const run of runs) {
+      expect(run.stopReason).toBe("stop");
+      expect(run.urls).toHaveLength(2);
+      expect(run.urls[0]).toBe("https://api2-v2.qoder.sh/model/v1/chat/completions");
+      expect(run.urls[1]).toContain("agent_chat_generation");
+    }
+
+    const v2Responses = (dir: string) =>
+      readDebugRecords(dir, "sess-v2-400").filter((r) => r.type === "response" && r.protocol === "v2");
+    expect(v2Responses(off.dir)).toHaveLength(0);
+    await vi.waitFor(() => {
+      expect(v2Responses(on.dir)).toHaveLength(1);
+    });
+    const record = v2Responses(on.dir)[0];
+    expect(record?.status).toBe(400);
+    expect(String(record?.sse)).toContain("invalid_model_error");
+    expect(record?.truncated).toBe(false);
+    // The url is the REQUEST url: a constructed Response reads back url === "",
+    // so this pin is what proves the wrapper did not source the field from itself.
+    expect(record?.url).toBe(off.urls[0]);
+    // The healed legacy turn recorded too — the relocation shrank neither half.
+    expect(
+      readDebugRecords(on.dir, "sess-v2-400").filter((r) => r.type === "response" && r.protocol === "legacy"),
+    ).toHaveLength(1);
   });
 });
 
