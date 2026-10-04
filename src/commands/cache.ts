@@ -218,12 +218,20 @@ function budgetLabel(budget: Budget): string {
  * `budget …` first while the arming truth survives. Do not reorder.
  */
 function gateConfigLine(budget: Budget): string {
-  const piMode = readPiCacheWarmingMode();
-  const gates = QODER_MODES.map((mode) => {
+  const resolved = QODER_MODES.map((mode) => {
     const providerId = getQoderRegionConfig(mode).providerID;
-    const verdict = resolveWarmGate(providerId);
-    return `${providerId}=${verdict.armed ? "ON" : "OFF"}(${verdict.layer})`;
-  }).join(" ");
+    return { providerId, verdict: resolveWarmGate(providerId) };
+  });
+  const gates = resolved
+    .map(({ providerId, verdict }) => `${providerId}=${verdict.armed ? "ON" : "OFF"}(${verdict.layer})`)
+    .join(" ");
+  // pi's layer comes off the same verdicts rather than a separate read, so one
+  // derivation feeds both halves of the line and a concurrent settings write
+  // cannot make the pi label disagree with the verdicts beside it. The fallback
+  // is unreachable — QODER_MODES is never empty — and exists only so the
+  // degenerate case still resolves through the gate's own default instead of a
+  // second spelling of it here.
+  const piMode = resolved[0]?.verdict.piMode ?? readPiCacheWarmingMode();
   return `config: pi ${piMode} · gate ${gates} · budget ${budgetLabel(budget)}`;
 }
 

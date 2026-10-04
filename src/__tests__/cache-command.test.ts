@@ -289,6 +289,8 @@ describe("/qoder-cache command", () => {
     const home = homeWithSession([
       JSON.stringify(warmEntry(Date.UTC(2026, 9, 1), { input: 159, cacheRead: 141_568, output: 4 }, 0, 2.867)),
     ]);
+    // invented: SA §5.2's example has qoder-cn:false; this row needs BOTH
+    // regions approved so the only OFF on the line is pi's own layer.
     seedGateFiles(home, "off", { qoder: true, "qoder-cn": true });
     delete process.env.QODER_CACHE_WARM;
     const notify = vi.fn();
@@ -322,11 +324,14 @@ describe("/qoder-cache command", () => {
     await handleCacheCommand("", { mode: "tui", ui: { notify, custom } } as never);
 
     const text = panel?.render(80).join("\n") ?? "";
-    // The longest realistic gate line — both ON(file) and OFF(off) present.
-    // cache-view.ts:154 renders one bestFit candidate and truncates at
-    // innerWidth (width - 2 = 78), so this row is what pins the fit: if the
-    // line ever outgrows the panel, it fails here rather than silently losing
-    // the arming truth to truncation.
+    // The longest the GATE section gets with two regions — both ON(file) and
+    // OFF(off) present — under an ordinary budget label. cache-view.ts:154
+    // renders one bestFit candidate and truncates at innerWidth (width - 2 = 78,
+    // cache-view.ts:194), so this row pins that the gate section plus a normal
+    // budget still fits, and that a third region (about +18 chars) would fail
+    // here rather than silently losing a verdict to truncation. It deliberately
+    // does NOT cover the widest budget label: `budget off (uncapped)` pushes the
+    // line to 84 chars and is expected to truncate, which the next row pins.
     const expected = "config: pi idle · gate qoder=ON(file) qoder-cn=OFF(off) · budget 0.25";
     expect(expected.length).toBeLessThanOrEqual(78);
     expect(text).toContain(expected);
@@ -340,17 +345,37 @@ describe("/qoder-cache command", () => {
     ]);
     seedGateFiles(home, "streaming", { qoder: true, "qoder-cn": false });
     delete process.env.QODER_CACHE_WARM;
-    // The widest budget label, which is what pushes the line past a narrow panel.
+    // The widest budget label: beside `pi streaming` it makes the line 84 chars,
+    // which is what actually overflows the panel's 78-char inner width.
     process.env.QODER_WARM_BUDGET = "off";
+    const full = "config: pi streaming · gate qoder=ON(file) qoder-cn=OFF(off) · budget off (uncapped)";
+    expect(full.length).toBeGreaterThan(78);
+
+    // rpc mode notifies the raw string, so nothing truncates and the whole line
+    // reaches the operator intact.
     const notify = vi.fn();
-
     await handleCacheCommand("", { mode: "rpc", ui: { notify } } as never);
-
     const [message] = notify.mock.calls[0] as [string, string];
-    expect(message).toContain("config: pi streaming · gate qoder=ON(file) qoder-cn=OFF(off) · budget off (uncapped)");
-    // Gate left of budget, so truncation from the right takes the budget first.
-    const line = "config: pi streaming · gate qoder=ON(file) qoder-cn=OFF(off) · budget off (uncapped)";
-    expect(line.indexOf("gate")).toBeLessThan(line.indexOf("budget"));
+    expect(message).toContain(full);
+
+    // The TUI panel truncates the same string at innerWidth. Gate sits LEFT of
+    // budget, so the budget label is what gets eaten and the arming truth — pi's
+    // layer and both per-provider verdicts with their deciding layers — survives.
+    const theme = { fg: (_kind: string, text: string) => text, bold: (text: string) => text };
+    interface CapturedPanel {
+      render(width: number): string[];
+      handleInput(data: string): void;
+    }
+    let panel: CapturedPanel | undefined;
+    const custom = vi.fn((factory: (tui: unknown, theme: unknown, kb: unknown, done: unknown) => CapturedPanel) => {
+      panel = factory({ requestRender: () => {} }, theme, {}, () => {});
+      return Promise.resolve(undefined);
+    });
+    await handleCacheCommand("", { mode: "tui", ui: { notify, custom } } as never);
+
+    const text = panel?.render(80).join("\n") ?? "";
+    expect(text).toContain("config: pi streaming · gate qoder=ON(file) qoder-cn=OFF(off)");
+    expect(text).not.toContain("uncapped");
     rmSync(home, { recursive: true, force: true });
   });
 });
