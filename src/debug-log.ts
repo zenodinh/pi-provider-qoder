@@ -12,8 +12,8 @@
  *
  * CAPTURE SITES — response capture is CONSUMER-SIDE and never forks a body.
  * `createDebugFetch` keeps only the request half and returns the inner fetch's
- * own Response object, so the transport sees an unlocked, unconsumed body, the
- * Response keeps its identity, and teardown cancels exactly once. The response
+ * own Response object, so the transport sees an unlocked, unconsumed body, that
+ * object keeps its identity, and teardown cancels exactly once. The response
  * half rides reads the transports already perform, through
  * `createResponseCapture`:
  *   1. the legacy read loop in `protocol/stream.ts`, which decodes every chunk
@@ -22,6 +22,12 @@
  *      every raw chunk before repairing the framing — plus that module's
  *      pass-through observer for the non-event-stream early return, where no
  *      reframe transform exists to ride.
+ * Identity is this wrapper's guarantee, not a global one. On the v2
+ * non-event-stream path `createReframedFetch` must hand back a constructed
+ * Response, because a body that module does not reframe has no consumer-side
+ * read inside it to ride. Status, statusText, headers and bytes are preserved;
+ * a constructed Response does read back `url === ""`, which is why every record
+ * takes its url from the request and never from a Response.
  * Neither a `tee()` nor a `clone()` may be reintroduced here. `tee()` locks the
  * body before `onResponse` runs, and `clone()` leaves a pending branch that
  * makes the caller's `cancel()` never settle on a stalled body — measured, not

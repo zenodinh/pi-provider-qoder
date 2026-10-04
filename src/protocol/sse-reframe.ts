@@ -31,6 +31,10 @@ function reframeBlock(block: string): string {
  * never merges into the DOM lib's global. Node's runtime does call `cancel` when
  * the readable side is cancelled, and that is the only signal a body was
  * abandoned before EOF — so the hook is typed here rather than given up.
+ *
+ * boundary: extends the host's own Transformer instead of re-declaring it
+ * (BND-3); only the missing hook is added, so the host type stays the source of
+ * truth for the rest.
  */
 type CancellingTransformer<I, O> = Transformer<I, O> & { cancel?(reason?: unknown): void };
 
@@ -57,6 +61,12 @@ function reframeSseStream(capture?: ResponseCapture): TransformStream<Uint8Array
         boundary = buffer.indexOf("\n\n");
       }
       if (buffer.length > MAX_SSE_BUFFER_LENGTH) {
+        // Record the prefix before throwing. An errored TransformStream runs
+        // neither flush nor — unless the consumer happens to cancel — cancel, and
+        // those are the only other finish() sites; this is precisely the turn an
+        // operator enabled QODER_DEBUG to diagnose. finish() is idempotent, so a
+        // later cancel cannot double-write.
+        capture?.finish();
         throw new Error(
           `Qoder SSE reframe buffer exceeded ${MAX_SSE_BUFFER_LENGTH} characters without an event boundary`,
         );

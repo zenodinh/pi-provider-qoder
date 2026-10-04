@@ -21,6 +21,7 @@ import { clearQoderRunRegistry } from "../protocol/run-identity.js";
 import { clearQoderFilterMemCache } from "../protocol/sampling.js";
 import { streamQoderV2 } from "../protocol/v2.js";
 import { readDebugRecords } from "./debug-sink.js";
+import { OVERSIZED_TEXT } from "./sse-fixtures.js";
 
 const context = normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: 0 }] });
 // A completed tool round in the raw pi shape, so the run continuation predicate
@@ -514,6 +515,44 @@ describe("fragmented SSE repair", () => {
     expect(record?.status).toBe(200);
     expect(String(record?.sse)).toContain("[DONE]");
     expect(record?.truncated).toBe(false);
+  });
+
+  /**
+   * Spec qoder-capture-neutrality CU-03 — the overflow throw must still fire and
+   * must not be swallowed by the accumulator, and the record must survive it.
+   * An errored TransformStream runs neither flush nor cancel, so the prefix is
+   * recorded before the throw or not at all — and this is precisely the turn an
+   * operator enabled QODER_DEBUG to diagnose.
+   */
+  it("still records a capped prefix when the reframe buffer overflows", async () => {
+    seedCatalogWithTiers();
+    const dir = mkdtempSync(join(tmpdir(), "qoder-v2-overflow-"));
+    vi.stubEnv("QODER_DEBUG", "1");
+    vi.stubEnv("QODER_DEBUG_DIR", dir);
+    const fetch = vi.fn(async () => sseResponse(OVERSIZED_TEXT)) as unknown as typeof globalThis.fetch;
+    const events: AssistantMessageEvent[] = [];
+    const stream = streamQoderRouter(modelNamed("Ultimate"), context, {
+      apiKey: "fake",
+      fetch,
+      sessionId: "sess-v2-overflow",
+    });
+    for await (const event of stream) events.push(event);
+    const terminal = events.at(-1) as { type: string; error?: { errorMessage?: string } };
+    // The throw still reaches a terminal error: the accumulator neither swallows
+    // it nor degrades it into a silent truncation.
+    expect(terminal.type).toBe("error");
+    expect(String(terminal.error?.errorMessage)).toContain("reframe buffer exceeded");
+
+    await vi.waitFor(() => {
+      expect(readDebugRecords(dir, "sess-v2-overflow").filter((r) => r.type === "response")).toHaveLength(1);
+    });
+    const record = readDebugRecords(dir, "sess-v2-overflow").find((r) => r.type === "response");
+    expect(record?.protocol).toBe("v2");
+    expect(record?.status).toBe(200);
+    // Exactly the default cap, and flagged: the accumulator bounds MEMORY as
+    // well as disk, so an 8 MB body never lands in `text` to be capped later.
+    expect(String(record?.sse)).toHaveLength(2_000_000);
+    expect(record?.truncated).toBe(true);
   });
 });
 
