@@ -360,7 +360,7 @@ describe("streamQoder", () => {
     expect(msg.stopReason).toBe("length");
   });
 
-  it("captures usage, responseId and responseModel from the finish chunk", async () => {
+  it("captures usage and responseId from the finish chunk, without echoing responseModel", async () => {
     const sse =
       sseEnvelope(chunk({ content: "OK", role: "assistant" })) +
       sseEnvelope(
@@ -392,7 +392,13 @@ describe("streamQoder", () => {
     const done = events.find((e) => e.type === "done");
     const msg = (done as { message: AssistantMessage }).message;
     expect(msg.responseId).toBe("chatcmpl-abc123");
-    expect(msg.responseModel).toBe("qmodel_latest");
+    // Inverted on purpose (qoder-warm-attribution FR-1, bc_binding: contract).
+    // The gateway echoes one constant for every requested model, so copying it
+    // made pi's warm stamp (`responseModel ?? model`) key warm rows by that
+    // constant while assistant rows keyed by the friendly id — the false
+    // "model switch" notice of BUG-0001. Absence, not an empty string: only
+    // `undefined` falls through `??` to `model`.
+    expect(msg.responseModel).toBeUndefined();
     expect(msg.usage.input).toBe(27);
     expect(msg.usage.output).toBe(7);
     expect(msg.usage.totalTokens).toBe(49);
@@ -1672,5 +1678,150 @@ describe("stamp tail on the legacy transport", () => {
     globalThis.fetch = mockFetch(SUCCESS_SSE);
     const plain = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
     expect(plain.map((event) => event.type)).toEqual(wrapped.map((event) => event.type));
+  });
+});
+
+/**
+ * qoder-warm-attribution (CU-01, T-01/T-02/T-07) — one ledger namespace.
+ *
+ * The gateway echoes a single constant for every requested model, so the pair pi
+ * resolves on a warm row (`responseModel ?? model`, cache-warmer.js:249) and the
+ * pair `/session` buckets by (usage-totals.js:47) must both land on the friendly
+ * catalog id. T-01/T-02 pin that on the legacy transport; T-07 pins the same
+ * namespace on v2, whose wire dispatch uses an upstream key instead.
+ */
+describe("qoder-warm-attribution: one ledger namespace", () => {
+  // boundary: `onPayload` hands back the adapter's own outbound body as
+  // `unknown`; narrow with a record predicate before reading a field (BND-1),
+  // the idiom debug-sink.ts and four production modules already use. No shared
+  // export exists to reuse — every copy in this repo is file-local.
+  function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+  }
+
+  /** The exact expression both host consumers resolve a persisted row's key with. */
+  const persistedModelKey = (message: AssistantMessage): string => message.responseModel ?? message.model;
+
+  /**
+   * invented: a legacy turn in this file's recorded envelope shape, echoing
+   * `model` on every chunk (the gateway's real behavior — a constant, not the
+   * requested model) and pricing the row on the finish chunk.
+   */
+  function legacyEchoSse(echoedModel = "auto"): string {
+    const usage = {
+      prompt_tokens: 42,
+      completion_tokens: 7,
+      total_tokens: 49,
+      prompt_tokens_details: { cached_tokens: 5, cache_write_tokens: 10 },
+    };
+    return (
+      sseEnvelope(chunk({ content: "OK", role: "assistant" }, { model: echoedModel })) +
+      sseEnvelope(finishChunk("stop", { model: echoedModel, usage })) +
+      DONE_SSE
+    );
+  }
+
+  const doneMessage = (events: AssistantMessageEvent[]): AssistantMessage => {
+    const done = events.find((event) => event.type === "done");
+    if (!done) throw new Error(`expected a done event, saw: ${events.map((event) => event.type).join(",")}`);
+    return (done as { message: AssistantMessage }).message;
+  };
+
+  it("T-01/AC-01 leaves responseModel absent on a legacy turn whose chunks echo a model", async () => {
+    globalThis.fetch = mockFetch(legacyEchoSse());
+    const events = await consume(streamQoder(makeModel("qoder", "Lite"), makeContext(), { apiKey: "fake" }));
+
+    const message = doneMessage(events);
+    // Absent, not "": pi's stamp is `responseModel ?? model`, and only undefined
+    // falls through to the friendly id the legacy closure set at construction.
+    expect(message.responseModel).toBeUndefined();
+    // The neighbouring captures in the same chunk handler are untouched (AC-05).
+    expect(message.responseId).toBe("test-id");
+    expect(message.usage.input).toBe(27); // 42 prompt − 5 cached − 10 cache_write
+    expect(message.usage.output).toBe(7);
+    expect(message.usage.totalTokens).toBe(49);
+    expect(message.usage.cacheRead).toBe(5);
+    expect(message.usage.cacheWrite).toBe(10);
+  });
+
+  it("T-02/AC-03,AC-04 keys the legacy terminal by the requested friendly id, not the echoed value", async () => {
+    globalThis.fetch = mockFetch(legacyEchoSse("qmodel_latest"));
+    const events = await consume(streamQoder(makeModel("qoder", "Qwen3.7-Max"), makeContext(), { apiKey: "fake" }));
+
+    const message = doneMessage(events);
+    expect(message.model).toBe("Qwen3.7-Max");
+    expect(message.responseModel).toBeUndefined();
+    // The pair pi resolves. A warm row stamped from this message and the
+    // assistant rows around it share one key, so pi's miss detector
+    // (cache-stats.js:39 against the warm row's :71) cannot report a model
+    // switch for a same-model miss.
+    expect(persistedModelKey(message)).toBe("Qwen3.7-Max");
+  });
+
+  it("T-07/AC-01,AC-02,AC-04 lands one requested model in the same namespace on both transports", async () => {
+    const requested = staticModels.find((model) => model.id === "DeepSeek-V4-Flash");
+    if (!requested) throw new Error("fixture model missing from static seed: DeepSeek-V4-Flash");
+    const model = requested as Model<Api>;
+    const upstreamKey = "dfmodel";
+
+    // Legacy: the gateway echoes its constant against a friendly-id request.
+    globalThis.fetch = mockFetch(legacyEchoSse());
+    const legacyMessage = doneMessage(
+      await consume(streamQoder(model, makeContext(), { apiKey: "fake", sessionId: "session-ns" })),
+    );
+
+    // v2: an OpenAI-shaped stream echoing the upstream key it dispatched under,
+    // so pi-ai's own guard (`chunk.model !== model.id`,
+    // openai-completions.js:360-362) is what suppresses responseModel. The
+    // outbound body is read through `onPayload`, which receives the built object
+    // directly — no second parse of the same payload.
+    const v2Bodies: unknown[] = [];
+    const v2Urls: string[] = [];
+    // invented: OpenAI-shaped chunk trio in the recorded v2 fixture's shape,
+    // echoing the upstream key rather than a friendly id.
+    const v2Sse = [
+      `data: ${JSON.stringify({ id: "x", model: upstreamKey, choices: [{ delta: { content: "OK" }, index: 0 }] })}`,
+      `data: ${JSON.stringify({
+        id: "x",
+        model: upstreamKey,
+        choices: [{ delta: {}, finish_reason: "stop", index: 0 }],
+        usage: { prompt_tokens: 42, completion_tokens: 7, total_tokens: 49 },
+      })}`,
+      "data: [DONE]",
+    ].join("\n\n");
+    const v2Fetch = vi.fn(async (input: unknown) => {
+      v2Urls.push(String(input));
+      return new Response(v2Sse, { headers: { "content-type": "text/event-stream" } });
+    }) as unknown as typeof globalThis.fetch;
+    const v2Message = doneMessage(
+      await consume(
+        streamQoderV2(
+          model,
+          makeContext(),
+          {
+            apiKey: "fake",
+            fetch: v2Fetch,
+            sessionId: "session-ns",
+            onPayload: (payload: unknown) => {
+              v2Bodies.push(payload);
+              return undefined;
+            },
+          } as SimpleStreamOptions,
+          { mode: "global", modelConfig: { key: upstreamKey }, upstreamKey },
+        ),
+      ),
+    );
+
+    // One model, one namespace: both transports persist the friendly id and
+    // neither leaves a competing responseModel for `??` to prefer.
+    expect(persistedModelKey(legacyMessage)).toBe("DeepSeek-V4-Flash");
+    expect(persistedModelKey(v2Message)).toBe("DeepSeek-V4-Flash");
+    expect(legacyMessage.model).toBe(v2Message.model);
+    expect(v2Message.responseModel).toBeUndefined();
+    // Normalization is a terminal concern only: the v2 wire still dispatches
+    // under the upstream key pi-ai was given.
+    expect(v2Urls[0]).toContain("chat/completions");
+    const dispatchedBody = v2Bodies[0];
+    expect(isRecord(dispatchedBody) ? dispatchedBody.model : undefined).toBe(upstreamKey);
   });
 });

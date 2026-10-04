@@ -857,3 +857,99 @@ describe("the host seam keeps the registered entry synchronous (T-05)", () => {
     expect(result.errorMessage).toContain("openAICompletionsApi");
   });
 });
+
+/**
+ * qoder-warm-attribution (CU-03, T-05/T-06) — a v2 turn's persisted row keys by
+ * the friendly catalog id even though the wire dispatches under the upstream key.
+ */
+describe("v2 terminal-model normalization (qoder-warm-attribution T-05/T-06)", () => {
+  const upstreamKey = "dfmodel";
+  const friendlyId = "DeepSeek-V4-Flash";
+
+  // boundary: the captured request body is JSON text — parse to unknown and
+  // narrow with a record predicate before any field read (BND-1), matching
+  // debug-sink.ts's idiom.
+  function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+  }
+
+  /**
+   * invented: an OpenAI-shaped chunk trio mirroring this file's `v2Success`
+   * fixture; only the echoed `model` varies, because that echo is exactly what
+   * pi-ai's `chunk.model !== model.id` guard (openai-completions.js:360-362)
+   * decides on. Kept separate from `v2UsageSuccess`/`usageFetch` rather than
+   * folded in: those parameterize the usage object and hardcode the echoed
+   * model, while these rows parameterize the echo and hold usage constant —
+   * merging them would give one helper two independent axes (REU-2).
+   */
+  function v2EchoSse(echoedModel: string): string {
+    return [
+      `data: ${JSON.stringify({ id: "x", model: echoedModel, choices: [{ delta: { content: "OK" }, index: 0 }] })}`,
+      `data: ${JSON.stringify({
+        id: "x",
+        model: echoedModel,
+        choices: [{ delta: {}, finish_reason: "stop", index: 0 }],
+        usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 },
+      })}`,
+      "data: [DONE]",
+    ].join("\n\n");
+  }
+
+  function echoFetch(echoedModel: string) {
+    const calls: { url: string; body: Record<string, unknown> }[] = [];
+    const fetch = vi.fn(async (input: unknown, init?: RequestInit) => {
+      const parsed: unknown = JSON.parse(String(init?.body));
+      if (!isRecord(parsed)) throw new Error("expected an object request body");
+      calls.push({ url: String(input), body: parsed });
+      return new Response(v2EchoSse(echoedModel), { headers: { "content-type": "text/event-stream" } });
+    }) as unknown as typeof globalThis.fetch;
+    return { calls, fetch };
+  }
+
+  it("T-05/AC-02,AC-04 persists under the friendly id while the wire still dispatches the upstream key", async () => {
+    const { calls, fetch } = echoFetch(upstreamKey);
+    const events: AssistantMessageEvent[] = [];
+    for await (const event of streamQoderV2(
+      modelNamed(friendlyId),
+      context,
+      { apiKey: "fake", fetch },
+      {
+        mode: "global",
+        modelConfig: { key: upstreamKey },
+        upstreamKey,
+      },
+    )) {
+      events.push(event);
+    }
+
+    const done = events.find((event) => event.type === "done") as Extract<AssistantMessageEvent, { type: "done" }>;
+    // The echo equals the id pi-ai sent, so its own guard suppressed
+    // responseModel: the normalized `model` is the whole persisted key.
+    expect(done.message.responseModel).toBeUndefined();
+    expect(done.message.model).toBe(friendlyId);
+    expect(done.message.responseModel ?? done.message.model).toBe(friendlyId);
+    // Normalization is a terminal concern: the dispatch is untouched.
+    expect(calls[0].url).toContain("chat/completions");
+    expect(calls[0].body.model).toBe(upstreamKey);
+  });
+
+  it("T-06/AC-06 leaves a genuine mismatch echo observable in responseModel", async () => {
+    const { fetch } = echoFetch("gm51model");
+    const result = await streamQoderV2(
+      modelNamed(friendlyId),
+      context,
+      { apiKey: "fake", fetch },
+      {
+        mode: "global",
+        modelConfig: { key: upstreamKey },
+        upstreamKey,
+      },
+    ).result();
+
+    // OB-8's unobserved branch stays diagnosable rather than being erased by
+    // normalization: `model` is rewritten, `responseModel` is not.
+    expect(result.responseModel).toBe("gm51model");
+    expect(result.model).toBe(friendlyId);
+    expect(result.stopReason).toBe("stop");
+  });
+});
