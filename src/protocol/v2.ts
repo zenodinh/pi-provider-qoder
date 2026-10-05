@@ -7,6 +7,8 @@ import {
   type AssistantMessageEventStream,
   clampThinkingLevel,
   createAssistantMessageEventStream,
+  getCurrentSystemMessage,
+  getSystemMessageText,
   type Model,
   type SimpleStreamOptions,
   type ThinkingLevel,
@@ -15,16 +17,18 @@ import {
 } from "@earendil-works/pi-ai";
 import type { QoderModelEntry } from "../catalog.js";
 import { debugLog } from "../debug.js";
-import { createDebugFetch } from "../debug-log.js";
+import { createDebugFetch, type DebugFetchMeta } from "../debug-log.js";
 import { openAICompletionsApi } from "../host-seam.js";
 import { type RateSource, rateForUpstreamKey } from "../pricing.js";
 import type { QoderMode } from "../region.js";
+import { resolveContextLength } from "./context-length.js";
 import { PROCESS_FALLBACK_SESSION_ID, planQoderTurn, type TurnPlan, type TurnPlanSeed } from "./plan.js";
+import { extendPrefixChain, prefixStampFields } from "./prefix-chain.js";
 import { markLegacyOnly } from "./routing.js";
 import { classifyTurnKind, type QoderRunMessage, resolveRunIdentity } from "./run-identity.js";
 import { clampPromptCacheKey } from "./session-key.js";
 import { createReframedFetch } from "./sse-reframe.js";
-import { withTerminalStamp } from "./stamp.js";
+import { type TerminalStamp, withTerminalStamp } from "./stamp.js";
 import { streamQoder } from "./stream.js";
 import { contentToText } from "./transform.js";
 
@@ -87,30 +91,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * Effective `context_length` for one request. The model's window as pi resolved
- * it — `models.json` `provider.modelOverrides.<modelId>.contextWindow` included —
- * wins when it matches one of the catalog's available windows; otherwise the
- * catalog's `is_default` tier (Qoder's own default). No largest-tier fallback:
- * an unmatched window omits the field and the server default governs (owner
- * direction 2026-09-29 — a hidden max can spend more than the user intended).
- * Mirrors qodercli's window validation (its `$6`/`Gf` helpers, decoded
- * 2026-09-29: an invalid selection falls back to the default window).
- */
-function resolveContextLength(
-  contextConfig: QoderModelEntry["context_config"],
-  requested: number | undefined,
-): number | undefined {
-  if (requested === undefined) return undefined;
-  const tiers = Object.values(contextConfig ?? {});
-  const windows = tiers
-    .map((tier) => tier?.token_count)
-    .filter((count): count is number => typeof count === "number" && Number.isFinite(count));
-  if (windows.length === 0 || windows.includes(requested)) return requested;
-  const fallback = tiers.find((tier) => tier?.is_default)?.token_count;
-  return typeof fallback === "number" && Number.isFinite(fallback) ? fallback : undefined;
-}
-
-/**
  * The Qoder field injector. Runs inside pi-ai's onPayload (which replaces the
  * body with a non-undefined return), then CHAINS pi's own hook — replacing it
  * without calling it would silence before_provider_request for every other
@@ -134,7 +114,9 @@ function injectQoderFields(
   // One producer for the session value: the plan's v2 wire form when the gate
   // is on, the same expression inline when it is off (identical by construction).
   const sessionId = plan?.wireSession.v2.envelopeAndHeaders ?? options?.sessionId ?? PROCESS_FALLBACK_SESSION_ID;
-  const tier = resolveContextLength(route.modelConfig.context_config, model.contextWindow);
+  // Same posture for the context tier: the plan's value when the gate is on,
+  // the same shared resolver inline when it is off (identical by construction).
+  const tier = plan?.contextLength ?? resolveContextLength(route.modelConfig.context_config, model.contextWindow);
   const { requestSetId } = resolveRunIdentity({
     mode: route.mode,
     upstreamKey: route.upstreamKey,
@@ -229,12 +211,27 @@ function errorStream(model: Model<Api>, message: string): AssistantMessageEventS
 }
 
 /**
- * Pass-through tail that stamps `rateSource` on a priced terminal message
+ * Pass-through tail that stamps `rateSource` on a priced terminal message and
+ * normalizes the terminal's `model` to the friendly catalog id `modelId`,
  * without touching pi-ai's computed cost; the shared wrapper supplies the
  * ordered terminal-before-end guarantee.
+ *
+ * `stamp` is the caller's own object and is populated rather than replaced or
+ * spread into a fresh literal. That identity is load-bearing: this tail is wrapped
+ * synchronously while the payload hook that attaches the prefix rider is async,
+ * so a copy taken here would be snapshotted before the hook ran and the rider
+ * would be silently dropped. `modelId` is written before the tail invokes
+ * `onTerminal`, so a rider observes the normalized model.
  */
-function withRateSourceStamp(inner: AssistantMessageEventStream, rateSource: RateSource): AssistantMessageEventStream {
-  return withTerminalStamp(inner, { rateSource });
+function withRateSourceStamp(
+  inner: AssistantMessageEventStream,
+  rateSource: RateSource,
+  modelId: string,
+  stamp: TerminalStamp,
+): AssistantMessageEventStream {
+  stamp.rateSource = rateSource;
+  stamp.modelId = modelId;
+  return withTerminalStamp(inner, stamp);
 }
 
 /**
@@ -274,6 +271,13 @@ export function streamQoderV2(
   };
 
   const callerOnPayload = options?.onPayload;
+  // Created before the tail is wrapped below and populated inside the async payload
+  // hook, because the hook is the one place v2 holds the transcript view beside the
+  // assembled body while the tail is wrapped synchronously. A turn that never
+  // reaches the hook — a pre-dispatch allowlist or credential rejection — leaves it
+  // unpopulated, so its terminal carries none of the six fields rather than a
+  // partial set.
+  const terminalStamp: TerminalStamp = {};
   const wrappedOnPayload = async (payload: unknown, selected: Model<Api>): Promise<unknown> => {
     const body = isRecord(payload) ? payload : {};
     // The raw transcript view, matching the legacy transport's input. Both
@@ -282,6 +286,59 @@ export function streamQoderV2(
     // One plan per v2 dispatch: no identity lookup happens on this protocol.
     const plan = route.plan ? await planQoderTurn(model, context, options, route.plan) : undefined;
     injectQoderFields(body, route, v2Model, options, messages, plan);
+
+    // Per-turn prefix identity, riding the tail's reserved onTerminal hook. pi-ai
+    // invokes this hook before any chunk, so before any terminal the tail stamps,
+    // and the hook is exception-isolated by the tail — a throwing rider can neither
+    // drop a terminal nor leave the host awaiting forever.
+    //
+    // The chain reads the same raw view and the same two transcript helpers legacy
+    // reads, so prefixLen/prefixHash/prefixStable/prefixDivergedAt are
+    // transport-independent for one transcript. paramsHash and payloadHash are not
+    // comparable across transports: each digests its own transport's logical prompt
+    // view, and both are resolved before the caller's hook below can replace the
+    // body. FR-6 cross-checks payloadHash same-transport only.
+    const currentSystem = getCurrentSystemMessage(context.messages);
+    const systemText = currentSystem ? getSystemMessageText(currentSystem) : "";
+    const tools = currentSystem?.toolsAdded ?? [];
+    // The sampling view, built from the option fields pi-ai merges into the body
+    // rather than read back off it: pi-ai owns the body's key set, so reading
+    // sampling keys out of it would couple a persisted ledger digest to an upstream
+    // key change. `max_tokens` is the warm replay's one-token cap, which
+    // prefix-chain.ts excludes from the digest so a warm row never reads as class 3.
+    const sampling = {
+      max_tokens: options?.maxTokens,
+      temperature: options?.temperature,
+      enable_thinking: body.enable_thinking,
+      ...model.samplingParams,
+      ...options?.samplingParams,
+    };
+    const prefixChain = extendPrefixChain({
+      // The pi session id, the ledger's own join key and the same key legacy uses —
+      // which is what keeps the self-heal below from reading as a divergence when it
+      // re-dispatches one transcript over the other wire.
+      sessionKey: options?.sessionId ?? PROCESS_FALLBACK_SESSION_ID,
+      systemText,
+      tools,
+      messages,
+    });
+    // The payload view carries prompt-determining content ONLY. `body` itself is
+    // deliberately not the view: injectQoderFields puts a fresh
+    // `metadata.context.request_id` and a run-rotating `request_set_id` on it, so
+    // digesting the body would move payloadHash on every single dispatch and leave
+    // the field written, hashed and meaningless.
+    const prefixStamp = prefixStampFields(prefixChain, sampling, {
+      systemText,
+      messages,
+      tools,
+      parameters: sampling,
+    });
+    if (prefixStamp !== undefined) {
+      terminalStamp.onTerminal = (message: AssistantMessage): void => {
+        Object.assign(message.usage, prefixStamp);
+      };
+    }
+
     if (callerOnPayload) {
       const next = await callerOnPayload(body, selected);
       return next !== undefined ? next : body;
@@ -291,21 +348,24 @@ export function streamQoderV2(
 
   // The gateway intermittently splits event JSON across lines (recorded
   // 2026-09-28); repair the framing before the SDK's strict SSE parser sees it.
-  // Debug capture wraps the base fetch INSIDE the reframe wrapper: the capture
-  // tees raw server bytes, and reframe still repairs the framing downstream.
+  // Debug capture wraps the base fetch INSIDE the reframe wrapper: capture keeps
+  // the request record and neither tees nor re-wraps a body, while reframe owns
+  // the response record off its own consumer-side transform. So the framing is
+  // still repaired downstream and the SDK reads a body nothing observed perturbed.
   const syncSession = options?.sessionId ?? PROCESS_FALLBACK_SESSION_ID;
+  const debugMeta: DebugFetchMeta = {
+    protocol: "v2",
+    session: options?.sessionId,
+    model: model.id,
+    upstreamKey: route.upstreamKey,
+    // The value that actually went on the wire: metadata.context.session_id.
+    wireSessionId: route.plan?.wireSessionV2.envelopeAndHeaders ?? syncSession,
+  };
   const inner = openAICompletionsApi().streamSimple(v2Model, context, {
     ...options,
-    fetch: createReframedFetch(
-      createDebugFetch(options?.fetch ?? globalThis.fetch, {
-        protocol: "v2",
-        session: options?.sessionId,
-        model: model.id,
-        upstreamKey: route.upstreamKey,
-        // The value that actually went on the wire: metadata.context.session_id.
-        wireSessionId: route.plan?.wireSessionV2.envelopeAndHeaders ?? syncSession,
-      }),
-    ),
+    // One meta, two capture halves: createDebugFetch keeps the request record,
+    // createReframedFetch keeps the response record off the consumer-side read.
+    fetch: createReframedFetch(createDebugFetch(options?.fetch ?? globalThis.fetch, debugMeta), debugMeta),
     onPayload: wrappedOnPayload,
   });
 
@@ -315,8 +375,10 @@ export function streamQoderV2(
   // own events, whose cost stream.ts already stamped at its assembly site.
   const rateSource: RateSource = rateForUpstreamKey(route.upstreamKey) ? "rate-table" : "fallback";
   // The v2 side gains the shared ordered tail here; the self-heal below only
-  // decides whether the first event hands the turn to legacy.
-  const stamped = withRateSourceStamp(inner, rateSource);
+  // decides whether the first event hands the turn to legacy. `model.id` is the
+  // friendly catalog id: pi-ai dispatched under `route.upstreamKey`, so without
+  // normalizing it back the persisted row would key by the wire key.
+  const stamped = withRateSourceStamp(inner, rateSource, model.id, terminalStamp);
   if (!fallbackEnabled) return stamped;
 
   // Self-heal (opt-in): on a pre-start 400 invalid_model_error, the routing

@@ -16,14 +16,25 @@ import {
 import { type QoderIdentity, resolveQoderIdentity } from "../auth/oauth.js";
 import { getCachedModelConfig, MAX_OUTPUT_TOKENS } from "../catalog.js";
 import { buildAuthHeaders, getMachineId } from "../cosy.js";
-import { capText, createDebugFetch, debugEnabled, redactHeadersForDebug, writeDebugRecord } from "../debug-log.js";
+import {
+  capText,
+  createDebugFetch,
+  createResponseCapture,
+  type DebugFetchMeta,
+  debugEnabled,
+  type ResponseCapture,
+  redactHeadersForDebug,
+  writeDebugRecord,
+} from "../debug-log.js";
 import { readResponseText, withAbort } from "../http.js";
 import { priceTurnCost, type RateSource, rateForUpstreamKey } from "../pricing.js";
 import { getQoderChatURL, getQoderRegionConfig } from "../region.js";
 import { yieldToEventLoop } from "../yield.js";
+import { resolveContextLength } from "./context-length.js";
 import { type DsmlParserEvent, DsmlToolCallParser } from "./dsml.js";
 import { qoderEncodeBodyAsync } from "./encoding.js";
 import { PROCESS_FALLBACK_SESSION_ID, planQoderTurn, qoderModeFor, type TurnPlanSeed } from "./plan.js";
+import { extendPrefixChain, prefixStampFields } from "./prefix-chain.js";
 import { mergeQoderHeaders } from "./request.js";
 import { PROTOCOL } from "./routing.js";
 import { classifyTurnKind, resolveRunIdentity } from "./run-identity.js";
@@ -33,6 +44,7 @@ import { stripThinkingTags, ThinkingTagParser } from "./thinking.js";
 import { ToolCallAccumulator } from "./tool-calls.js";
 import { contentToText, transformMessagesForQoder, transformTools } from "./transform.js";
 import { parseQoderCreditsUsage, type QoderCreditsUsage } from "./usage.js";
+import { affinityPlacements, carrierValue, QODER_WIRE_COMPAT } from "./wire-compat.js";
 
 type QoderAssistantUsage = AssistantMessage["usage"] & QoderCreditsUsage & { rateSource?: RateSource };
 
@@ -158,6 +170,9 @@ export function streamQoder(
 
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   let response: Response | undefined;
+  // Declared beside the reader because the response record is written from the
+  // teardown block below, which must see it on the done, catch and abort paths.
+  let capture: ResponseCapture | undefined;
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
   const requestController = new AbortController();
   const requestTimer =
@@ -331,6 +346,49 @@ export function streamQoder(
         parameters.enable_thinking = false;
       }
 
+      // Per-turn prefix identity, stamped once per dispatch onto the assembled
+      // `output` message. This is the assembly site rather than the usage-chunk
+      // handler below because that handler sits inside `if (inner.usage)`: an HTTP
+      // failure, a malformed-SSE throw, an idle timeout or an external abort all
+      // reach the error terminal without any usage chunk, so stamping there would
+      // leave legacy's error and aborted rows carrying none of the six fields
+      // while v2's tail hook stamps them — identical turns diverging across
+      // protocols, which is the defect SA §7.8's v0.4 correction (OD-E) re-placed
+      // this write to fix. Here it precedes every downstream throw site, so every
+      // terminal that pushes `output` — the done event and the error event alike —
+      // carries it.
+      //
+      // The chain reads the RAW transcript view, the same one v2's payload hook
+      // reads, so `prefixHash` is transport-independent for one transcript.
+      // `payloadHash` and `paramsHash` are NOT comparable across transports: this
+      // view is legacy's own logical prompt, resolved before the request body and
+      // before the caller's `onPayload` hook can reject, where v2 digests its own
+      // prompt view assembled inside that hook. Neither is the wire body, and
+      // neither reflects a host hook's rewrite. The view carries prompt-determining
+      // content only: one per-dispatch value in it (a request id, a timestamp, a
+      // session id) would move the digest every turn, make `prefixStable`
+      // unreachable, and leave the field written, hashed and meaningless.
+      const prefixChain = extendPrefixChain({
+        // The pi session id is the ledger's own join key, so the memo groups chains
+        // the way the census groups rows. Both transports use it, which is what
+        // keeps the v2-to-legacy self-heal from reading as a divergence: the same
+        // transcript re-dispatched over the other wire extends the same chain.
+        sessionKey: options?.sessionId ?? PROCESS_FALLBACK_SESSION_ID,
+        systemText,
+        tools: currentTools,
+        messages: transcriptMessages,
+      });
+      const prefixStamp = prefixStampFields(prefixChain, parameters, {
+        systemText,
+        messages: normalizedMessages,
+        tools: toolsRaw ?? [],
+        parameters,
+      });
+      // Absent (undefined) exactly when the chain is cold, so a first turn writes
+      // none of the six keys and the ledger's class 0 stays an honest "no stamp"
+      // rather than a coerced verdict.
+      if (prefixStamp !== undefined) Object.assign(output.usage, prefixStamp);
+
       // Qoder groups billing/records per agentic "run". qodercli keeps one
       // request_set_id + business.id per run (created at run start, threaded
       // through every tool round/retry/subagent); this plugin used to re-derive
@@ -358,6 +416,10 @@ export function streamQoder(
         request_set_id: requestSetId,
         chat_record_id: requestID,
         session_id: sessionID,
+        // v2/qodercli carry the session identity twice (source_session_id in
+        // metadata.context equals session_id); a receiver keys on field
+        // presence, so legacy sends the same pair instead of omitting one.
+        source_session_id: sessionID,
         stream: true,
         chat_task: "FREE_INPUT",
         is_reply: true,
@@ -407,6 +469,48 @@ export function streamQoder(
       if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
         throw new Error("Qoder onPayload must return a JSON object or undefined");
       }
+      // Legacy cache affinity (SA §3.1 FR-7 / fs-qoder-legacy-affinity): the
+      // placement set comes from the plan's affinity tier when the router
+      // produced one and from the frozen table otherwise — the same data, so
+      // a probe verdict promoting a carrier is a one-string table edit that
+      // reaches both paths with no adapter change. QODER_LEGACY_AFFINITY=off
+      // (§6.3) empties the set at request time: one environment change stops
+      // every legacy affinity field on the next dispatch of a running process.
+      const affinityKillSwitch = options?.env?.QODER_LEGACY_AFFINITY ?? process.env.QODER_LEGACY_AFFINITY;
+      const legacyAffinity =
+        affinityKillSwitch === "off" ? [] : (plan?.affinity.placements.legacy ?? affinityPlacements("legacy"));
+      // v2 gates the body key and the header trio on cacheRetention separately
+      // (openai-completions.js:542 and :576-579); legacy mirrors both gates so
+      // a retention-none turn leaves neither half of the surface on the wire.
+      const affinityRetentionNone = options?.cacheRetention === "none";
+      if (!affinityRetentionNone && legacyAffinity.includes("prompt_cache_key")) {
+        // Written onto the resolved payload, never reqBody: a host hook that
+        // returns a replacement object discards fields written to the original.
+        (payload as Record<string, unknown>).prompt_cache_key = sessionID;
+      }
+      // Legacy context tier (SA §3.3 OB-10 / fs-qoder-legacy-context-length):
+      // the plan owns the resolution and the adapter resolves nothing itself —
+      // the gate-off arm calls the same shared resolver over the same catalog
+      // entry, so the tier is identical with QODER_CORE_PLAN on or off. The
+      // policy row is data: legacy emits while `legacy:top-level-number` sits
+      // in the live row, and moving the string into the gated row stops
+      // emission with no adapter edit. QODER_LEGACY_CONTEXT_LENGTH=off (§6.3)
+      // suppresses the member at request time, the same rollback posture as
+      // the affinity switch above.
+      const contextLengthKillSwitch =
+        options?.env?.QODER_LEGACY_CONTEXT_LENGTH ?? process.env.QODER_LEGACY_CONTEXT_LENGTH;
+      const contextTier =
+        contextLengthKillSwitch === "off"
+          ? undefined
+          : (plan?.contextLength ?? resolveContextLength(modelConfig.context_config, model.contextWindow));
+      if (
+        carrierValue(QODER_WIRE_COMPAT.contextLengthEmission, "legacy") === "top-level-number" &&
+        contextTier !== undefined
+      ) {
+        // Written onto the resolved payload, never reqBody: a host hook that
+        // returns a replacement object discards fields written to the original.
+        (payload as Record<string, unknown>).context_length = contextTier;
+      }
       const bodyBytes = Buffer.from(JSON.stringify(payload));
       throwIfAborted();
       await yieldToEventLoop();
@@ -427,6 +531,15 @@ export function streamQoder(
 
       const outgoingConfig = (payload as { model_config?: { key?: string; source?: string } }).model_config;
       const modelSource = outgoingConfig?.source || modelConfig.source || "system";
+      // The unsigned affinity trio (SA §3.1 FR-7): COSY signs the encoded body
+      // bytes and never the headers, so these cannot invalidate a signature.
+      // All three carry the body's own session value — the gateway must see
+      // one identity, not two — and later merge sources (model, caller) still
+      // override them, per mergeQoderHeaders' source order.
+      const affinityHeaderEntries: Record<string, string> =
+        !affinityRetentionNone && legacyAffinity.includes("header-x-session-id")
+          ? { session_id: sessionID, "x-client-request-id": sessionID, "x-session-affinity": sessionID }
+          : {};
       // Resolve the (optional) idle-timeout override once per request instead of
       // re-reading process.env on every streamed chunk.
       const configuredIdleTimeout = Number(
@@ -452,6 +565,7 @@ export function streamQoder(
           "Accept-Encoding": "identity",
           "X-Model-Key": outgoingConfig?.key || qoderModel,
           "X-Model-Source": modelSource,
+          ...affinityHeaderEntries,
           ...headers,
         },
         model.headers,
@@ -459,8 +573,9 @@ export function streamQoder(
       );
       if (debugEnabled()) {
         // Logical payload before COSY encoding — the wire bytes are opaque
-        // base64, so the request record is written here, not in the fetch
-        // wrapper (which captures the raw response side instead). Records are
+        // base64, so the request record is written here rather than in the
+        // fetch wrapper (whose debug half is request-meta only; response
+        // capture rides the consumer-side read loop below). Records are
         // keyed by the PI session id (the ledger join key), with the hashed
         // wire session id carried as a field — legacy and v2 must land in the
         // same per-session file.
@@ -479,13 +594,14 @@ export function streamQoder(
           bodyTruncated: capped.truncated,
         });
       }
-      const debugFetch = createDebugFetch(options?.fetch ?? fetch, {
+      const debugMeta: DebugFetchMeta = {
         protocol: "legacy",
         session: options?.sessionId,
         model: model.id,
         upstreamKey: qoderModel,
         logRequest: false,
-      });
+      };
+      const debugFetch = createDebugFetch(options?.fetch ?? fetch, debugMeta);
 
       const fetchPromise = debugFetch(chatURL, {
         method: "POST",
@@ -520,6 +636,16 @@ export function streamQoder(
 
       if (!response.ok) {
         const errText = await readResponseText(response, requestController.signal);
+        // readResponseText is this path's consumer-side read — the loop below never
+        // runs — so an HTTP error body is recorded here or not at all. Gated on
+        // response.body to hold the one-record-per-response partition: a body-less
+        // response is already recorded by createDebugFetch, which is the module
+        // that owns that case on both protocols.
+        if (response.body) {
+          capture = createResponseCapture(debugMeta, chatURL, response.status);
+          capture?.push(errText);
+          capture?.finish();
+        }
         throw new Error(`Qoder API request failed: ${response.status} ${response.statusText}. Response: ${errText}`);
       }
 
@@ -527,6 +653,10 @@ export function streamQoder(
       if (!reader) throw new Error("No response body");
       const decoder = new TextDecoder();
       let buffer = "";
+      // Response capture rides this loop: the decoder below already traverses
+      // every byte in order to parse it, so observing here adds no wrapper,
+      // cannot reorder events, and records exactly what the transport processed.
+      capture = createResponseCapture(debugMeta, chatURL, response.status);
 
       let thinkingBlockIndex = -1;
       const toolCalls = new ToolCallAccumulator(output, pushEvent);
@@ -617,7 +747,9 @@ export function streamQoder(
         throwIfAborted();
         if (!done) resetIdleTimer();
 
-        buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+        const decoded = done ? decoder.decode() : decoder.decode(value, { stream: true });
+        capture?.push(decoded);
+        buffer += decoded;
         if (buffer.length > MAX_SSE_BUFFER_LENGTH && !buffer.includes("\n")) {
           throw new Error(`Qoder SSE buffer exceeded ${MAX_SSE_BUFFER_LENGTH} characters without a complete line`);
         }
@@ -676,7 +808,10 @@ export function streamQoder(
               throw new Error(`Qoder upstream error: ${typeof error === "string" ? error : JSON.stringify(error)}`);
             }
             if (inner.id) output.responseId = inner.id as string;
-            if (inner.model) output.responseModel = inner.model as string;
+            // No `responseModel` copy here: the gateway's `model` echo is one
+            // constant for every requested model, so copying it would key every
+            // row by that constant instead of the request (pi resolves
+            // `responseModel ?? model`); `output.model` is already the friendly id.
             if (inner.usage) {
               const u = inner.usage as {
                 prompt_tokens?: number;
@@ -831,6 +966,11 @@ export function streamQoder(
       if (requestTimer) clearTimeout(requestTimer);
       if (idleTimer) clearTimeout(idleTimer);
       removeExternalAbortListener?.();
+      // One response record per turn, holding the prefix actually processed: the
+      // done path, the catch path and an external abort all land here, and
+      // finish() is idempotent, so this is the single write site. An aborted turn
+      // therefore records what it saw instead of draining the body it cancelled.
+      capture?.finish();
       if (reader) void reader.cancel().catch(() => {});
       else if (response) void response.body?.cancel().catch(() => {});
     }

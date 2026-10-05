@@ -10,8 +10,9 @@ import type {
   TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { normalizeContext } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { staticModels } from "../catalog.js";
+import { clearPrefixChainRegistry } from "../protocol/prefix-chain.js";
 import { clearQoderRunRegistry } from "../protocol/run-identity.js";
 import { streamQoder } from "../protocol/stream.js";
 import { streamQoderV2 } from "../protocol/v2.js";
@@ -129,7 +130,19 @@ type StoredUsage = AssistantMessage["usage"] & {
   original_credits?: number;
   billable?: boolean;
   rateSource?: "credits" | "rate-table" | "fallback";
+  prefixLen?: number;
+  prefixHash?: string;
+  prefixStable?: boolean;
+  prefixDivergedAt?: number;
+  paramsHash?: string;
+  payloadHash?: string;
 };
+
+/**
+ * The five prefix keys every stamped turn carries. `prefixDivergedAt` is the sixth
+ * and rides only an unstable prefix, so the cold-stamp rows append it explicitly.
+ */
+const PREFIX_FIELDS = ["prefixLen", "prefixHash", "prefixStable", "paramsHash", "payloadHash"] as const;
 
 describe("streamQoder", () => {
   const originalFetch = globalThis.fetch;
@@ -360,7 +373,7 @@ describe("streamQoder", () => {
     expect(msg.stopReason).toBe("length");
   });
 
-  it("captures usage, responseId and responseModel from the finish chunk", async () => {
+  it("captures usage and responseId from the finish chunk, without echoing responseModel", async () => {
     const sse =
       sseEnvelope(chunk({ content: "OK", role: "assistant" })) +
       sseEnvelope(
@@ -392,7 +405,13 @@ describe("streamQoder", () => {
     const done = events.find((e) => e.type === "done");
     const msg = (done as { message: AssistantMessage }).message;
     expect(msg.responseId).toBe("chatcmpl-abc123");
-    expect(msg.responseModel).toBe("qmodel_latest");
+    // Inverted on purpose (qoder-warm-attribution FR-1, bc_binding: contract).
+    // The gateway echoes one constant for every requested model, so copying it
+    // made pi's warm stamp (`responseModel ?? model`) key warm rows by that
+    // constant while assistant rows keyed by the friendly id — the false
+    // "model switch" notice of BUG-0001. Absence, not an empty string: only
+    // `undefined` falls through `??` to `model`.
+    expect(msg.responseModel).toBeUndefined();
     expect(msg.usage.input).toBe(27);
     expect(msg.usage.output).toBe(7);
     expect(msg.usage.totalTokens).toBe(49);
@@ -1417,10 +1436,12 @@ describe("plan seam on the legacy transport", () => {
     mode: "global",
     upstreamKey: "dfmodel",
     rejectedSamplingKeys: [],
+    contextConfig: undefined,
     piSessionId: "session-plan",
     wireSessionV2: { promptCacheKey: "session-plan", envelopeAndHeaders: "session-plan" },
     turnKind: "real",
     capture: { protocol: "legacy", model: "Lite", session: "session-plan" },
+    contextLength: undefined,
   } as const;
 
   /** The ids the run registry rotates per dispatch (OD-5) — not the wire contract under test. */
@@ -1672,5 +1693,404 @@ describe("stamp tail on the legacy transport", () => {
     globalThis.fetch = mockFetch(SUCCESS_SSE);
     const plain = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
     expect(plain.map((event) => event.type)).toEqual(wrapped.map((event) => event.type));
+  });
+});
+
+/**
+ * qoder-warm-attribution (CU-01, T-01/T-02/T-07) — one ledger namespace.
+ *
+ * The gateway echoes a single constant for every requested model, so the pair pi
+ * resolves on a warm row (`responseModel ?? model`, cache-warmer.js:249) and the
+ * pair `/session` buckets by (usage-totals.js:47) must both land on the friendly
+ * catalog id. T-01/T-02 pin that on the legacy transport; T-07 pins the same
+ * namespace on v2, whose wire dispatch uses an upstream key instead.
+ */
+describe("qoder-warm-attribution: one ledger namespace", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  // boundary: `onPayload` hands back the adapter's own outbound body as
+  // `unknown`; narrow with a record predicate before reading a field (BND-1),
+  // the idiom debug-sink.ts and four production modules already use. No shared
+  // export exists to reuse — every copy in this repo is file-local.
+  function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+  }
+
+  /** The exact expression both host consumers resolve a persisted row's key with. */
+  const persistedModelKey = (message: AssistantMessage): string => message.responseModel ?? message.model;
+
+  /**
+   * invented: a legacy turn in this file's recorded envelope shape, echoing
+   * `model` on every chunk (the gateway's real behavior — a constant, not the
+   * requested model) and pricing the row on the finish chunk.
+   */
+  function legacyEchoSse(echoedModel = "auto"): string {
+    const usage = {
+      prompt_tokens: 42,
+      completion_tokens: 7,
+      total_tokens: 49,
+      prompt_tokens_details: { cached_tokens: 5, cache_write_tokens: 10 },
+    };
+    return (
+      sseEnvelope(chunk({ content: "OK", role: "assistant" }, { model: echoedModel })) +
+      sseEnvelope(finishChunk("stop", { model: echoedModel, usage })) +
+      DONE_SSE
+    );
+  }
+
+  const doneMessage = (events: AssistantMessageEvent[]): AssistantMessage => {
+    const done = events.find((event) => event.type === "done");
+    if (!done) throw new Error(`expected a done event, saw: ${events.map((event) => event.type).join(",")}`);
+    return (done as { message: AssistantMessage }).message;
+  };
+
+  it("T-01/AC-01 leaves responseModel absent on a legacy turn whose chunks echo a model", async () => {
+    globalThis.fetch = mockFetch(legacyEchoSse());
+    const events = await consume(streamQoder(makeModel("qoder", "Lite"), makeContext(), { apiKey: "fake" }));
+
+    const message = doneMessage(events);
+    // Absent, not "": pi's stamp is `responseModel ?? model`, and only undefined
+    // falls through to the friendly id the legacy closure set at construction.
+    expect(message.responseModel).toBeUndefined();
+    // The neighbouring captures in the same chunk handler are untouched (AC-05).
+    expect(message.responseId).toBe("test-id");
+    expect(message.usage.input).toBe(27); // 42 prompt − 5 cached − 10 cache_write
+    expect(message.usage.output).toBe(7);
+    expect(message.usage.totalTokens).toBe(49);
+    expect(message.usage.cacheRead).toBe(5);
+    expect(message.usage.cacheWrite).toBe(10);
+  });
+
+  it("T-02/AC-03,AC-04 keys the legacy terminal by the requested friendly id, not the echoed value", async () => {
+    globalThis.fetch = mockFetch(legacyEchoSse("qmodel_latest"));
+    const events = await consume(streamQoder(makeModel("qoder", "Qwen3.7-Max"), makeContext(), { apiKey: "fake" }));
+
+    const message = doneMessage(events);
+    expect(message.model).toBe("Qwen3.7-Max");
+    expect(message.responseModel).toBeUndefined();
+    // The pair pi resolves. A warm row stamped from this message and the
+    // assistant rows around it share one key, so pi's miss detector
+    // (cache-stats.js:39 against the warm row's :71) cannot report a model
+    // switch for a same-model miss.
+    expect(persistedModelKey(message)).toBe("Qwen3.7-Max");
+  });
+
+  it("T-07/AC-01,AC-02,AC-04 lands one requested model in the same namespace on both transports", async () => {
+    const requested = staticModels.find((model) => model.id === "DeepSeek-V4-Flash");
+    if (!requested) throw new Error("fixture model missing from static seed: DeepSeek-V4-Flash");
+    const model = requested as Model<Api>;
+    const upstreamKey = "dfmodel";
+
+    // Legacy: the gateway echoes its constant against a friendly-id request.
+    globalThis.fetch = mockFetch(legacyEchoSse());
+    const legacyMessage = doneMessage(
+      await consume(streamQoder(model, makeContext(), { apiKey: "fake", sessionId: "session-ns" })),
+    );
+
+    // v2: an OpenAI-shaped stream echoing the upstream key it dispatched under,
+    // so pi-ai's own guard (`chunk.model !== model.id`,
+    // openai-completions.js:360-362) is what suppresses responseModel. The
+    // outbound body is read through `onPayload`, which receives the built object
+    // directly — no second parse of the same payload.
+    const v2Bodies: unknown[] = [];
+    const v2Urls: string[] = [];
+    // invented: OpenAI-shaped chunk trio in the recorded v2 fixture's shape,
+    // echoing the upstream key rather than a friendly id.
+    const v2Sse = [
+      `data: ${JSON.stringify({ id: "x", model: upstreamKey, choices: [{ delta: { content: "OK" }, index: 0 }] })}`,
+      `data: ${JSON.stringify({
+        id: "x",
+        model: upstreamKey,
+        choices: [{ delta: {}, finish_reason: "stop", index: 0 }],
+        usage: { prompt_tokens: 42, completion_tokens: 7, total_tokens: 49 },
+      })}`,
+      "data: [DONE]",
+    ].join("\n\n");
+    const v2Fetch = vi.fn(async (input: unknown) => {
+      v2Urls.push(String(input));
+      return new Response(v2Sse, { headers: { "content-type": "text/event-stream" } });
+    }) as unknown as typeof globalThis.fetch;
+    const v2Message = doneMessage(
+      await consume(
+        streamQoderV2(
+          model,
+          makeContext(),
+          {
+            apiKey: "fake",
+            fetch: v2Fetch,
+            sessionId: "session-ns",
+            onPayload: (payload: unknown) => {
+              v2Bodies.push(payload);
+              return undefined;
+            },
+          } as SimpleStreamOptions,
+          { mode: "global", modelConfig: { key: upstreamKey }, upstreamKey },
+        ),
+      ),
+    );
+
+    // One model, one namespace: both transports persist the friendly id and
+    // neither leaves a competing responseModel for `??` to prefer.
+    expect(persistedModelKey(legacyMessage)).toBe("DeepSeek-V4-Flash");
+    expect(persistedModelKey(v2Message)).toBe("DeepSeek-V4-Flash");
+    expect(legacyMessage.model).toBe(v2Message.model);
+    expect(v2Message.responseModel).toBeUndefined();
+    // Normalization is a terminal concern only: the v2 wire still dispatches
+    // under the upstream key pi-ai was given.
+    expect(v2Urls[0]).toContain("chat/completions");
+    const dispatchedBody = v2Bodies[0];
+    expect(isRecord(dispatchedBody) ? dispatchedBody.model : undefined).toBe(upstreamKey);
+  });
+});
+
+/**
+ * The prefix stamp on the legacy transport (spec CU-03).
+ *
+ * A cold chain writes NONE of the six keys — that absence is how the ledger
+ * represents class 0 — so every stamped row here warms the session's chain with a
+ * prior turn first. The registry is module state, hence the reset on both sides.
+ */
+describe("prefix stamp on the legacy transport (spec CU-03)", () => {
+  const originalFetch = globalThis.fetch;
+
+  beforeEach(() => clearPrefixChainRegistry());
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    clearPrefixChainRegistry();
+    vi.restoreAllMocks();
+  });
+
+  /** A fresh Response per call: one body can only be consumed once, so a multi-turn row needs one each. */
+  function freshFetch(body: string): typeof fetch {
+    return vi.fn(
+      async () => new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } }),
+    ) as unknown as typeof fetch;
+  }
+
+  // invented: a second-turn transcript that EXTENDS makeContext()'s single user
+  // message, which is what makes the chain stable rather than diverged.
+  function extendedContext(): TranscriptContext {
+    return normalizeContext({
+      systemPrompt: "test",
+      messages: [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "hello" },
+        { role: "user", content: "and again" },
+      ],
+      tools: [],
+    } as unknown as Context);
+  }
+
+  // invented: extendedContext() with the middle message rewritten, so the
+  // divergence lands on a known message index.
+  function rewrittenContext(): TranscriptContext {
+    return normalizeContext({
+      systemPrompt: "test",
+      messages: [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "REWRITTEN" },
+        { role: "user", content: "and again" },
+      ],
+      tools: [],
+    } as unknown as Context);
+  }
+
+  function terminalUsage(events: AssistantMessageEvent[]): StoredUsage {
+    const terminal = events.find((event) => event.type === "done" || event.type === "error");
+    if (!terminal) throw new Error("expected a terminal event");
+    const message = terminal.type === "done" ? terminal.message : terminal.error;
+    return message.usage as StoredUsage;
+  }
+
+  /** Warm the session's chain so the next dispatch on it is not cold. */
+  async function warm(sessionId: string, context: TranscriptContext = makeContext()): Promise<void> {
+    globalThis.fetch = freshFetch(SUCCESS_SSE);
+    await consume(streamQoder(makeModel(), context, { apiKey: "fake", sessionId }));
+  }
+
+  // spec: T-07 / AC-07 — a first turn in a fresh session carries none of the six.
+  it("T-07 leaves a cold first turn unstamped, which is what class 0 means", async () => {
+    globalThis.fetch = freshFetch(SUCCESS_SSE);
+    const usage = terminalUsage(
+      await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake", sessionId: "session-cold" })),
+    );
+
+    // A cold chain has no predecessor, so it has no divergence verdict to give.
+    // Writing the other five anyway would make the census unable to tell a
+    // genuinely append-only session from a process that had just started.
+    for (const key of [...PREFIX_FIELDS, "prefixDivergedAt"] as const) {
+      expect(key in usage, `a cold chain writes no ${key}`).toBe(false);
+    }
+  });
+
+  // spec: T-07 / AC-01,AC-03 — every legacy terminal carries the six fields.
+  it("T-07 stamps all six fields on a done terminal once the chain is warm", async () => {
+    await warm("session-done");
+    globalThis.fetch = freshFetch(SUCCESS_SSE);
+    const usage = terminalUsage(
+      await consume(streamQoder(makeModel(), extendedContext(), { apiKey: "fake", sessionId: "session-done" })),
+    );
+
+    for (const key of PREFIX_FIELDS) {
+      expect(usage[key], `the done terminal carries ${key}`).toBeDefined();
+    }
+    expect(usage.prefixStable, "the second turn extended the first turn's chain").toBe(true);
+    expect(usage.prefixDivergedAt, "an extending turn carries no divergence index").toBeUndefined();
+    expect(usage.prefixLen, "a character-scale count, not a message count").toBeGreaterThan(0);
+  });
+
+  it("T-07 stamps an error terminal produced after the chain resolved, with the same prefixHash as a done turn", async () => {
+    await warm("session-error");
+
+    globalThis.fetch = freshFetch(SUCCESS_SSE);
+    const doneUsage = terminalUsage(
+      await consume(streamQoder(makeModel(), extendedContext(), { apiKey: "fake", sessionId: "session-error" })),
+    );
+
+    globalThis.fetch = freshFetch(BLOCKED_SSE);
+    const events = await consume(
+      streamQoder(makeModel(), extendedContext(), { apiKey: "fake", sessionId: "session-error" }),
+    );
+    const errorUsage = terminalUsage(events);
+
+    expect(
+      events.find((event) => event.type === "error"),
+      "the 406 fixture errors mid-stream",
+    ).toBeDefined();
+    expect(
+      (events.find((event) => event.type === "error") as { error: AssistantMessage }).error.stopReason,
+      "and it is an error, not a silent stop",
+    ).toBe("error");
+    for (const key of PREFIX_FIELDS) {
+      expect(errorUsage[key], `the error terminal carries ${key}`).toBeDefined();
+    }
+    expect(errorUsage.prefixHash, "one transcript, one prefixHash, whatever the terminal").toBe(doneUsage.prefixHash);
+  });
+
+  it("T-07 stamps an aborted terminal, because the write precedes every downstream throw site", async () => {
+    await warm("session-abort");
+
+    // The abort must land AFTER the chain resolved, or the row is honestly
+    // unstamped like any pre-resolution failure. Signalling from inside fetch is
+    // what pins that order: the closure cannot reach fetch without having passed
+    // the stamp write first.
+    let reachedFetch: () => void = () => {};
+    const reached = new Promise<void>((resolve) => {
+      reachedFetch = resolve;
+    });
+    const controller = new AbortController();
+    globalThis.fetch = vi.fn(
+      (_url: URL | RequestInfo, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          reachedFetch();
+          init?.signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), {
+            once: true,
+          });
+        }),
+    ) as unknown as typeof fetch;
+
+    const pending = consume(
+      streamQoder(makeModel(), extendedContext(), {
+        apiKey: "fake",
+        sessionId: "session-abort",
+        signal: controller.signal,
+      }),
+    );
+    await reached;
+    controller.abort();
+    const events = await pending;
+    const usage = terminalUsage(events);
+
+    expect(
+      (events.find((event) => event.type === "error") as { error: AssistantMessage }).error.stopReason,
+      "the turn was cancelled after the stamp was written",
+    ).toBe("aborted");
+    for (const key of PREFIX_FIELDS) {
+      expect(usage[key], `the aborted terminal carries ${key}`).toBeDefined();
+    }
+  });
+
+  // spec: T-07 / AC-03 — a rewritten transcript names where it broke.
+  it("T-07 marks a rewritten transcript unstable at the message index where it broke", async () => {
+    await warm("session-rewrite", extendedContext());
+
+    globalThis.fetch = freshFetch(SUCCESS_SSE);
+    const usage = terminalUsage(
+      await consume(streamQoder(makeModel(), rewrittenContext(), { apiKey: "fake", sessionId: "session-rewrite" })),
+    );
+
+    expect(usage.prefixStable, "the middle message was rewritten, so the prefix broke").toBe(false);
+    expect(usage.prefixDivergedAt, "at that message's index in the chained transcript").toBe(1);
+  });
+
+  // Ruling Q2 requirement 1's falsifier at the legacy seam: if any per-dispatch
+  // value reached the payload view, payloadHash would move every turn and the field
+  // would be written, hashed and meaningless.
+  it("Q2-R1 holds payloadHash steady across two legacy turns with an unchanged prompt", async () => {
+    await warm("session-legacy-steady");
+
+    globalThis.fetch = freshFetch(SUCCESS_SSE);
+    const first = terminalUsage(
+      await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake", sessionId: "session-legacy-steady" })),
+    );
+    globalThis.fetch = freshFetch(SUCCESS_SSE);
+    const second = terminalUsage(
+      await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake", sessionId: "session-legacy-steady" })),
+    );
+
+    // request_id is a fresh UUID and business.id rotates per run, and neither is in
+    // the view — which is the whole point of stamping the logical prompt instead of
+    // the assembled body.
+    expect(second.payloadHash, "an unchanged prompt digests identically turn over turn").toBe(first.payloadHash);
+    expect(second.paramsHash, "nor does the sampling view move").toBe(first.paramsHash);
+    expect(second.prefixStable, "and the row still reads stable").toBe(true);
+  });
+
+  // spec: T-08 / AC-07 — the stamp and the usage-chunk handler coexist on one object.
+  it("T-08 carries the full priced usage and all six prefix fields without either overwriting the other", async () => {
+    // recorded-from: the envelope and finishChunk shape mirror the live legacy SSE
+    // captures (SUCCESS_SSE); the Credits amount is the existing priced-turn row's.
+    const priced =
+      sseEnvelope(chunk({ content: "OK", role: "assistant" })) +
+      sseEnvelope(
+        finishChunk("stop", {
+          usage: { prompt_tokens: 250_000, completion_tokens: 1_000, total_tokens: 251_000, credits: 100.0 },
+        }),
+      ) +
+      DONE_SSE;
+
+    globalThis.fetch = freshFetch(priced);
+    await consume(
+      streamQoder(makeModel("qoder", "DeepSeek-V4-Flash"), makeContext(), {
+        apiKey: "fake",
+        sessionId: "session-priced",
+      }),
+    );
+
+    globalThis.fetch = freshFetch(priced);
+    const usage = terminalUsage(
+      await consume(
+        streamQoder(makeModel("qoder", "DeepSeek-V4-Flash"), makeContext(), {
+          apiKey: "fake",
+          sessionId: "session-priced",
+        }),
+      ),
+    );
+
+    // The usage-chunk handler still owns the token buckets, the cost and the ladder.
+    expect(usage.cost.total, "the priced cost is exactly what the existing row asserts").toBeCloseTo(1.3333333, 6);
+    expect(usage.rateSource, "and the stamp did not displace the rate source").toBe("credits");
+    expect(usage.output, "nor the token buckets").toBe(1_000);
+    expect(usage.totalTokens).toBe(251_000);
+    // Beside all six prefix fields on the same object.
+    for (const key of PREFIX_FIELDS) {
+      expect(usage[key], `the priced terminal still carries ${key}`).toBeDefined();
+    }
+    expect(usage.prefixStable, "the same transcript again, so the chain held").toBe(true);
   });
 });

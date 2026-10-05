@@ -1,17 +1,21 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { getPiAgentDir } from "../home.js";
 import {
   estimate,
   fitRates,
   type LedgerTurn,
   type LifetimeProfile,
+  learnProfile,
   PROFILE_FILENAME,
   readProfile,
+  resetProfileForParity,
   scanLedgers,
   writeProfile,
 } from "../lifetime.js";
+import { QODER_WIRE_COMPAT } from "../protocol/wire-compat.js";
 import { assistantEntry, compactionEntry, warmEntry } from "./session-fixtures.js";
 
 const MODEL = "DeepSeek-V4-Flash";
@@ -58,7 +62,7 @@ function gapChain(): string[] {
 }
 
 describe("scanLedgers / estimate (AC-05)", () => {
-  it("publishes 600 s for 30 qualifying gaps and keeps the default below 20 samples", () => {
+  it("publishes 500 s for 30 qualifying gaps and keeps the default below 20 samples", () => {
     const root = sessionsRoot();
     writeSession(root, "session.jsonl", gapChain());
 
@@ -69,8 +73,11 @@ describe("scanLedgers / estimate (AC-05)", () => {
     expect(samples).toBeDefined();
     expect(samples?.gaps).toHaveLength(30);
 
+    // spec CU-03 / AC-01: the published value is the largest observed gap among
+    // the qualifying buckets (500 s — the biggest gap in the 600 s bucket), not
+    // the bucket's 600 s upper boundary the pre-BUG-0003 rule emitted.
     const result = estimate(samples?.gaps ?? []);
-    expect(result.lifetimeSeconds).toBe(600);
+    expect(result.lifetimeSeconds).toBe(500);
     expect(result.samples).toBe(30);
     expect(result.buckets.map((bucket) => [bucket.upperSeconds, bucket.samples])).toEqual([
       [30, 12],
@@ -231,5 +238,722 @@ describe("profile read/write (AC-06)", () => {
 
     writeFileSync(path, JSON.stringify({ version: 2, updatedAt: "2026-10-01T00:00:00.000Z", models: {} }));
     expect(readProfile(dir)).toBeUndefined();
+  });
+});
+
+/**
+ * The ledger whitelist for the six prefix-identity keys (spec CU-05).
+ *
+ * `parseLedgerLine` is module-private, so admission is observed through the
+ * exported `scanLedgers` by REJECTION ASYMMETRY rather than by field presence: a
+ * malformed prefix key must make its row vanish, which it can only do if that
+ * branch read the key at all. Sample-structure propagation is FS-E's gap-filter
+ * edit at the gap push, not this whitelist's, so a stamped row publishes exactly
+ * what the same row unstamped publishes.
+ */
+describe("parseLedgerLine prefix whitelist (spec CU-05)", () => {
+  const STAMPED_AT = Date.UTC(2026, 8, 30, 0, 0, 0);
+
+  // invented: prefixLen 412300 is SA §5.1's own example value; the three digests
+  // are that example's truncated forms ("9f2c…", "41ab…", "77e0…") padded to the
+  // 32-hex width prefix-chain.ts publishes.
+  const PREFIX_FIELDS = {
+    prefixLen: 412300,
+    prefixHash: "9f2c000000000000000000000000abcd",
+    prefixStable: true,
+    paramsHash: "41ab000000000000000000000000abcd",
+    payloadHash: "77e0000000000000000000000000abcd",
+  };
+
+  /** One fixture row as a JSONL line, with extra keys merged into its usage object. */
+  function row(entry: unknown, usage: Record<string, unknown>): string {
+    const line = structuredClone(entry) as {
+      usage?: Record<string, unknown>;
+      message?: { usage?: Record<string, unknown> };
+    };
+    const target = line.message?.usage ?? line.usage;
+    if (!target) throw new Error("fixture row carries no usage object");
+    Object.assign(target, usage);
+    return JSON.stringify(line);
+  }
+
+  function assistantRow(at: number, usage: Record<string, unknown> = PREFIX_FIELDS): string {
+    return row(assistantEntry(MODEL, at, TOKENS, 1.94), usage);
+  }
+
+  function warmRow(at: number, usage: Record<string, unknown> = PREFIX_FIELDS): string {
+    return row(warmEntry(at, TOKENS, 0.0259, 1.94), usage);
+  }
+
+  // spec: T-11 / AC-08 — both ledger row kinds carry the prefix fields through the
+  // parse, and rows without them are unaffected.
+  it("T-11 admits all six keys in both branches and publishes exactly what an unstamped ledger publishes", () => {
+    const unstampedRoot = sessionsRoot();
+    writeSession(unstampedRoot, "session.jsonl", [
+      JSON.stringify(assistantEntry(MODEL, STAMPED_AT, TOKENS, 1.94)),
+      JSON.stringify(warmEntry(STAMPED_AT + 60_000, TOKENS, 0.0259, 1.94)),
+    ]);
+    const unstamped = scanLedgers(5000, [unstampedRoot]);
+
+    const stampedRoot = sessionsRoot();
+    writeSession(stampedRoot, "session.jsonl", [assistantRow(STAMPED_AT), warmRow(STAMPED_AT + 60_000)]);
+    const stamped = scanLedgers(5000, [stampedRoot]);
+
+    // Both rows still parse with all six keys present: the warm row reaches
+    // scan.warm and the assistant row reaches the model's turn sample.
+    expect(stamped.warm, "the cache_warm branch admitted the stamp").toHaveLength(1);
+    expect(stamped.models[MODEL]?.turns, "the assistant branch admitted the stamp").toHaveLength(1);
+    // And admitting them changes no published value, which is the additive-field
+    // compatibility claim: the sample structures are built fresh, so nothing leaks.
+    expect(stamped.warm).toEqual(unstamped.warm);
+    expect(stamped.models[MODEL]?.turns).toEqual(unstamped.models[MODEL]?.turns);
+    expect(stamped.models[MODEL]?.gaps).toEqual(unstamped.models[MODEL]?.gaps);
+  });
+
+  it("T-11 rejects a warm row whose prefixLen is malformed, so the warm branch demonstrably reads the key", () => {
+    const root = sessionsRoot();
+    writeSession(root, "session.jsonl", [warmRow(STAMPED_AT, { ...PREFIX_FIELDS, prefixLen: "not-a-number" })]);
+
+    // Had the branch ignored the key as unknown, the row would have survived.
+    expect(scanLedgers(5000, [root]).warm, "a malformed stamp rejects the row wholesale").toHaveLength(0);
+  });
+
+  it("T-11 rejects an assistant row whose prefixLen is malformed, so the assistant branch demonstrably reads it", () => {
+    const root = sessionsRoot();
+    writeSession(root, "session.jsonl", [assistantRow(STAMPED_AT, { ...PREFIX_FIELDS, prefixLen: "not-a-number" })]);
+
+    expect(scanLedgers(5000, [root]).models[MODEL]?.turns ?? [], "the row was refused, not half-admitted").toHaveLength(
+      0,
+    );
+  });
+
+  // spec: T-12 / AC-09 — the reject-wholesale posture and the unknown-key drop both
+  // survive the whitelist extension.
+  it("T-12 still refuses a corrupt line and a malformed stamp, and keeps scanning past both", () => {
+    const root = sessionsRoot();
+    writeSession(root, "session.jsonl", [
+      "{not json at all",
+      assistantRow(STAMPED_AT),
+      assistantRow(STAMPED_AT + 20_000, { ...PREFIX_FIELDS, prefixStable: "true" }),
+      assistantRow(STAMPED_AT + 40_000),
+    ]);
+
+    const scan = scanLedgers(5000, [root]);
+    expect(scan.files, "the scan completed rather than aborting on the corrupt line").toBe(1);
+    expect(scan.exceededBudget).toBe(false);
+    expect(
+      scan.models[MODEL]?.turns,
+      "the unparseable line and the non-boolean prefixStable are both refused; the two clean rows survive",
+    ).toHaveLength(2);
+  });
+
+  it("T-12 still drops unknown keys beyond the six", () => {
+    const root = sessionsRoot();
+    writeSession(root, "session.jsonl", [
+      assistantRow(STAMPED_AT, { ...PREFIX_FIELDS, prefixFromTheFuture: "ignored" }),
+    ]);
+
+    const turn = scanLedgers(5000, [root]).models[MODEL]?.turns[0];
+    expect(turn, "the row still parses with an unknown key beside the whitelist").toBeDefined();
+    expect(Object.keys(turn ?? {}).sort(), "and only the keys the parser names survive it").toEqual([
+      "cacheRead",
+      "credits",
+      "input",
+      "output",
+    ]);
+  });
+
+  it("T-12 rejects a malformed digest key, not only a malformed number", () => {
+    const root = sessionsRoot();
+    writeSession(root, "session.jsonl", [warmRow(STAMPED_AT, { ...PREFIX_FIELDS, paramsHash: 41 })]);
+
+    expect(
+      scanLedgers(5000, [root]).warm,
+      "a non-string digest rejects the row like any other malformation",
+    ).toHaveLength(0);
+  });
+
+  it("T-11 admits prefixDivergedAt, and rejects the row when that index is malformed", () => {
+    // The divergence index is the one field that says WHERE a prefix broke, so it
+    // must survive the parse on a diverged row rather than being dropped as unknown.
+    const divergedRoot = sessionsRoot();
+    writeSession(divergedRoot, "session.jsonl", [
+      assistantRow(STAMPED_AT, { ...PREFIX_FIELDS, prefixStable: false, prefixDivergedAt: 3 }),
+    ]);
+    expect(
+      scanLedgers(5000, [divergedRoot]).models[MODEL]?.turns,
+      "a diverged row carrying a valid index still parses",
+    ).toHaveLength(1);
+
+    const malformedRoot = sessionsRoot();
+    writeSession(malformedRoot, "session.jsonl", [
+      assistantRow(STAMPED_AT, { ...PREFIX_FIELDS, prefixStable: false, prefixDivergedAt: "third" }),
+    ]);
+    expect(
+      scanLedgers(5000, [malformedRoot]).models[MODEL]?.turns ?? [],
+      "and a malformed index rejects the row wholesale like any other malformation",
+    ).toHaveLength(0);
+  });
+});
+
+/**
+ * The observed-second learner (fs-qoder-cache-learner CUs 01-05, SA CU-4 /
+ * BUG-0003). Every row drives the public seam — scanLedgers over a temp
+ * fixture ledger, then estimate / learnProfile / readProfile / writeProfile /
+ * resetProfileForParity — never the private parser.
+ *
+ * `learnProfile` is imported at the top of this block's enclosing module scope
+ * via the same seam table (S5): it is exercised through the profile it
+ * publishes, so a row here needs no mock of node:fs beyond the temp dirs the
+ * harness already creates.
+ */
+
+// invented: a qualifying-bucket chain whose gaps are all 640 s — the largest
+// observed survival the BUG-0003 ledger records — landing in the 1200 s bucket.
+function observedSurvivalChain(seconds: number, count: number): string[] {
+  let timestamp = Date.UTC(2026, 8, 30, 0, 0, 0);
+  const lines = [JSON.stringify(assistantEntry(MODEL, timestamp, TOKENS))];
+  for (let index = 0; index < count; index += 1) {
+    timestamp += seconds * 1000;
+    lines.push(JSON.stringify(assistantEntry(MODEL, timestamp, TOKENS)));
+  }
+  return lines;
+}
+
+/** A MISSED warm refresh attributed to MODEL: nothing came back, so the entry
+ *  was dead by this idle offset. */
+function warmRowForMiss(at: number): string {
+  const line = structuredClone(warmEntry(at, { input: 1000, cacheRead: 0, output: 4 }, 0, 3.75)) as unknown as {
+    model: string;
+  };
+  line.model = MODEL;
+  return JSON.stringify(line);
+}
+
+/** A HIT warm refresh attributed to MODEL: the cache was read back, so the
+ *  entry was alive at this idle offset. */
+function warmRowForHit(at: number): string {
+  const line = structuredClone(warmEntry(at, { input: 1000, cacheRead: 9000, output: 4 }, 0, 3.75)) as unknown as {
+    model: string;
+  };
+  line.model = MODEL;
+  return JSON.stringify(line);
+}
+
+describe("observed-second learner (fs-qoder-cache-learner)", () => {
+  // spec: CU-01 / T-01 / AC-03 — a zero-usage assistant row anchors no gap.
+  it("T-01 excludes a zero-usage assistant row from gap anchoring, while a positive-usage middle row anchors exactly as before", () => {
+    const start = Date.UTC(2026, 8, 30, 0, 0, 0);
+    const zeroUsage = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 };
+
+    const zeroRoot = sessionsRoot();
+    writeSession(zeroRoot, "session.jsonl", [
+      JSON.stringify(assistantEntry(MODEL, start, TOKENS)),
+      JSON.stringify(assistantEntry(MODEL, start + 20_000, zeroUsage)),
+      JSON.stringify(assistantEntry(MODEL, start + 40_000, TOKENS)),
+      JSON.stringify(assistantEntry(MODEL, start + 60_000, TOKENS)),
+    ]);
+    const zeroScan = scanLedgers(5000, [zeroRoot]);
+    // The zero-usage row anchors nothing, so no gap spans it: only the
+    // post-zero pair (m2 -> m3) forms, because the anchor was cleared rather
+    // than retained across the zero-usage turn.
+    expect(zeroScan.models[MODEL]?.gaps.map((gap) => gap.seconds)).toEqual([20]);
+
+    const positiveRoot = sessionsRoot();
+    writeSession(positiveRoot, "session.jsonl", [
+      JSON.stringify(assistantEntry(MODEL, start, TOKENS)),
+      JSON.stringify(assistantEntry(MODEL, start + 20_000, TOKENS)),
+      JSON.stringify(assistantEntry(MODEL, start + 40_000, TOKENS)),
+    ]);
+    const positiveScan = scanLedgers(5000, [positiveRoot]);
+    expect(positiveScan.models[MODEL]?.gaps.map((gap) => gap.seconds)).toEqual([20, 20]);
+  });
+
+  // spec: CU-02 / T-02 / AC-02, AC-04 — a warm row carries an attributable
+  // observation at a known idle offset; a hit is survival, a miss a death.
+  it("T-02 harvests idleSeconds and attributedModel on a warm row, both undefined with no same-model predecessor", () => {
+    const start = Date.UTC(2026, 8, 30, 0, 0, 0);
+    // Post-attribution the warm row's model column is the friendly id, so the
+    // fixture overrides the builder's `auto` default for the attributed row.
+    function warmRow(at: number, model: string): string {
+      const line = structuredClone(warmEntry(at, { input: 1000, cacheRead: 9000, output: 4 }, 0, 3.75)) as unknown as {
+        model: string;
+      };
+      line.model = model;
+      return JSON.stringify(line);
+    }
+    const root = sessionsRoot();
+    writeSession(root, "session.jsonl", [
+      JSON.stringify(warmEntry(start, { input: 1000, cacheRead: 9000, output: 4 }, 0, 3.75)),
+      JSON.stringify(assistantEntry(MODEL, start + 10_000, TOKENS)),
+      warmRow(start + 40_000, MODEL),
+    ]);
+    const scan = scanLedgers(5000, [root]);
+    expect(scan.warm).toHaveLength(2);
+    const [orphan, attributed] = scan.warm;
+    expect(orphan.idleSeconds).toBeUndefined();
+    expect(orphan.attributedModel).toBeUndefined();
+    expect(attributed.idleSeconds).toBe(30);
+    expect(attributed.attributedModel).toBe(MODEL);
+
+    // A different model's last real turn is not the predecessor: it cached a
+    // different entry, so the offset would be measured from the wrong marker.
+    const foreignRoot = sessionsRoot();
+    writeSession(foreignRoot, "session.jsonl", [
+      JSON.stringify(assistantEntry("Qwen3-Coder", start, TOKENS)),
+      warmRow(start + 25_000, MODEL),
+    ]);
+    const foreign = scanLedgers(5000, [foreignRoot]);
+    expect(foreign.warm[0]?.idleSeconds).toBeUndefined();
+    expect(foreign.warm[0]?.attributedModel).toBeUndefined();
+  });
+
+  it("T-03 distinguishes a hit warm (survival evidence) from a miss warm (death candidate) in the sample the scan produces", () => {
+    const start = Date.UTC(2026, 8, 30, 0, 0, 0);
+    const root = sessionsRoot();
+    writeSession(root, "session.jsonl", [
+      JSON.stringify(assistantEntry(MODEL, start, TOKENS)),
+      // A hit: the refresh read the cache back, so the entry was alive at 30 s.
+      JSON.stringify(warmEntry(start + 30_000, { input: 1000, cacheRead: 9000, output: 4 }, 0, 3.75)),
+      JSON.stringify(assistantEntry(MODEL, start + 40_000, TOKENS)),
+      // A miss: nothing came back at the 60 s offset, so the entry was dead by then.
+      JSON.stringify(warmEntry(start + 100_000, { input: 1000, cacheRead: 0, output: 4 }, 0, 3.75)),
+    ]);
+    const scan = scanLedgers(5000, [root]);
+    expect(scan.warm.map((row) => row.cacheRead > 0)).toEqual([true, false]);
+
+    // AC-04's falsifier, driven through learnProfile: a cacheRead-positive
+    // warm at a low idle offset is survival evidence and must NOT shorten the
+    // published lifetime — only misses corroborate a death bound.
+    const hitRoot = sessionsRoot();
+    const hitStart = Date.UTC(2026, 8, 30, 0, 0, 0);
+    const hitLines = [JSON.stringify(assistantEntry(MODEL, hitStart, TOKENS))];
+    let hitAt = hitStart;
+    for (let index = 0; index < 21; index += 1) {
+      hitAt += 640_000;
+      hitLines.push(JSON.stringify(assistantEntry(MODEL, hitAt, TOKENS)));
+    }
+    // Two HIT refreshes at 300 s and 400 s idle — alive at both offsets, so
+    // the observed survival stands and the published value stays 640.
+    hitLines.push(warmRowForHit(hitStart + 21 * 640_000 + 300_000));
+    hitLines.push(warmRowForHit(hitStart + 21 * 640_000 + 400_000));
+    writeSession(hitRoot, "session.jsonl", hitLines);
+    const hitScan = scanLedgers(5000, [hitRoot]);
+    expect(learnProfile(hitScan, undefined).models[MODEL]?.lifetimeSeconds).toBe(640);
+  });
+
+  // spec: CU-03 / T-04 / AC-01 — the published lifetime never exceeds an
+  // observed survival second.
+  it("T-04 publishes the observed survival, not the bucket boundary, and the profile written to the temp agent dir carries it", () => {
+    const root = sessionsRoot();
+    // 21 same-shape gaps of 640 s: 20 samples meet MIN_NATURAL_SAMPLES and 3+
+    // per bucket meet MIN_BUCKET_SAMPLES with a 0.9 median ratio, so the 1200 s
+    // bucket qualifies — and its boundary is exactly the overclaim BUG-0003
+    // records. The largest observed gap is 640 s.
+    writeSession(root, "session.jsonl", observedSurvivalChain(640, 21));
+
+    const scan = scanLedgers(5000, [root]);
+    const samples = scan.models[MODEL];
+    expect(samples?.gaps).toHaveLength(21);
+    const result = estimate(samples?.gaps ?? []);
+    expect(result.buckets.map((bucket) => bucket.upperSeconds)).toContain(1200);
+    expect(result.lifetimeSeconds).toBe(640);
+
+    // The observed survival is read from the QUALIFYING buckets only: three
+    // 3000 s gaps whose median ratio collapses (0.1) put a larger gap inside a
+    // non-qualifying bucket, and that gap must not leak into the published
+    // value — the qualifying evidence is the 640 s chain.
+    const decayed = [...(samples?.gaps ?? []), ...Array.from({ length: 3 }, () => ({ seconds: 3000, ratio: 0.1 }))];
+    const decayedResult = estimate(decayed);
+    expect(decayedResult.buckets.map((bucket) => [bucket.upperSeconds, bucket.samples])).toContainEqual([3600, 3]);
+    expect(decayedResult.lifetimeSeconds).toBe(640);
+
+    const dir = mkdtempSync(join(tmpdir(), "qoder-learner-"));
+    createdDirs.push(dir);
+    const profile = learnProfile(scan, undefined);
+    writeProfile(profile, dir);
+    expect(readProfile(dir)?.models[MODEL]?.lifetimeSeconds).toBe(640);
+  });
+
+  // spec: CU-03 / T-05 / AC-02, AC-05 — a death bound moves the published value
+  // only when at least two independent miss signals support it.
+  it("T-05 leaves the published value unchanged on one miss, and takes the earlier of the two bounds on two", () => {
+    const root = sessionsRoot();
+    writeSession(root, "session.jsonl", observedSurvivalChain(640, 21));
+    const scan = scanLedgers(5000, [root]);
+    const samples = scan.models[MODEL]?.gaps ?? [];
+    expect(samples).toHaveLength(21);
+
+    // One uncorroborated miss at 300 s: the observed-survival term stands.
+    expect(estimate(samples, [{ seconds: 300, model: MODEL }]).lifetimeSeconds).toBe(640);
+    // Two independent misses at 300 s and 400 s: the earliest bound both
+    // support is 400 s (a miss at 400 proves nothing about 300 s), so the
+    // published value is min(640, 400) = 400.
+    expect(
+      estimate(samples, [
+        { seconds: 300, model: MODEL },
+        { seconds: 400, model: MODEL },
+      ]).lifetimeSeconds,
+    ).toBe(400);
+    // A third miss at 200 s does not move the bound below the second-smallest
+    // offset: 200 s alone is uncorroborated, so the earliest bound two signals
+    // support is still 300 s.
+    expect(
+      estimate(samples, [
+        { seconds: 200, model: MODEL },
+        { seconds: 300, model: MODEL },
+        { seconds: 900, model: MODEL },
+      ]).lifetimeSeconds,
+    ).toBe(300);
+    // A corroborated bound below the clamp floor still publishes the floor.
+    expect(
+      estimate(samples, [
+        { seconds: 60, model: MODEL },
+        { seconds: 90, model: MODEL },
+      ]).lifetimeSeconds,
+    ).toBe(120);
+
+    // The same gate flows through learnProfile: a ledger with two missed
+    // refreshes publishes the corroborated bound into the profile, while the
+    // identical ledger with one miss publishes the observed survival alone.
+    // The misses sit inside a gap-broken chain (a warm row breaks the chain),
+    // so the gap sample below is built from the real turns only.
+    const missRoot = sessionsRoot();
+    const missStart = Date.UTC(2026, 8, 30, 0, 0, 0);
+    const missLines = [JSON.stringify(assistantEntry(MODEL, missStart, TOKENS))];
+    let missAt = missStart;
+    for (let index = 0; index < 21; index += 1) {
+      missAt += 640_000;
+      missLines.push(JSON.stringify(assistantEntry(MODEL, missAt, TOKENS)));
+    }
+    // Two missed refreshes at 300 s and 400 s idle: both attributed to MODEL.
+    missLines.push(warmRowForMiss(missStart + 21 * 640_000 + 300_000));
+    missLines.push(warmRowForMiss(missStart + 21 * 640_000 + 400_000));
+    writeSession(missRoot, "session.jsonl", missLines);
+    const missScan = scanLedgers(5000, [missRoot]);
+    expect(learnProfile(missScan, undefined).models[MODEL]?.lifetimeSeconds).toBe(400);
+
+    const oneMissRoot = sessionsRoot();
+    const oneMissLines = [...missLines.slice(0, -1)];
+    writeSession(oneMissRoot, "session.jsonl", oneMissLines);
+    const oneMissScan = scanLedgers(5000, [oneMissRoot]);
+    expect(learnProfile(oneMissScan, undefined).models[MODEL]?.lifetimeSeconds).toBe(640);
+
+    // Cross-model isolation: a miss attributed to a DIFFERENT model must not
+    // shorten this model's bound — deaths corroborate per model, never pooled.
+    const foreignMissRoot = sessionsRoot();
+    const foreignMissLines = [...missLines.slice(0, -2)];
+    const foreignMissStart = missStart;
+    foreignMissLines.push(
+      JSON.stringify(
+        (() => {
+          const line = structuredClone(
+            warmEntry(foreignMissStart + 21 * 640_000 + 300_000, { input: 1000, cacheRead: 0, output: 4 }, 0, 3.75),
+          ) as unknown as { model: string };
+          line.model = "Qwen3-Coder";
+          return line;
+        })(),
+      ),
+      JSON.stringify(
+        (() => {
+          const line = structuredClone(
+            warmEntry(foreignMissStart + 21 * 640_000 + 400_000, { input: 1000, cacheRead: 0, output: 4 }, 0, 3.75),
+          ) as unknown as { model: string };
+          line.model = "Qwen3-Coder";
+          return line;
+        })(),
+      ),
+    );
+    writeSession(foreignMissRoot, "session.jsonl", foreignMissLines);
+    const foreignMissScan = scanLedgers(5000, [foreignMissRoot]);
+    expect(learnProfile(foreignMissScan, undefined).models[MODEL]?.lifetimeSeconds).toBe(640);
+  });
+
+  // spec: CU-03 / T-06 / AC-06 — the thin-evidence gate and the carry-forward
+  // both survive the new bound.
+  it("T-06 still publishes nothing for a thin session and still carries the prior estimate forward", () => {
+    const thinRoot = sessionsRoot();
+    writeSession(thinRoot, "session.jsonl", observedSurvivalChain(640, 10));
+    const thinScan = scanLedgers(5000, [thinRoot]);
+    expect(estimate(thinScan.models[MODEL]?.gaps ?? []).lifetimeSeconds).toBeUndefined();
+
+    const prior: LifetimeProfile = {
+      version: 2,
+      updatedAt: "2026-10-01T00:00:00.000Z",
+      models: {
+        [MODEL]: {
+          lifetimeSeconds: 480,
+          samples: 21,
+          computedAt: "2026-09-30T12:00:00.000Z",
+          buckets: [{ upperSeconds: 1200, medianRatio: 0.9, samples: 21 }],
+        },
+      },
+    };
+    const learned = learnProfile(thinScan, prior);
+    expect(learned.models[MODEL]?.lifetimeSeconds).toBe(480);
+
+    // A well-evidenced session with no death observations at all publishes the
+    // observed survival term unchanged.
+    const fullRoot = sessionsRoot();
+    writeSession(fullRoot, "session.jsonl", observedSurvivalChain(640, 21));
+    const fullScan = scanLedgers(5000, [fullRoot]);
+    expect(estimate(fullScan.models[MODEL]?.gaps ?? []).lifetimeSeconds).toBe(640);
+  });
+
+  // spec: CU-04 / T-07 / AC-07 — the parity reset discards the profile exactly
+  // once and is a no-op thereafter.
+  it("T-07 removes a present profile once, is a no-op on the second call, and leaves the next learn to rebuild from post-parity rows", () => {
+    const dir = mkdtempSync(join(tmpdir(), "qoder-parity-"));
+    createdDirs.push(dir);
+    const path = join(dir, PROFILE_FILENAME);
+
+    const preParity: LifetimeProfile = {
+      version: 2,
+      updatedAt: "2026-10-01T00:00:00.000Z",
+      models: {
+        [MODEL]: {
+          lifetimeSeconds: 3600,
+          samples: 42,
+          computedAt: "2026-09-30T12:00:00.000Z",
+          buckets: [{ upperSeconds: 3600, medianRatio: 0.9, samples: 42 }],
+        },
+      },
+    };
+    writeProfile(preParity, dir);
+    expect(existsSync(path)).toBe(true);
+
+    expect(resetProfileForParity(dir)).toBe(true);
+    expect(existsSync(path)).toBe(false);
+    expect(readProfile(dir)).toBeUndefined();
+
+    // A profile written by a concurrent relearn between two resets is removed
+    // by the later one, and a second reset with no profile is a no-op.
+    writeProfile(preParity, dir);
+    expect(resetProfileForParity(dir)).toBe(true);
+    expect(resetProfileForParity(dir)).toBe(false);
+    expect(existsSync(path)).toBe(false);
+
+    // The next learn over a post-parity fixture ledger publishes only from
+    // those rows — no pre-parity value survives into the rebuilt profile.
+    const root = sessionsRoot();
+    writeSession(root, "session.jsonl", observedSurvivalChain(640, 21));
+    const scan = scanLedgers(5000, [root]);
+    const rebuilt = learnProfile(scan, readProfile(dir));
+    expect(rebuilt.models[MODEL]?.lifetimeSeconds).toBe(640);
+  });
+
+  // spec: CU-05 / T-08 / AC-08 — a diverged-prefix gap is excluded from the
+  // lifetime sample; an unmarked gap and a stable-prefix gap are not.
+  it("T-08 excludes prefixStable:false gaps, includes absent and prefixStable:true ones", () => {
+    const start = Date.UTC(2026, 8, 30, 0, 0, 0);
+    const STAMP = { prefixLen: 412300, prefixHash: "9f2c000000000000000000000000abcd" };
+
+    function stampedRow(at: number, prefixStable: boolean): string {
+      const line = structuredClone(assistantEntry(MODEL, at, TOKENS, 1.94)) as unknown as {
+        message: { usage: Record<string, unknown> };
+      };
+      Object.assign(line.message.usage, { ...STAMP, prefixStable });
+      return JSON.stringify(line);
+    }
+
+    // All three ledgers share the same 30-gap qualifying chain; only the later
+    // rows of the diverged one are marked unstable, so it falls below the
+    // publish gate while the other two publish the same observed survival.
+    const chain = observedSurvivalChain(640, 21);
+
+    const unmarkedRoot = sessionsRoot();
+    writeSession(unmarkedRoot, "session.jsonl", chain);
+    const unmarked = scanLedgers(5000, [unmarkedRoot]);
+
+    const divergedRoot = sessionsRoot();
+    writeSession(divergedRoot, "session.jsonl", [
+      chain[0],
+      ...chain
+        .slice(1)
+        .map((line, index) => (index % 2 === 0 ? stampedRow(start + (index + 1) * 640_000, false) : line)),
+    ]);
+    const diverged = scanLedgers(5000, [divergedRoot]);
+
+    const stableRoot = sessionsRoot();
+    writeSession(stableRoot, "session.jsonl", [
+      chain[0],
+      ...chain
+        .slice(1)
+        .map((line, index) => (index % 2 === 0 ? stampedRow(start + (index + 1) * 640_000, true) : line)),
+    ]);
+    const stable = scanLedgers(5000, [stableRoot]);
+
+    expect(unmarked.models[MODEL]?.gaps).toHaveLength(21);
+    // 11 of the 21 gaps have a marked later row and are excluded; 10 remain —
+    // below the 20-sample publish gate, so the diverged ledger publishes nothing.
+    expect(diverged.models[MODEL]?.gaps).toHaveLength(10);
+    expect(stable.models[MODEL]?.gaps).toHaveLength(21);
+
+    expect(estimate(unmarked.models[MODEL]?.gaps ?? []).lifetimeSeconds).toBe(640);
+    expect(estimate(diverged.models[MODEL]?.gaps ?? []).lifetimeSeconds).toBeUndefined();
+    expect(estimate(stable.models[MODEL]?.gaps ?? []).lifetimeSeconds).toBe(640);
+  });
+});
+
+/**
+ * Spec fs-qoder-legacy-affinity CU-06 / T-07 / AC-08 — the parity cutover
+ * rides the session-start learn hook through the real factory: the profile is
+ * discarded exactly once, only when a placement beyond the identity baseline
+ * is live, and the learn that follows rebuilds from post-parity rows only.
+ *
+ * Everything real except the pi host (the providers.test.ts fake shape) and
+ * the injected scan, so the claim is about the file on disk, not a mock. The
+ * per-file HOME the vitest setup installs is the learner's own agent dir.
+ */
+describe("session-start parity cutover (fs-qoder-legacy-affinity CU-06)", () => {
+  // The factory's startup logs in from PAT env names; delete them so the
+  // session_start rows below exercise the learn hook, not a login path.
+  const patEnvNames = [
+    "QODER_API_KEY",
+    "QODER_PERSONAL_ACCESS_TOKEN",
+    "QODER_PAT",
+    "QODERCN_API_KEY",
+    "QODERCN_PERSONAL_ACCESS_TOKEN",
+    "QODERCN_PAT",
+  ] as const;
+  const originalPats = Object.fromEntries(patEnvNames.map((name) => [name, process.env[name]]));
+
+  afterEach(() => {
+    for (const name of patEnvNames) {
+      const value = originalPats[name];
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    vi.resetModules();
+    rmSync(join(getPiAgentDir(), PROFILE_FILENAME), { force: true });
+    rmSync(join(getPiAgentDir(), "qoder-cache-lifetime-parity-reset.txt"), { force: true });
+  });
+
+  /** The factory-time pi host: providers register, handlers land in the map. */
+  function fakePi() {
+    const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    const pi = {
+      registerProvider: vi.fn(),
+      unregisterProvider: vi.fn(),
+      registerCommand: vi.fn(),
+      on: vi.fn((name: string, handler: (event: unknown, ctx: unknown) => unknown) => {
+        handlers.set(name, handler);
+      }),
+    };
+    return { pi, handlers };
+  }
+
+  const sessionStartCtx = (): unknown => ({
+    modelRegistry: { getApiKeyForProvider: async () => undefined },
+  });
+
+  /** The shipped table with the header-trio carrier promoted out of the gated row. */
+  function promotedTable() {
+    const table = structuredClone(QODER_WIRE_COMPAT);
+    table.affinityPlacement.push("legacy:header-x-session-id");
+    table.affinityPlacementGated = table.affinityPlacementGated.filter(
+      (entry) => entry !== "legacy:header-x-session-id",
+    );
+    return table;
+  }
+
+  /** An empty scan: nothing publishable, so only carried prior values could survive. */
+  const emptyScan = () => scanLedgers(5000, [sessionsRoot()]);
+
+  const seededProfile = (): LifetimeProfile => ({
+    version: 2,
+    updatedAt: "2026-10-01T00:00:00.000Z",
+    models: {
+      [MODEL]: {
+        lifetimeSeconds: 3600,
+        samples: 42,
+        computedAt: "2026-09-30T12:00:00.000Z",
+        buckets: [{ upperSeconds: 3600, medianRatio: 0.9, samples: 42 }],
+      },
+    },
+  });
+
+  async function startSession(handlers: Map<string, (event: unknown, ctx: unknown) => unknown>): Promise<void> {
+    await handlers.get("session_start")?.({}, sessionStartCtx());
+  }
+
+  it("T-07 discards pre-parity carried evidence at cutover, when a promoted placement is live", async () => {
+    for (const name of patEnvNames) delete process.env[name];
+    // The scan publishes nothing, so the seeded 3600 s value could only survive
+    // by being carried forward through learnProfile's prior — exactly the
+    // pre-parity evidence OB-6 invalidates. A cutover start leaves no profile.
+    writeProfile(seededProfile());
+    const { pi, handlers } = fakePi();
+    const { default: registerProviders } = await import("../index.js");
+    await registerProviders(pi as never, { scanLedgers: emptyScan, wireCompat: promotedTable() });
+    await startSession(handlers);
+
+    expect(readProfile()).toBeUndefined();
+    expect(existsSync(join(getPiAgentDir(), PROFILE_FILENAME))).toBe(false);
+  });
+
+  it("T-07 rebuilds from post-parity rows once, and a second session start deletes nothing", async () => {
+    for (const name of patEnvNames) delete process.env[name];
+    const postParityRoot = sessionsRoot();
+    writeSession(postParityRoot, "session.jsonl", observedSurvivalChain(640, 21));
+    const postParityScan = () => scanLedgers(5000, [postParityRoot]);
+
+    writeProfile(seededProfile());
+    const first = fakePi();
+    const { default: registerProviders } = await import("../index.js");
+    await registerProviders(first.pi as never, { scanLedgers: postParityScan, wireCompat: promotedTable() });
+    await startSession(first.handlers);
+    // Rebuilt from the post-parity ledger alone — the seeded 3600 s is gone.
+    expect(readProfile()?.models[MODEL]?.lifetimeSeconds).toBe(640);
+
+    // Same process, same module: the once-flag must hold, so a second start
+    // whose scan publishes nothing cannot delete the freshly rebuilt profile.
+    const second = fakePi();
+    const { default: registerAgain } = await import("../index.js");
+    await registerAgain(second.pi as never, { scanLedgers: emptyScan, wireCompat: promotedTable() });
+    await startSession(second.handlers);
+    expect(readProfile()?.models[MODEL]?.lifetimeSeconds).toBe(640);
+    expect(existsSync(join(getPiAgentDir(), PROFILE_FILENAME))).toBe(true);
+  });
+
+  it("T-07 performs no reset at all on the shipped build, where nothing is promoted", async () => {
+    for (const name of patEnvNames) delete process.env[name];
+    // Shipped table: legacy:session_id alone is live, and it has always been —
+    // that is not a cutover. The seeded profile must survive untouched.
+    writeProfile(seededProfile());
+    const { pi, handlers } = fakePi();
+    vi.resetModules();
+    const { default: registerProviders } = await import("../index.js");
+    await registerProviders(pi as never, { scanLedgers: emptyScan });
+    await startSession(handlers);
+
+    expect(readProfile()?.models[MODEL]?.lifetimeSeconds).toBe(3600);
+    expect(readProfile()?.models[MODEL]?.samples).toBe(42);
+    expect(existsSync(join(getPiAgentDir(), "qoder-cache-lifetime-parity-reset.txt"))).toBe(false);
+  });
+
+  it("T-07 performs no second reset in a later process once the cutover marker exists", async () => {
+    for (const name of patEnvNames) delete process.env[name];
+    // First process: the cutover runs and writes the marker.
+    writeProfile(seededProfile());
+    const cutover = fakePi();
+    const { default: registerCutover } = await import("../index.js");
+    await registerCutover(cutover.pi as never, { scanLedgers: emptyScan, wireCompat: promotedTable() });
+    await startSession(cutover.handlers);
+    expect(existsSync(join(getPiAgentDir(), "qoder-cache-lifetime-parity-reset.txt"))).toBe(true);
+
+    // A later process sees the same promoted table but the marker too: the
+    // profile that process rebuilt must survive its own session start, thin
+    // scan and all (AC-08's "second reset deleting a freshly learned profile"
+    // falsifier, across the process boundary).
+    vi.resetModules();
+    writeProfile(seededProfile());
+    const later = fakePi();
+    const { default: registerLater } = await import("../index.js");
+    await registerLater(later.pi as never, { scanLedgers: emptyScan, wireCompat: promotedTable() });
+    await startSession(later.handlers);
+
+    expect(readProfile()?.models[MODEL]?.lifetimeSeconds).toBe(3600);
+    expect(readProfile()?.models[MODEL]?.samples).toBe(42);
   });
 });

@@ -16,6 +16,7 @@ import type {
 import { resolveQoderIdentity } from "../auth/oauth.js";
 import { getCachedModelConfig, type QoderModelEntry } from "../catalog.js";
 import type { QoderMode } from "../region.js";
+import { resolveContextLength } from "./context-length.js";
 import type { Protocol } from "./routing.js";
 import { classifyTurnKind, type QoderTurnKind } from "./run-identity.js";
 import { clampPromptCacheKey, MAX_PROMPT_CACHE_KEY_LENGTH, stableHash } from "./session-key.js";
@@ -39,13 +40,16 @@ export const PROCESS_FALLBACK_SESSION_ID = crypto.randomUUID();
 /**
  * The router's per-request route facts. Derived once from the model and the
  * catalog, then read by the plan and both adapters — the route is the seed's
- * other half, so no adapter re-derives the mode or the upstream key.
+ * other half, so no adapter re-derives the mode, the upstream key or the
+ * context-window tiers.
  */
 export interface PlanRoute {
   protocol: Protocol;
   mode: QoderMode;
   upstreamKey: string;
   rejectedSamplingKeys: readonly string[];
+  /** The catalog entry's context tiers, the same entry the adapters dispatch under. */
+  contextConfig: QoderModelEntry["context_config"];
 }
 
 /**
@@ -60,6 +64,8 @@ export interface TurnPlanSync {
   wireSessionV2: { promptCacheKey: string; envelopeAndHeaders: string };
   turnKind: QoderTurnKind;
   capture: { protocol: Protocol; model: string; session: string | undefined };
+  /** The resolved context-window tier, or undefined when no tier governs. */
+  contextLength: number | undefined;
 }
 
 /** The seed the router hands the adapters when QODER_CORE_PLAN is on: route facts plus their sync projection. */
@@ -76,6 +82,8 @@ export interface TurnPlan {
   thinkingInputs: { level: ThinkingLevel | undefined; budgets: ThinkingBudgets | undefined };
   turnKind: QoderTurnKind;
   capture: { protocol: Protocol; model: string; session: string | undefined; wireSessionId: string };
+  /** The sync projection's tier, carried through unchanged — one resolution per dispatch. */
+  contextLength: number | undefined;
 }
 
 /**
@@ -150,6 +158,7 @@ export function planSyncProjection(
     wireSessionV2: v2WireSession(options?.sessionId),
     turnKind: classifyTurnKind(options?.maxTokens),
     capture: { protocol: route.protocol, model: model.id, session: options?.sessionId },
+    contextLength: resolveContextLength(route.contextConfig, model.contextWindow),
   };
 }
 
@@ -190,6 +199,9 @@ export async function planQoderTurn(
   }
 
   const wireSessionId = route.protocol === "legacy" ? wireSessionLegacy : wireSessionV2.envelopeAndHeaders;
+  // The sync projection already resolved the tier; carrying it through rather
+  // than recomputing keeps the two surfaces one value by construction.
+  const sync = planSyncProjection(model, options, route);
   return {
     piSessionId: options?.sessionId,
     mode: route.mode,
@@ -213,5 +225,6 @@ export async function planQoderTurn(
       session: options?.sessionId,
       wireSessionId,
     },
+    contextLength: sync.contextLength,
   };
 }

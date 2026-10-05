@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,6 +16,7 @@ import { clearQoderModelsMemCache, staticModels } from "../catalog.js";
 import { streamQoderRouter } from "../protocol/router.js";
 import { clearQoderFallbackCache, clearQoderRoutingMemCache } from "../protocol/routing.js";
 import { clearQoderFilterMemCache } from "../protocol/sampling.js";
+import { QODER_WIRE_COMPAT, type QoderWireCompatData } from "../protocol/wire-compat.js";
 import { debugMessages } from "./debug-sink.js";
 
 // SA rows 1/2/7/8/9 regression: the wire vocabulary the host contract promises.
@@ -22,6 +24,32 @@ import { debugMessages } from "./debug-sink.js";
 // options shaped exactly as pi builds them (agent.js:303-311 + sdk.js:178-196):
 // reasoning absent when thinking is off, sessionId per session, thinkingBudgets
 // from settings, onPayload chaining.
+
+// Injection seam for the fs-qoder-legacy-affinity rows: the affinity placement
+// set a dispatch reads is the plan's own tier, produced by planQoderTurn from
+// the frozen table — so a test-local promoted clone rides that producer's
+// deps.table seam through a pass-through wrapper. With no override set the
+// wrapper is behaviour-identical, which is why the rest of this file's rows
+// run under it unchanged. Same pattern as router.test.ts's counting seam.
+const planTableOverride = vi.hoisted(() => ({ table: undefined as QoderWireCompatData | undefined }));
+vi.mock("../protocol/plan.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../protocol/plan.js")>();
+  type PlanArgs = Parameters<typeof actual.planQoderTurn>;
+  return {
+    ...actual,
+    planQoderTurn: (
+      model: PlanArgs[0],
+      context: PlanArgs[1],
+      options: PlanArgs[2],
+      route: PlanArgs[3],
+      deps?: PlanArgs[4],
+    ) =>
+      actual.planQoderTurn(model, context, options, route, {
+        ...deps,
+        table: planTableOverride.table ?? deps?.table,
+      }),
+  };
+});
 
 const SYSTEM_PROMPT = "You are a coding assistant.";
 
@@ -247,18 +275,25 @@ describe("v2 wire vocabulary (SA rows 1, 8, 9, 10)", () => {
 });
 
 /**
- * stream.ts:326-371 — the legacy body's 24 keys in the shipped order.
+ * stream.ts's legacy body — the 26 keys in the shipped order.
  *
  * COSY hashes whatever bytes it is handed, so a dropped, renamed or reordered
  * key still signs cleanly and nothing downstream notices: the gateway either
  * rejects the turn or silently mis-bills it. Order is part of the pin because
- * the signature is computed over the serialized bytes.
+ * the signature is computed over the serialized bytes. source_session_id is
+ * unconditional identity (fs-qoder-legacy-affinity CU-07), not affinity — the
+ * affinity carriers stay off this list until a probe verdict promotes them.
+ * context_length is appended after the literal (fs-qoder-legacy-context-length:
+ * written onto the post-onPayload resolved payload, like prompt_cache_key), so
+ * it lands after business — the owner promoted the row on 2026-10-04 and this
+ * pin stays exhaustive, 26 names, none silently added or dropped.
  */
 const LEGACY_BODY_KEYS = [
   "request_id",
   "request_set_id",
   "chat_record_id",
   "session_id",
+  "source_session_id",
   "stream",
   "chat_task",
   "is_reply",
@@ -279,6 +314,7 @@ const LEGACY_BODY_KEYS = [
   "chat_context",
   "model_config",
   "business",
+  "context_length",
 ];
 
 /**
@@ -404,15 +440,18 @@ describe("legacy parameters vocabulary (SA rows 2, 8)", () => {
     expect("reasoning_effort" in parameters).toBe(false);
   });
 
-  // T-02 / AC-01: the ordered 24-key body. Element-by-element, so a reorder is
+  // T-02 / AC-01: the ordered 26-key body. Element-by-element, so a reorder is
   // as red as a drop -- the COSY signature is over the serialized bytes.
-  it("sends exactly the 24 legacy body keys, request_id first and business last, in the shipped order", async () => {
+  it("sends exactly the 26 legacy body keys, request_id first and context_length last, in the shipped order", async () => {
     const { body } = await runLegacyCapture({ apiKey: "fake", reasoning: "high" });
     const keys = Object.keys(body);
     expect(keys).toEqual(LEGACY_BODY_KEYS);
-    expect(keys).toHaveLength(24);
+    expect(keys).toHaveLength(26);
     expect(keys[0]).toBe("request_id");
-    expect(keys.at(-1)).toBe("business");
+    expect(keys.at(-1)).toBe("context_length");
+    // A number, never a string or null: v2's top-level form is numeric, and the
+    // tier is the plan's resolution over this fixture's untiered entry.
+    expect(body.context_length).toBe(1_000_000);
   });
 
   // T-03 / AC-01: the merged 25-name header set.
@@ -690,5 +729,344 @@ describe("sampling filter (SA row 7)", () => {
     expect("frequency_penalty" in body).toBe(false);
     expect("seed" in body).toBe(false);
     expect(body.temperature).toBe(0.7);
+  });
+});
+
+/**
+ * Spec fs-qoder-legacy-affinity (SA §3.1 FR-7 / BUG-0007): the legacy cache
+ * affinity surface, probe-gated by the wire-compat table. Every positive here
+ * drives a test-local table clone whose gated string has been moved into the
+ * live row through the plan seam above — the shipped table emits nothing, which
+ * the negative pins already assert, and a promotion is that one-string move
+ * with no adapter edit.
+ */
+describe("legacy cache affinity surface (fs-qoder-legacy-affinity)", () => {
+  afterEach(() => {
+    planTableOverride.table = undefined;
+  });
+
+  /** A clone of the shipped table with `carriers` promoted out of the gated row. */
+  function promotedTable(carriers: string[]): QoderWireCompatData {
+    const table = structuredClone(QODER_WIRE_COMPAT);
+    for (const carrier of carriers) {
+      table.affinityPlacement.push(`legacy:${carrier}`);
+      table.affinityPlacementGated = table.affinityPlacementGated.filter((entry) => entry !== `legacy:${carrier}`);
+    }
+    return table;
+  }
+
+  /**
+   * The wire the gateway actually receives: the encoded body decoded back to
+   * JSON plus the merged header record. The affinity body field is written
+   * AFTER the onPayload hook resolves, so capturing in the hook (the older
+   * harness above) cannot see it — the wire is the only honest observation
+   * point, and the debug request record is its off-wire mirror.
+   */
+  async function runLegacyWire(options: SimpleStreamOptions) {
+    seedLegacyEffortKey();
+    vi.stubEnv("QODER_CORE_PLAN", "1");
+    let init: RequestInit | undefined;
+    const fetch = vi.fn(async (_input: unknown, requestInit?: RequestInit) => {
+      init = requestInit;
+      return new Response(legacySuccess);
+    }) as typeof globalThis.fetch;
+    const result = await streamQoderRouter(modelNamed("DeepSeek-V4-Flash"), context, {
+      ...options,
+      fetch,
+    }).result();
+    expect(result.stopReason).toBe("stop");
+    if (!init) throw new Error("expected the legacy transport to receive a RequestInit");
+    if (!init.headers || !isPlainHeaderRecord(init.headers)) {
+      throw new Error(`expected a plain header record, got: ${String(init.headers)}`);
+    }
+    return { body: decodeWireBody(init.body), headers: init.headers, init };
+  }
+
+  // Same decoder as stream-contract.test.ts (recorded-from: the custom base64
+  // alphabet src/protocol/encoding.js writes). Kept local rather than shared:
+  // a shared helper would live in a test-util file this spec does not own.
+  function decodeWireBody(body: BodyInit | null | undefined): Record<string, unknown> {
+    const custom = "_doRTgHZBKcGVjlvpC,@aFSx#DPuNJme&i*MzLOEn)sUrthbf%Y^w.(kIQyXqWA!";
+    const standard = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const encoded = Buffer.from(body as Uint8Array).toString("utf8");
+    const rearranged = [...encoded].map((c) => (c === "$" ? "=" : standard[custom.indexOf(c)])).join("");
+    const third = Math.floor(rearranged.length / 3);
+    const base64 = rearranged.slice(-third) + rearranged.slice(third, -third) + rearranged.slice(0, third);
+    return JSON.parse(Buffer.from(base64, "base64").toString("utf8"));
+  }
+
+  /** The COSY md5 chain still covers the bytes actually sent (stream-contract's pin). */
+  function expectBodyhashOverSentBytes(run: { headers: Record<string, string>; init: RequestInit }): void {
+    const bytes = Buffer.from(run.init.body as Uint8Array);
+    const headers = new Headers(run.headers);
+    expect(headers.get("Cosy-Bodyhash")).toBe(crypto.createHash("md5").update(bytes).digest("hex"));
+  }
+
+  const WIRE_SESSION = "qoder-session-user-dfmodel-session-aff-1";
+
+  // T-02 / AC-01, AC-02: the body key ships exactly when its row is promoted,
+  // carrying the legacy wire session form — the same value the body's own
+  // session_id carries — inside the bytes COSY signs.
+  it("puts prompt_cache_key on the wire only when its row is promoted, with the body's own session value", async () => {
+    const shipped = await runLegacyWire({ apiKey: "fake", sessionId: "session-aff-1" });
+    expect("prompt_cache_key" in shipped.body).toBe(false);
+
+    planTableOverride.table = promotedTable(["prompt_cache_key"]);
+    const promoted = await runLegacyWire({ apiKey: "fake", sessionId: "session-aff-1" });
+    expect(promoted.body.prompt_cache_key).toBe(WIRE_SESSION);
+    expect(promoted.body.prompt_cache_key).toBe(promoted.body.session_id);
+    expectBodyhashOverSentBytes(promoted);
+  });
+
+  // T-03 / AC-06: the field is written onto the post-hook payload object, so a
+  // host or extension that replaces the body outright cannot silently drop it.
+  it("keeps prompt_cache_key through an onPayload hook that returns a replacement object", async () => {
+    planTableOverride.table = promotedTable(["prompt_cache_key"]);
+    const run = await runLegacyWire({
+      apiKey: "fake",
+      sessionId: "session-aff-1",
+      onPayload: async (value: unknown) => ({ ...(value as Record<string, unknown>) }),
+    });
+    expect(run.body.prompt_cache_key).toBe(WIRE_SESSION);
+    expect(run.body.prompt_cache_key).toBe(run.body.session_id);
+  });
+
+  // T-04 / AC-01, AC-03: the header trio ships exactly when its row is
+  // promoted, unsigned, carrying the body's session value, overridable.
+  it("sends the affinity header trio only when promoted, with the body's session value, and a caller header still wins", async () => {
+    const shipped = await runLegacyWire({ apiKey: "fake", sessionId: "session-aff-1" });
+    const shippedLower = new Set(Object.keys(shipped.headers).map((name) => name.toLowerCase()));
+    for (const name of AFFINITY_HEADER_NAMES) {
+      expect(shippedLower.has(name), `unpromoted legacy must not send the ${name} header`).toBe(false);
+    }
+
+    planTableOverride.table = promotedTable(["header-x-session-id"]);
+    const promoted = await runLegacyWire({ apiKey: "fake", sessionId: "session-aff-1" });
+    for (const name of AFFINITY_HEADER_NAMES) {
+      expect(promoted.headers[name], `${name} carries the wire session value`).toBe(WIRE_SESSION);
+    }
+    expectBodyhashOverSentBytes(promoted);
+
+    const overridden = await runLegacyWire({
+      apiKey: "fake",
+      sessionId: "session-aff-1",
+      headers: { "X-Session-Affinity": "custom-affinity" },
+    });
+    expect(overridden.headers["x-session-affinity"]).toBe("custom-affinity");
+    expect(overridden.headers["x-client-request-id"]).toBe(WIRE_SESSION);
+  });
+
+  // T-05 / AC-04: retention none omits the body field and the header trio
+  // independently, mirroring v2's two separate gates.
+  it("omits the body field and the header trio independently under cacheRetention none", async () => {
+    planTableOverride.table = promotedTable(["prompt_cache_key", "header-x-session-id"]);
+
+    const none = await runLegacyWire({ apiKey: "fake", sessionId: "session-aff-1", cacheRetention: "none" });
+    expect("prompt_cache_key" in none.body).toBe(false);
+    const noneLower = new Set(Object.keys(none.headers).map((name) => name.toLowerCase()));
+    for (const name of AFFINITY_HEADER_NAMES) {
+      expect(noneLower.has(name), `retention none must omit the ${name} header`).toBe(false);
+    }
+
+    const kept = await runLegacyWire({ apiKey: "fake", sessionId: "session-aff-1" });
+    expect(kept.body.prompt_cache_key).toBe(WIRE_SESSION);
+    for (const name of AFFINITY_HEADER_NAMES) {
+      expect(kept.headers[name]).toBe(WIRE_SESSION);
+    }
+  });
+
+  // T-06 / AC-07: the kill switch empties the placement set at request time,
+  // so one environment change stops every affinity field on the next dispatch.
+  it("suppresses every legacy affinity placement when QODER_LEGACY_AFFINITY is off", async () => {
+    planTableOverride.table = promotedTable(["prompt_cache_key", "header-x-session-id"]);
+
+    const off = await runLegacyWire({
+      apiKey: "fake",
+      sessionId: "session-aff-1",
+      env: { QODER_LEGACY_AFFINITY: "off" },
+    });
+    expect("prompt_cache_key" in off.body).toBe(false);
+    const offLower = new Set(Object.keys(off.headers).map((name) => name.toLowerCase()));
+    for (const name of AFFINITY_HEADER_NAMES) {
+      expect(offLower.has(name), `kill switch must suppress the ${name} header`).toBe(false);
+    }
+
+    const on = await runLegacyWire({ apiKey: "fake", sessionId: "session-aff-1" });
+    expect(on.body.prompt_cache_key).toBe(WIRE_SESSION);
+    for (const name of AFFINITY_HEADER_NAMES) {
+      expect(on.headers[name]).toBe(WIRE_SESSION);
+    }
+
+    // The process.env arm of the same knob: a shell export reaches dispatches
+    // whose options carry no provider env — the file's established dual read.
+    vi.stubEnv("QODER_LEGACY_AFFINITY", "off");
+    const offByProcessEnv = await runLegacyWire({ apiKey: "fake", sessionId: "session-aff-1" });
+    vi.unstubAllEnvs();
+    expect("prompt_cache_key" in offByProcessEnv.body).toBe(false);
+    const offProcessLower = new Set(Object.keys(offByProcessEnv.headers).map((name) => name.toLowerCase()));
+    for (const name of AFFINITY_HEADER_NAMES) {
+      expect(offProcessLower.has(name), `process.env off must suppress the ${name} header`).toBe(false);
+    }
+  });
+
+  // T-08 / AC-10: legacy carries the session identity twice, as v2 and
+  // qodercli do — unconditionally, because it is identity rather than cache
+  // affinity — with the hashed long-session form matching session_id too.
+  it("carries source_session_id equal to session_id, readable and hashed alike", async () => {
+    const short = await runLegacyWire({ apiKey: "fake", sessionId: "session-identity-1" });
+    expect(short.body.source_session_id).toBe(short.body.session_id);
+    expect(short.body.source_session_id).toBe("qoder-session-user-dfmodel-session-identity-1");
+    expectBodyhashOverSentBytes(short);
+
+    const hashed = await runLegacyWire({ apiKey: "fake", sessionId: "s".repeat(80) });
+    expect(hashed.body.source_session_id).toBe(hashed.body.session_id);
+    expect(hashed.body.source_session_id).toMatch(/^qoder-session-[0-9a-f]{16}$/);
+  });
+});
+
+/**
+ * Spec fs-qoder-legacy-context-length (SA §3.3 OB-10 / §5.4): the legacy wire
+ * carries the context tier the plan resolved, as a top-level number — the
+ * owner promoted the row on 2026-10-04, so the shipped table emits and these
+ * rows observe the encoded body the gateway actually receives. The plan is
+ * the single producer (AC-06): the adapter resolves nothing itself, and the
+ * gate-off arm calls the same shared resolver over the same catalog entry.
+ */
+describe("legacy context tier (fs-qoder-legacy-context-length)", () => {
+  // invented: the tier set the plan/v2 fixtures seed — 200K is_default, 400K,
+  // 1M — so the plan rows, the v2 rows and these legacy rows hold one fixture
+  // set and a tier value is attributable to exactly one resolution rule.
+  const TIERS = {
+    "200K": { token_count: 200_000, is_default: true },
+    "400K": { token_count: 400_000 },
+    "1M": { token_count: 1_000_000 },
+  } as const;
+
+  function seedLegacyTieredKey(contextConfig: Record<string, { token_count?: number; is_default?: boolean }>) {
+    seedCache({
+      "DeepSeek-V4-Flash": {
+        key: "dfmodel",
+        enable: true,
+        display_name: "DeepSeek-V4-Flash",
+        is_reasoning: true,
+        thinking_config: { enabled: { efforts: { low: {}, high: {}, max: {} } } },
+        context_config: contextConfig,
+      },
+    });
+  }
+
+  /** The wire the gateway receives: the encoded body decoded back to JSON. */
+  async function runLegacyTierWire(
+    model: Model<Api>,
+    options: SimpleStreamOptions,
+    gate: "on" | "off" = "on",
+    contextConfig: Record<string, { token_count?: number; is_default?: boolean }> = TIERS,
+  ) {
+    seedLegacyTieredKey(contextConfig);
+    vi.stubEnv("QODER_CORE_PLAN", gate === "on" ? "1" : "");
+    let init: RequestInit | undefined;
+    const fetch = vi.fn(async (_input: unknown, requestInit?: RequestInit) => {
+      init = requestInit;
+      return new Response(legacySuccess);
+    }) as typeof globalThis.fetch;
+    const result = await streamQoderRouter(model, context, {
+      apiKey: "fake",
+      sessionId: "session-ctx-1",
+      ...options,
+      fetch,
+    }).result();
+    expect(result.stopReason).toBe("stop");
+    if (!init) throw new Error("expected the legacy transport to receive a RequestInit");
+    return { body: decodeWireBody(init.body), init };
+  }
+
+  // Same decoder as the affinity describe above (recorded-from: the custom
+  // base64 alphabet src/protocol/encoding.js writes). Kept per-describe rather
+  // than hoisted: hoisting would edit the affinity spec's block in a file the
+  // set shares append-only, and a shared helper would live in a test-util file
+  // this spec does not own.
+  function decodeWireBody(body: BodyInit | null | undefined): Record<string, unknown> {
+    const custom = "_doRTgHZBKcGVjlvpC,@aFSx#DPuNJme&i*MzLOEn)sUrthbf%Y^w.(kIQyXqWA!";
+    const standard = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const encoded = Buffer.from(body as Uint8Array).toString("utf8");
+    const rearranged = [...encoded].map((c) => (c === "$" ? "=" : standard[custom.indexOf(c)])).join("");
+    const third = Math.floor(rearranged.length / 3);
+    const base64 = rearranged.slice(-third) + rearranged.slice(third, -third) + rearranged.slice(0, third);
+    return JSON.parse(Buffer.from(base64, "base64").toString("utf8"));
+  }
+
+  const tieredModel = (contextWindow: number): Model<Api> =>
+    ({ ...modelNamed("DeepSeek-V4-Flash"), contextWindow }) as Model<Api>;
+
+  // T-02 / AC-01, AC-02, AC-03: the tier on the wire is the plan's resolution —
+  // the owner's override when it matches a tier, the catalog's is_default tier
+  // when it does not (never the largest advertised), the model's own window
+  // when no tier table governs, and no member at all rather than null or zero
+  // when no tier resolves.
+  it("carries the plan's resolved context tier as a top-level number", async () => {
+    // A /qoder-context-style override matching the 1M tier.
+    const overridden = await runLegacyTierWire(tieredModel(1_000_000), { reasoning: "high" });
+    expect(overridden.body.context_length).toBe(1_000_000);
+
+    // No override: the model's registered window is the 1M default, which
+    // matches the 1M tier — pi resolves it with no override involved.
+    const unoverridden = await runLegacyTierWire(modelNamed("DeepSeek-V4-Flash"), { reasoning: "high" });
+    expect(unoverridden.body.context_length).toBe(1_000_000);
+
+    // An override matching no tier yields the is_default tier — never the
+    // largest advertised one.
+    const mismatched = await runLegacyTierWire(tieredModel(123_456), { reasoning: "high" });
+    expect(mismatched.body.context_length).toBe(200_000);
+  });
+
+  // T-02 / AC-03: undefined omits the member entirely — no null, no zero.
+  it("omits context_length when no tier is marked default", async () => {
+    const run = await runLegacyTierWire(tieredModel(123_456), {}, "on", {
+      "200K": { token_count: 200_000 },
+      "1M": { token_count: 1_000_000 },
+    });
+    expect("context_length" in run.body).toBe(false);
+  });
+
+  // T-03 / AC-04: one environment value disables the tier at request time, on
+  // the next dispatch of a running process — both read arms of the knob.
+  it("removes the tier when QODER_LEGACY_CONTEXT_LENGTH is off, and emits it when unset", async () => {
+    const model = tieredModel(1_000_000);
+    const off = await runLegacyTierWire(model, {
+      env: { QODER_LEGACY_CONTEXT_LENGTH: "off" },
+    });
+    expect("context_length" in off.body).toBe(false);
+
+    const on = await runLegacyTierWire(model, {});
+    expect(on.body.context_length).toBe(1_000_000);
+
+    // The process.env arm: a shell export reaches dispatches whose options
+    // carry no provider env — the file's established dual read.
+    vi.stubEnv("QODER_LEGACY_CONTEXT_LENGTH", "off");
+    const offByProcessEnv = await runLegacyTierWire(model, {});
+    vi.unstubAllEnvs();
+    expect("context_length" in offByProcessEnv.body).toBe(false);
+  });
+
+  // T-04 / AC-03, AC-06: the plan gate changes where the tier comes from and
+  // never what is sent — the gate-off fallback resolves the identical value
+  // over the same catalog entry, so one model and window produce one wire.
+  it("emits the identical tier with QODER_CORE_PLAN on and off", async () => {
+    const model = tieredModel(123_456);
+    const gated = await runLegacyTierWire(model, {}, "on");
+    const inline = await runLegacyTierWire(model, {}, "off");
+    expect(gated.body.context_length).toBe(200_000);
+    expect(inline.body.context_length).toBe(200_000);
+    expect(inline.body.context_length).toBe(gated.body.context_length);
+  });
+
+  // The member is written onto the post-hook payload object, so a host or
+  // extension that replaces the body outright cannot silently drop it — the
+  // same placement property the affinity body field pins (affinity T-03).
+  it("keeps the tier through an onPayload hook that returns a replacement object", async () => {
+    const run = await runLegacyTierWire(tieredModel(1_000_000), {
+      onPayload: async (value: unknown) => ({ ...(value as Record<string, unknown>) }),
+    });
+    expect(run.body.context_length).toBe(1_000_000);
   });
 });

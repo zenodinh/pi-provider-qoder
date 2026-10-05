@@ -1,9 +1,13 @@
 import crypto from "node:crypto";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { type Api, type Model, normalizeContext, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cacheQoderIdentityForTest, clearQoderAuthMemCache } from "../auth/oauth.js";
 import { staticModels } from "../catalog.js";
 import { streamQoder } from "../protocol/stream.js";
+import { readDebugRecords } from "./debug-sink.js";
 
 const model = staticModels.find((model) => model.id === "Lite") as Model<Api>;
 const context = normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: 0 }] });
@@ -276,5 +280,272 @@ describe("pi request contract", () => {
       ),
     });
     expect(result.usage.totalTokens).toBe(12);
+  });
+});
+
+/**
+ * Spec qoder-capture-neutrality T-02/T-03 — FR-8's failure condition stated as a
+ * positive (AC-01, AC-03, AC-05, AC-06).
+ *
+ * Every body-lifecycle shape above is re-run with QODER_DEBUG stubbed ON and the
+ * observable must not move. These are the rows BUG-0009 turned red in the owner's
+ * own shell: the fetch wrapper tee'd the body before `onResponse` ran and
+ * re-wrapped the Response, so the hook saw a locked stream and teardown
+ * cancelled twice. Capture now rides the read loop, so both states are one run.
+ *
+ * setup.ts scrubs the ambient QODER_* family; setup.test.ts:87-94 pins that
+ * vi.stubEnv survives that scrub, which is what makes the two states expressible
+ * inside one hermetic suite rather than depending on an operator's shell.
+ */
+describe("capture neutrality (QODER_DEBUG off vs on)", () => {
+  // `recordsBody` is false where the transport never reads a byte of the body, so
+  // consumer-side capture has nothing to record in EITHER state. Asserting a
+  // record there would be asserting the very drain this spec removes.
+  const shapes: {
+    name: string;
+    recordsBody: boolean;
+    sseContains?: string;
+    run(sessionId: string): Promise<Record<string, unknown>>;
+  }[] = [
+    {
+      name: "cleans up the response when onResponse throws",
+      recordsBody: false,
+      async run(sessionId) {
+        const cancel = vi.fn();
+        const response = new Response(new ReadableStream({ cancel }));
+        const seen: Record<string, unknown> = {};
+        const result = await run({
+          sessionId,
+          fetch: vi.fn(async (input: unknown) => {
+            seen.requestedUrl = String(input);
+            return response;
+          }),
+          onResponse() {
+            // AC-01: the hook must see the inner fetch's own body, unlocked.
+            seen.bodyLockedInHook = response.body?.locked;
+            seen.bodyUsedInHook = response.bodyUsed;
+            throw new Error("hook failure");
+          },
+        });
+        return {
+          ...seen,
+          cancelCalls: cancel.mock.calls.length,
+          errorMessage: result.errorMessage,
+          stopReason: result.stopReason,
+        };
+      },
+    },
+    {
+      name: "releases a stalled HTTP error body on timeout",
+      recordsBody: false,
+      async run(sessionId) {
+        const cancel = vi.fn();
+        const result = await run({
+          sessionId,
+          timeoutMs: 20,
+          fetch: vi.fn(async () => new Response(new ReadableStream({ cancel }), { status: 500 })),
+        });
+        return {
+          cancelCalls: cancel.mock.calls.length,
+          errorMessage: result.errorMessage,
+          stopReason: result.stopReason,
+        };
+      },
+    },
+    {
+      name: "cancels an open body and its pending delta timer",
+      recordsBody: true,
+      sseContains: "partial",
+      async run(sessionId) {
+        const controller = new AbortController();
+        const cancel = vi.fn();
+        const seen: Record<string, unknown> = {};
+        const stream = streamQoder(model, context, {
+          apiKey: "fake",
+          sessionId,
+          signal: controller.signal,
+          fetch: vi.fn(async (input: unknown) => {
+            seen.requestedUrl = String(input);
+            return new Response(
+              new ReadableStream({
+                start(c) {
+                  c.enqueue(new TextEncoder().encode(text("partial")));
+                },
+                cancel,
+              }),
+            );
+          }),
+        });
+        const events: string[] = [];
+        for await (const event of stream) {
+          events.push(event.type);
+          if (event.type === "text_start") controller.abort(new Error("cancelled"));
+        }
+        const result = await stream.result();
+        return { ...seen, events, cancelCalls: cancel.mock.calls.length, stopReason: result.stopReason };
+      },
+    },
+    {
+      name: "records an HTTP error body the transport reads itself",
+      recordsBody: true,
+      sseContains: "rate limited",
+      async run(sessionId) {
+        const cancel = vi.fn();
+        const seen: Record<string, unknown> = {};
+        const result = await run({
+          sessionId,
+          // A COMPLETE error body, unlike the stalled one above: the transport
+          // reads it itself in readResponseText and never reaches the read loop,
+          // so this is the path where consumer-side capture has no loop to ride.
+          fetch: vi.fn(async (input: unknown) => {
+            seen.requestedUrl = String(input);
+            return new Response(
+              new ReadableStream({
+                start(c) {
+                  c.enqueue(new TextEncoder().encode("rate limited"));
+                  c.close();
+                },
+                cancel,
+              }),
+              { status: 429 },
+            );
+          }),
+        });
+        return {
+          ...seen,
+          cancelCalls: cancel.mock.calls.length,
+          errorMessage: result.errorMessage,
+          stopReason: result.stopReason,
+        };
+      },
+    },
+    {
+      name: "invokes onResponse before consuming a complete stream",
+      recordsBody: true,
+      sseContains: "[DONE]",
+      async run(sessionId) {
+        const response = new Response(success, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        });
+        const seen: Record<string, unknown> = {};
+        const result = await run({
+          sessionId,
+          fetch: vi.fn(async (input: unknown) => {
+            seen.requestedUrl = String(input);
+            return response;
+          }),
+          onResponse: async () => {
+            seen.bodyLockedInHook = response.body?.locked;
+            seen.bodyUsedInHook = response.bodyUsed;
+          },
+        });
+        return {
+          ...seen,
+          stopReason: result.stopReason,
+          answer: result.content.map((block) => (block.type === "text" ? block.text : "")).join(""),
+        };
+      },
+    },
+  ];
+
+  let debugDir: string;
+
+  beforeEach(() => {
+    debugDir = mkdtempSync(join(tmpdir(), "qoder-neutral-"));
+    vi.stubEnv("QODER_DEBUG_DIR", debugDir);
+  });
+
+  for (const shape of shapes) {
+    it(`T-02 ${shape.name} — identical with capture off and on`, async () => {
+      const observed: Record<string, unknown>[] = [];
+      const sessions: string[] = [];
+      for (const debug of ["", "1"]) {
+        vi.stubEnv("QODER_DEBUG", debug);
+        const sessionId = debug === "1" ? "neutral-on" : "neutral-off";
+        sessions.push(sessionId);
+        observed.push(await shape.run(sessionId));
+      }
+      const [off, on] = observed;
+      // FR-8's failure condition, negated: no observable differs between states.
+      expect(on).toEqual(off);
+
+      const responses = (session: string) =>
+        readDebugRecords(debugDir, session).filter((record) => record.type === "response");
+      expect(responses(sessions[0])).toHaveLength(0);
+      if (!shape.recordsBody) {
+        expect(responses(sessions[1])).toHaveLength(0);
+        return;
+      }
+      await vi.waitFor(() => {
+        expect(responses(sessions[1])).toHaveLength(1);
+      });
+      const record = responses(sessions[1])[0];
+      expect(record?.protocol).toBe("legacy");
+      // The record names the REQUEST url — the field's pre-relocation value. A
+      // constructed Response reads back url === "", so this catches sourcing it
+      // from a wrapper instead of the request.
+      expect(record?.url).toBe(off?.requestedUrl);
+      expect(String(record?.sse)).toContain(shape.sseContains ?? "");
+    });
+  }
+
+  it("T-03 an aborted turn records the prefix it saw and cancels exactly once", async () => {
+    vi.stubEnv("QODER_DEBUG", "1");
+    const sessionId = "neutral-abort-prefix";
+    const controller = new AbortController();
+    const cancel = vi.fn();
+    // invented: the body yields `prefix` on the first read and then stalls, so no
+    // second read ever resolves. Bytes past the prefix are unreachable by
+    // construction, which is what makes "prefix, not full body" falsifiable.
+    const prefix = text("partial");
+    const stream = streamQoder(model, context, {
+      apiKey: "fake",
+      sessionId,
+      signal: controller.signal,
+      fetch: vi.fn(
+        async () =>
+          new Response(
+            new ReadableStream({
+              start(c) {
+                c.enqueue(new TextEncoder().encode(prefix));
+              },
+              cancel,
+            }),
+          ),
+      ),
+    });
+    for await (const event of stream) {
+      if (event.type === "text_start") controller.abort(new Error("cancelled"));
+    }
+    expect((await stream.result()).stopReason).toBe("aborted");
+    // Exactly one cancel: recording the prefix must not also drain the body.
+    expect(cancel).toHaveBeenCalledTimes(1);
+
+    await vi.waitFor(() => {
+      expect(readDebugRecords(debugDir, sessionId).filter((record) => record.type === "response")).toHaveLength(1);
+    });
+    const record = readDebugRecords(debugDir, sessionId).find((r) => r.type === "response");
+    // Not nothing, and not a drain: the body was cancelled before EOF, yet the
+    // record holds exactly the prefix the read loop decoded.
+    expect(record?.sse).toBe(prefix);
+    expect(record?.truncated).toBe(false);
+  });
+
+  it("T-02b a body-less response is recorded exactly once, by the wrapper", async () => {
+    vi.stubEnv("QODER_DEBUG", "1");
+    const sessionId = "neutral-bodyless";
+    const result = await run({
+      sessionId,
+      fetch: vi.fn(async () => new Response(null, { status: 500 })),
+    });
+    expect(result.stopReason).toBe("error");
+    const responses = readDebugRecords(debugDir, sessionId).filter((record) => record.type === "response");
+    // Exactly one record, in the wrapper's body-less shape: no sse field at all.
+    // A second record here would mean a consumer-side capture fired on a body it
+    // never read — the double-write the response.body gate exists to prevent.
+    expect(responses).toHaveLength(1);
+    expect(responses[0]?.status).toBe(500);
+    expect("sse" in (responses[0] as Record<string, unknown>)).toBe(false);
   });
 });

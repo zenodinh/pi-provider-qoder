@@ -1,9 +1,11 @@
 import type { Message } from "@earendil-works/pi-ai";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   classifyTurnKind,
+  clearQoderRealTurnClock,
   clearQoderRunRegistry,
   isRunContinuation,
+  lastRealRequestAt,
   type QoderRunBusiness,
   type QoderRunIdentity,
   type QoderRunMessage,
@@ -333,5 +335,61 @@ describe("classifyTurnKind", () => {
     expect(classifyTurnKind(0)).toBe("real");
     expect(classifyTurnKind(2)).toBe("real");
     expect(classifyTurnKind("1" as unknown as number)).toBe("real");
+  });
+});
+
+/**
+ * fs-qoder-guard-governance T-10 / AC-05 / AC-06 / AC-07 — the real-turn clock
+ * the warm guard's miss ceiling reads. It rides resolveRunIdentity because both
+ * adapters already call it exactly once per dispatch with `turnKind` resolved, so
+ * neither adapter is edited (OD-D). A warm replay that advanced the clock would
+ * empty the guard's since-last-real-dispatch span and make the ceiling dead code
+ * that looks alive.
+ */
+describe("real-turn clock (T-10, AC-05/AC-06/AC-07)", () => {
+  beforeEach(() => {
+    clearQoderRunRegistry();
+    clearQoderRealTurnClock();
+    // Date only: the assertions are about timestamps, and faking the timer
+    // functions would fake the runner's own scheduling (stream.test.ts idiom).
+    vi.useFakeTimers({ toFake: ["Date"] });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("stamps on a real dispatch only, and the test-only clearer unstamps it", () => {
+    // invented: an epoch-millisecond ladder, one minute apart, so each movement
+    // has a distinct expected stamp rather than a >= comparison.
+    expect(lastRealRequestAt(), "a process that dispatched no real turn").toBeUndefined();
+
+    vi.setSystemTime(1_700_000_000_000);
+    request([user("first prompt")]);
+    expect(lastRealRequestAt()).toBe(1_700_000_000_000);
+
+    // A warm replay over the established slot leaves the stamp exactly as it was.
+    vi.setSystemTime(1_700_000_060_000);
+    request([user("first prompt")], "first prompt", "warm");
+    expect(lastRealRequestAt(), "a warm replay advanced the clock").toBe(1_700_000_000_000);
+
+    // Neither does a warm MISS, which mints an ephemeral identity for a turn
+    // nobody sent and registers nothing.
+    clearQoderRunRegistry();
+    request([user("first prompt")], "first prompt", "warm");
+    expect(lastRealRequestAt(), "an unregistered warm identity advanced the clock").toBe(1_700_000_000_000);
+
+    // The next real dispatch re-stamps: a rotating identity stamps too.
+    vi.setSystemTime(1_700_000_120_000);
+    request([user("second prompt")]);
+    expect(lastRealRequestAt()).toBe(1_700_000_120_000);
+
+    // And so does a real turn that CONTINUES the run rather than rotating it.
+    vi.setSystemTime(1_700_000_180_000);
+    request([user("second prompt"), assistantWithTools(["call-1"]), toolResult("call-1")]);
+    expect(lastRealRequestAt()).toBe(1_700_000_180_000);
+
+    clearQoderRealTurnClock();
+    expect(lastRealRequestAt()).toBeUndefined();
   });
 });

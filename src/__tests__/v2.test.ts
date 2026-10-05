@@ -15,12 +15,15 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cacheQoderIdentityForTest, clearQoderAuthMemCache } from "../auth/oauth.js";
 import { clearQoderModelsMemCache, staticModels } from "../catalog.js";
+import { clearPrefixChainRegistry } from "../protocol/prefix-chain.js";
 import { streamQoderRouter } from "../protocol/router.js";
 import { clearQoderFallbackCache, clearQoderRoutingMemCache, isMarkedLegacyOnly } from "../protocol/routing.js";
 import { clearQoderRunRegistry } from "../protocol/run-identity.js";
 import { clearQoderFilterMemCache } from "../protocol/sampling.js";
+import { streamQoder } from "../protocol/stream.js";
 import { streamQoderV2 } from "../protocol/v2.js";
 import { readDebugRecords } from "./debug-sink.js";
+import { OVERSIZED_TEXT } from "./sse-fixtures.js";
 
 const context = normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: 0 }] });
 // A completed tool round in the raw pi shape, so the run continuation predicate
@@ -296,6 +299,61 @@ describe("v2 field injector", () => {
     expect(bodyOf(b.calls, 0).context_length).toBe(200000);
   });
 
+  /**
+   * Spec fs-qoder-context-window-plan CU-04, T-04 (AC-04, AC-05) — the
+   * pure-refactor bar. The tier moved from a v2-local function to the plan
+   * producer; for the same fixtures the emitted context values must be
+   * byte-identical in BOTH gate states, and the omit case must omit both keys.
+   */
+  it("emits byte-identical context values with QODER_CORE_PLAN on and off (T-04/AC-04, AC-05)", async () => {
+    for (const gate of ["", "1"]) {
+      vi.stubEnv("QODER_CORE_PLAN", gate);
+      seedCatalogWithTiers();
+      clearQoderFallbackCache();
+      clearQoderRoutingMemCache();
+
+      // The matched override: both emitted forms carry 400000.
+      const overridden = { ...modelNamed("Ultimate"), contextWindow: 400000 } as Model<Api>;
+      const a = v2FetchCapture();
+      await streamQoderRouter(overridden, context, { apiKey: "fake", fetch: a.fetch, sessionId: "sess-gate" }).result();
+      expect(bodyOf(a.calls, 0).context_length).toBe(400000);
+      expect((bodyOf(a.calls, 0).metadata as { context: Record<string, unknown> }).context.context_length).toBe(
+        "400000",
+      );
+
+      // The mismatched override: the is_default tier, 200000, both forms.
+      const mismatched = { ...modelNamed("Ultimate"), contextWindow: 123456 } as Model<Api>;
+      const b = v2FetchCapture();
+      await streamQoderRouter(mismatched, context, { apiKey: "fake", fetch: b.fetch, sessionId: "sess-gate" }).result();
+      expect(bodyOf(b.calls, 0).context_length).toBe(200000);
+      expect((bodyOf(b.calls, 0).metadata as { context: Record<string, unknown> }).context.context_length).toBe(
+        "200000",
+      );
+
+      // The omit case: a model whose entry declares no tiers and whose window
+      // is unset carries NEITHER key in either gate state.
+      const windowless = { ...modelNamed("Ultimate"), contextWindow: undefined } as unknown as Model<Api>;
+      writeFileSync(
+        cachePath(),
+        JSON.stringify({
+          updatedAt: Date.now(),
+          models: [],
+          configs: { Ultimate: { key: "ultimate", enable: true, display_name: "Ultimate" } },
+        }),
+        "utf8",
+      );
+      clearQoderModelsMemCache();
+      clearQoderFallbackCache();
+      clearQoderRoutingMemCache();
+      const c = v2FetchCapture();
+      await streamQoderRouter(windowless, context, { apiKey: "fake", fetch: c.fetch, sessionId: "sess-gate" }).result();
+      expect("context_length" in bodyOf(c.calls, 0)).toBe(false);
+      expect("context_length" in (bodyOf(c.calls, 0).metadata as { context: Record<string, unknown> }).context).toBe(
+        false,
+      );
+    }
+  });
+
   it("sends enable_thinking:false when the level is unset or clamps to off", async () => {
     const { calls, fetch } = v2FetchCapture();
     // Efficient is reasoning:false in the static seed, so "high" clamps to off.
@@ -469,6 +527,90 @@ describe("fragmented SSE repair", () => {
     expect(terminal.type).toBe("error");
     expect(String(terminal.error?.errorMessage)).toContain("invalid_model_error");
   });
+
+  /**
+   * Spec qoder-capture-neutrality T-04 (AC-02, AC-04) — the v2 half of FR-8.
+   *
+   * The same fragmented fixture is driven twice, capture off then on. Capture
+   * rides reframe's existing transform rather than adding a Response layer, so
+   * the repaired framing and the terminal message must be identical in both
+   * states; the only difference is that the on-run leaves a record behind.
+   */
+  it("repairs a fragmented stream identically with capture off and on, recording once", async () => {
+    seedCatalogWithTiers();
+    const runs: { stopReason: string; text: string; dir: string }[] = [];
+    for (const debug of ["", "1"]) {
+      const dir = mkdtempSync(join(tmpdir(), "qoder-v2-neutral-"));
+      vi.stubEnv("QODER_DEBUG", debug);
+      vi.stubEnv("QODER_DEBUG_DIR", dir);
+      clearQoderFallbackCache();
+      clearQoderRoutingMemCache();
+      const fetch = vi.fn(async () => sseResponse(fixture, 7)) as unknown as typeof globalThis.fetch;
+      const result = await streamQoderRouter(modelNamed("Ultimate"), context, {
+        apiKey: "fake",
+        fetch,
+        sessionId: "sess-v2-neutral",
+      }).result();
+      runs.push({ stopReason: result.stopReason, text: answerText(result), dir });
+    }
+    const [off, on] = runs;
+    // Neutrality: one repaired event sequence and one terminal message, whatever
+    // the capture state — and both equal the fixture's known-good answer.
+    expect(off.stopReason).toBe("toolUse");
+    expect(on.stopReason).toBe(off.stopReason);
+    expect(on.text).toBe(off.text);
+    expect(on.text).toBe(EXPECTED_TEXT);
+
+    // Capture off writes nothing; capture on writes exactly one response record,
+    // holding the raw pre-repair bytes the transform decoded.
+    expect(readDebugRecords(off.dir, "sess-v2-neutral").filter((r) => r.type === "response")).toHaveLength(0);
+    await vi.waitFor(() => {
+      expect(readDebugRecords(on.dir, "sess-v2-neutral").filter((r) => r.type === "response")).toHaveLength(1);
+    });
+    const record = readDebugRecords(on.dir, "sess-v2-neutral").find((r) => r.type === "response");
+    expect(record?.protocol).toBe("v2");
+    expect(record?.status).toBe(200);
+    expect(String(record?.sse)).toContain("[DONE]");
+    expect(record?.truncated).toBe(false);
+  });
+
+  /**
+   * Spec qoder-capture-neutrality CU-03 — the overflow throw must still fire and
+   * must not be swallowed by the accumulator, and the record must survive it.
+   * An errored TransformStream runs neither flush nor cancel, so the prefix is
+   * recorded before the throw or not at all — and this is precisely the turn an
+   * operator enabled QODER_DEBUG to diagnose.
+   */
+  it("still records a capped prefix when the reframe buffer overflows", async () => {
+    seedCatalogWithTiers();
+    const dir = mkdtempSync(join(tmpdir(), "qoder-v2-overflow-"));
+    vi.stubEnv("QODER_DEBUG", "1");
+    vi.stubEnv("QODER_DEBUG_DIR", dir);
+    const fetch = vi.fn(async () => sseResponse(OVERSIZED_TEXT)) as unknown as typeof globalThis.fetch;
+    const events: AssistantMessageEvent[] = [];
+    const stream = streamQoderRouter(modelNamed("Ultimate"), context, {
+      apiKey: "fake",
+      fetch,
+      sessionId: "sess-v2-overflow",
+    });
+    for await (const event of stream) events.push(event);
+    const terminal = events.at(-1) as { type: string; error?: { errorMessage?: string } };
+    // The throw still reaches a terminal error: the accumulator neither swallows
+    // it nor degrades it into a silent truncation.
+    expect(terminal.type).toBe("error");
+    expect(String(terminal.error?.errorMessage)).toContain("reframe buffer exceeded");
+
+    await vi.waitFor(() => {
+      expect(readDebugRecords(dir, "sess-v2-overflow").filter((r) => r.type === "response")).toHaveLength(1);
+    });
+    const record = readDebugRecords(dir, "sess-v2-overflow").find((r) => r.type === "response");
+    expect(record?.protocol).toBe("v2");
+    expect(record?.status).toBe(200);
+    // Exactly the default cap, and flagged: the accumulator bounds MEMORY as
+    // well as disk, so an 8 MB body never lands in `text` to be capped later.
+    expect(String(record?.sse)).toHaveLength(2_000_000);
+    expect(record?.truncated).toBe(true);
+  });
 });
 
 describe("self-heal", () => {
@@ -553,6 +695,71 @@ describe("self-heal", () => {
     expect(events.at(-1)?.type).toBe("error");
     expect(urls).toHaveLength(1);
     expect(isMarkedLegacyOnly("ultimate")).toBe(false);
+  });
+
+  /**
+   * Spec qoder-capture-neutrality T-05 (CU-04, AC-04, AC-06) — SA §7.10 OD-F.
+   *
+   * `createReframedFetch` hands a non-event-stream response back without
+   * reframing it, so a capture living only inside the reframe transform would
+   * never see this 400 `invalid_model_error` body — which is exactly the
+   * evidence the self-heal branch reads to decide, and that the FS-G probe
+   * collects. The record set must be identical before and after the relocation,
+   * and the branch must decide identically in both capture states.
+   */
+  it("records a non-SSE 400 while the self-heal branch still reads the same body", async () => {
+    seedCatalogWithTiers();
+    const runs: { stopReason: string; urls: string[]; dir: string }[] = [];
+    for (const debug of ["", "1"]) {
+      const dir = mkdtempSync(join(tmpdir(), "qoder-v2-400-"));
+      vi.stubEnv("QODER_DEBUG", debug);
+      vi.stubEnv("QODER_DEBUG_DIR", dir);
+      // The first run marks the key legacy-only, which would suppress the second
+      // run's v2 attempt entirely; clear so both states dispatch identically.
+      clearQoderFallbackCache();
+      clearQoderRoutingMemCache();
+      const urls: string[] = [];
+      const fetch = vi.fn(async (input: unknown) => {
+        const url = String(input);
+        urls.push(url);
+        if (url.includes("chat/completions")) return invalidModelResponse();
+        return new Response(legacySuccess);
+      }) as typeof globalThis.fetch;
+      const result = await streamQoderRouter(modelNamed("Ultimate"), context, {
+        apiKey: "fake",
+        fetch,
+        sessionId: "sess-v2-400",
+        env: { QODER_FALLBACK: "1" },
+      } as SimpleStreamOptions).result();
+      runs.push({ stopReason: result.stopReason, urls, dir });
+    }
+    const [off, on] = runs;
+    // The 400 body stayed readable by the self-heal branch in both states, so
+    // the turn healed to legacy exactly once, from the same two dispatches.
+    for (const run of runs) {
+      expect(run.stopReason).toBe("stop");
+      expect(run.urls).toHaveLength(2);
+      expect(run.urls[0]).toBe("https://api2-v2.qoder.sh/model/v1/chat/completions");
+      expect(run.urls[1]).toContain("agent_chat_generation");
+    }
+
+    const v2Responses = (dir: string) =>
+      readDebugRecords(dir, "sess-v2-400").filter((r) => r.type === "response" && r.protocol === "v2");
+    expect(v2Responses(off.dir)).toHaveLength(0);
+    await vi.waitFor(() => {
+      expect(v2Responses(on.dir)).toHaveLength(1);
+    });
+    const record = v2Responses(on.dir)[0];
+    expect(record?.status).toBe(400);
+    expect(String(record?.sse)).toContain("invalid_model_error");
+    expect(record?.truncated).toBe(false);
+    // The url is the REQUEST url: a constructed Response reads back url === "",
+    // so this pin is what proves the wrapper did not source the field from itself.
+    expect(record?.url).toBe(off.urls[0]);
+    // The healed legacy turn recorded too — the relocation shrank neither half.
+    expect(
+      readDebugRecords(on.dir, "sess-v2-400").filter((r) => r.type === "response" && r.protocol === "legacy"),
+    ).toHaveLength(1);
   });
 });
 
@@ -670,10 +877,12 @@ describe("plan seam on the v2 transport", () => {
           mode: "global",
           upstreamKey: "ultimate",
           rejectedSamplingKeys: [],
+          contextConfig: undefined,
           piSessionId: "sess-plan",
           wireSessionV2: { promptCacheKey: "sess-plan", envelopeAndHeaders: "sess-plan" },
           turnKind: "real",
           capture: { protocol: "v2", model: "Ultimate", session: "sess-plan" },
+          contextLength: undefined,
         } as const,
       },
     );
@@ -855,5 +1064,350 @@ describe("the host seam keeps the registered entry synchronous (T-05)", () => {
     expect(result.stopReason).toBe("error");
     expect(result.errorMessage).toContain("Qoder host seam");
     expect(result.errorMessage).toContain("openAICompletionsApi");
+  });
+});
+
+/**
+ * qoder-warm-attribution (CU-03, T-05/T-06) — a v2 turn's persisted row keys by
+ * the friendly catalog id even though the wire dispatches under the upstream key.
+ */
+describe("v2 terminal-model normalization (qoder-warm-attribution T-05/T-06)", () => {
+  const upstreamKey = "dfmodel";
+  const friendlyId = "DeepSeek-V4-Flash";
+
+  // boundary: the captured request body is JSON text — parse to unknown and
+  // narrow with a record predicate before any field read (BND-1), matching
+  // debug-sink.ts's idiom.
+  function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+  }
+
+  /**
+   * invented: an OpenAI-shaped chunk trio mirroring this file's `v2Success`
+   * fixture; only the echoed `model` varies, because that echo is exactly what
+   * pi-ai's `chunk.model !== model.id` guard (openai-completions.js:360-362)
+   * decides on. Kept separate from `v2UsageSuccess`/`usageFetch` rather than
+   * folded in: those parameterize the usage object and hardcode the echoed
+   * model, while these rows parameterize the echo and hold usage constant —
+   * merging them would give one helper two independent axes (REU-2).
+   */
+  function v2EchoSse(echoedModel: string): string {
+    return [
+      `data: ${JSON.stringify({ id: "x", model: echoedModel, choices: [{ delta: { content: "OK" }, index: 0 }] })}`,
+      `data: ${JSON.stringify({
+        id: "x",
+        model: echoedModel,
+        choices: [{ delta: {}, finish_reason: "stop", index: 0 }],
+        usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 },
+      })}`,
+      "data: [DONE]",
+    ].join("\n\n");
+  }
+
+  function echoFetch(echoedModel: string) {
+    const calls: { url: string; body: Record<string, unknown> }[] = [];
+    const fetch = vi.fn(async (input: unknown, init?: RequestInit) => {
+      const parsed: unknown = JSON.parse(String(init?.body));
+      if (!isRecord(parsed)) throw new Error("expected an object request body");
+      calls.push({ url: String(input), body: parsed });
+      return new Response(v2EchoSse(echoedModel), { headers: { "content-type": "text/event-stream" } });
+    }) as unknown as typeof globalThis.fetch;
+    return { calls, fetch };
+  }
+
+  it("T-05/AC-02,AC-04 persists under the friendly id while the wire still dispatches the upstream key", async () => {
+    const { calls, fetch } = echoFetch(upstreamKey);
+    const events: AssistantMessageEvent[] = [];
+    for await (const event of streamQoderV2(
+      modelNamed(friendlyId),
+      context,
+      { apiKey: "fake", fetch },
+      {
+        mode: "global",
+        modelConfig: { key: upstreamKey },
+        upstreamKey,
+      },
+    )) {
+      events.push(event);
+    }
+
+    const done = events.find((event) => event.type === "done") as Extract<AssistantMessageEvent, { type: "done" }>;
+    // The echo equals the id pi-ai sent, so its own guard suppressed
+    // responseModel: the normalized `model` is the whole persisted key.
+    expect(done.message.responseModel).toBeUndefined();
+    expect(done.message.model).toBe(friendlyId);
+    expect(done.message.responseModel ?? done.message.model).toBe(friendlyId);
+    // Normalization is a terminal concern: the dispatch is untouched.
+    expect(calls[0].url).toContain("chat/completions");
+    expect(calls[0].body.model).toBe(upstreamKey);
+  });
+
+  it("T-06/AC-06 leaves a genuine mismatch echo observable in responseModel", async () => {
+    const { fetch } = echoFetch("gm51model");
+    const result = await streamQoderV2(
+      modelNamed(friendlyId),
+      context,
+      { apiKey: "fake", fetch },
+      {
+        mode: "global",
+        modelConfig: { key: upstreamKey },
+        upstreamKey,
+      },
+    ).result();
+
+    // OB-8's unobserved branch stays diagnosable rather than being erased by
+    // normalization: `model` is rewritten, `responseModel` is not.
+    expect(result.responseModel).toBe("gm51model");
+    expect(result.model).toBe(friendlyId);
+    expect(result.stopReason).toBe("stop");
+  });
+});
+
+/**
+ * The prefix stamp on the v2 transport (spec CU-04), riding the tail's reserved
+ * onTerminal hook. A cold chain writes none of the six — that absence is how the
+ * ledger represents class 0 — so every stamped row here warms the session's chain
+ * with a prior turn first.
+ */
+describe("prefix stamp on the v2 transport (spec CU-04)", () => {
+  const PREFIX_FIELDS = ["prefixLen", "prefixHash", "prefixStable", "paramsHash", "payloadHash"] as const;
+  const MODEL = "DeepSeek-V4-Flash";
+  beforeEach(() => clearPrefixChainRegistry());
+  afterEach(() => clearPrefixChainRegistry());
+
+  // invented: `context` extended by one assistant/user pair, which is what makes a
+  // second turn on the session stable rather than diverged. The assistant message
+  // reuses completedAssistant's full usage object — pi-ai reads `usage.totalTokens`
+  // off a transcript assistant message, so a partial one aborts the dispatch before
+  // the payload hook can run.
+  const extended = normalizeContext({
+    messages: [
+      { role: "user", content: "hi", timestamp: 0 },
+      { ...completedAssistant, content: [{ type: "text", text: "hello" }], stopReason: "stop", timestamp: 1 },
+      { role: "user", content: "and again", timestamp: 2 },
+    ],
+  } as unknown as Context);
+
+  // invented: `extended` plus a system prompt and one tool declaration, so the
+  // cross-transport row compares the seed's system and tool contribution and not
+  // only its message units. Without it, a drift between the tool view legacy chains
+  // (`currentSystem?.toolsAdded`) and the one v2 chains would pass unnoticed, since
+  // an empty tool set contributes the same empty seed on both sides.
+  const tooledContext = normalizeContext({
+    systemPrompt: "you are helpful",
+    messages: [
+      { role: "user", content: "hi", timestamp: 0 },
+      { ...completedAssistant, content: [{ type: "text", text: "hello" }], stopReason: "stop", timestamp: 1 },
+      { role: "user", content: "read it", timestamp: 2 },
+    ],
+    tools: [
+      {
+        name: "read",
+        description: "Read a file",
+        parameters: { type: "object", properties: { path: { type: "string" } } },
+      },
+    ],
+  } as unknown as Context);
+
+  // invented: the recorded legacy envelope shape with a finish chunk, so a legacy
+  // dispatch in this file reaches a done terminal rather than a premature-EOF error.
+  const legacySse = [
+    envelope({ choices: [{ delta: { content: "OK" } }] }),
+    envelope({
+      choices: [{ finish_reason: "stop", index: 0 }],
+      usage: { prompt_tokens: 1_000, completion_tokens: 100, total_tokens: 1_100 },
+    }),
+    "data: [DONE]",
+  ].join("\n\n");
+
+  type PrefixedUsage = AssistantMessage["usage"] & {
+    prefixLen?: number;
+    prefixHash?: string;
+    prefixStable?: boolean;
+    prefixDivergedAt?: number;
+    paramsHash?: string;
+    payloadHash?: string;
+  };
+
+  const prefixed = (message: AssistantMessage): PrefixedUsage => message.usage as PrefixedUsage;
+
+  /** A fresh Response per call: one body can only be consumed once, so a multi-turn row needs one each. */
+  function serving(body: string, status = 200): typeof globalThis.fetch {
+    return vi.fn(
+      async () => new Response(body, { status, headers: { "content-type": "text/event-stream" } }),
+    ) as unknown as typeof globalThis.fetch;
+  }
+
+  function v2Turn(sessionId: string, transcript: Context = extended, fetchImpl = serving(v2Success)) {
+    return streamQoderV2(
+      modelNamed(MODEL),
+      transcript as unknown as Parameters<typeof streamQoderV2>[1],
+      { apiKey: "fake", fetch: fetchImpl, sessionId } as SimpleStreamOptions,
+      { mode: "global", modelConfig: { key: "dfmodel" }, upstreamKey: "dfmodel" },
+    ).result();
+  }
+
+  function legacyTurn(sessionId: string, transcript: Context = extended, fetchImpl = serving(legacySse)) {
+    return streamQoder(
+      modelNamed(MODEL),
+      transcript as unknown as Parameters<typeof streamQoder>[1],
+      {
+        apiKey: "fake",
+        fetch: fetchImpl,
+        sessionId,
+      } as SimpleStreamOptions,
+    ).result();
+  }
+
+  // spec: T-09 / AC-02,AC-03 — v2 stamps the same six fields as legacy, on done.
+  it("T-09 stamps all six fields on a v2 done terminal once the chain is warm", async () => {
+    await v2Turn("session-v2-done", context);
+    const usage = prefixed(await v2Turn("session-v2-done"));
+
+    for (const key of PREFIX_FIELDS) {
+      expect(usage[key], `the v2 done terminal carries ${key}`).toBeDefined();
+    }
+    expect(usage.prefixStable, "the second turn extended the first turn's chain").toBe(true);
+    expect(usage.prefixDivergedAt, "an extending turn carries no divergence index").toBeUndefined();
+    expect(usage.prefixLen, "a character-scale count").toBeGreaterThan(0);
+  });
+
+  // spec: T-09 / AC-03,AC-07 — and on an error terminal, through the same hook.
+  it("T-09 stamps a v2 error terminal through the same reserved hook", async () => {
+    await v2Turn("session-v2-error", context);
+    const message = await v2Turn("session-v2-error", extended, serving("upstream boom", 500));
+    const usage = prefixed(message);
+
+    expect(message.stopReason, "the 500 produces an error terminal after the payload hook ran").toBe("error");
+    for (const key of PREFIX_FIELDS) {
+      expect(usage[key], `the v2 error terminal carries ${key}`).toBeDefined();
+    }
+  });
+
+  // spec: T-09 / AC-02 — for an identical transcript the v2 prefixHash equals the
+  // legacy prefixHash, so one ledger is readable across both transports. The
+  // transcript carries a system prompt and one tool, so the seed's contribution is
+  // compared too and not only the message units.
+  it("T-09 derives the same prefixHash as legacy for an identical transcript", async () => {
+    const sessionId = "session-cross";
+    await legacyTurn(sessionId, context);
+    await v2Turn(sessionId, context);
+
+    const legacyUsage = prefixed(await legacyTurn(sessionId, tooledContext));
+    const v2Usage = prefixed(await v2Turn(sessionId, tooledContext));
+
+    expect(v2Usage.prefixHash, "the chain is computed above both transforms").toBe(legacyUsage.prefixHash);
+    expect(v2Usage.prefixLen, "and it chained the same characters").toBe(legacyUsage.prefixLen);
+    expect(v2Usage.prefixStable, "re-dispatching one transcript over the other wire is not a divergence").toBe(true);
+    // The two digests are same-transport values by construction: legacy hashes its
+    // own logical prompt view, v2 its own, so they are expected to differ.
+    expect(v2Usage.payloadHash, "payloadHash is not comparable across transports").not.toBe(legacyUsage.payloadHash);
+  });
+
+  // Ruling Q2 requirement 1's falsifier at the transport seam: if any per-dispatch
+  // value reached the payload view, payloadHash would move every turn and the field
+  // would be written, hashed and meaningless.
+  it("Q2-R1 holds payloadHash steady across two v2 turns with an unchanged prompt", async () => {
+    await v2Turn("session-v2-steady", context);
+    const first = prefixed(await v2Turn("session-v2-steady"));
+    const second = prefixed(await v2Turn("session-v2-steady"));
+
+    expect(second.payloadHash, "metadata.context.request_id rotates per dispatch and is not in the view").toBe(
+      first.payloadHash,
+    );
+    expect(second.paramsHash, "nor does the sampling view move").toBe(first.paramsHash);
+    expect(second.prefixStable, "and the row still reads stable").toBe(true);
+  });
+
+  // spec: T-10 / AC-07 — no payload hook means no prefix stamp, and never a partial one.
+  it("T-10 leaves a pre-dispatch credential rejection carrying none of the six", async () => {
+    // Warmed first: with a cold chain the absence would prove nothing, because a
+    // cold chain writes none of the six either.
+    await v2Turn("session-v2-reject", context);
+    const message = await streamQoderV2(
+      modelNamed(MODEL),
+      extended as unknown as Parameters<typeof streamQoderV2>[1],
+      { fetch: serving(v2Success), sessionId: "session-v2-reject" } as SimpleStreamOptions,
+      { mode: "global", modelConfig: { key: "dfmodel" }, upstreamKey: "dfmodel" },
+    ).result();
+    const usage = prefixed(message);
+
+    expect(message.stopReason, "no access token, so the turn never dispatched").toBe("error");
+    expect(message.errorMessage).toContain("credentials");
+    for (const key of [...PREFIX_FIELDS, "prefixDivergedAt"] as const) {
+      expect(key in usage, `the payload hook never ran, so no ${key} — not even a partial stamp`).toBe(false);
+    }
+  });
+
+  it("T-10 leaves a pre-dispatch allowlist rejection carrying none of the six", async () => {
+    await v2Turn("session-v2-allowlist", context);
+    // cn mode with no QODER_MODEL_SERVER_HOST override resolves to an empty base
+    // url, which is the rejection an explicit override cannot produce:
+    // isAllowedV2Host trusts the override by definition, so setting one would
+    // dispatch rather than reject.
+    const message = await streamQoderV2(
+      modelNamed(MODEL),
+      extended as unknown as Parameters<typeof streamQoderV2>[1],
+      { apiKey: "fake", fetch: serving(v2Success), sessionId: "session-v2-allowlist" } as SimpleStreamOptions,
+      { mode: "cn", modelConfig: { key: "dfmodel" }, upstreamKey: "dfmodel" },
+    ).result();
+    const usage = prefixed(message);
+
+    expect(message.errorMessage).toContain("allowlist");
+    for (const key of [...PREFIX_FIELDS, "prefixDivergedAt"] as const) {
+      expect(key in usage, `rejected before dispatch, so no ${key}`).toBe(false);
+    }
+  });
+
+  // spec: T-10 / AC-07 — the self-heal forwards legacy's own single stamp, not two.
+  it("T-10 the self-heal forwards legacy's stamp rather than stamping the forwarded events again", async () => {
+    const healingFetch = vi.fn(async (input: unknown) => {
+      if (String(input).includes("chat/completions")) {
+        return new Response(
+          JSON.stringify({ error: { type: "invalid_model_error", message: "model not supported" } }),
+          {
+            status: 400,
+            headers: { "content-type": "application/json" },
+          },
+        );
+      }
+      return new Response(legacySse, { headers: { "content-type": "text/event-stream" } });
+    }) as typeof globalThis.fetch;
+
+    // Warm the chain on legacy so the healed turn has a predecessor at all.
+    await legacyTurn("session-heal", context);
+    const healed = await streamQoderV2(
+      modelNamed(MODEL),
+      extended as unknown as Parameters<typeof streamQoderV2>[1],
+      {
+        apiKey: "fake",
+        fetch: healingFetch,
+        env: { QODER_FALLBACK: "1" },
+        sessionId: "session-heal",
+      } as SimpleStreamOptions,
+      { mode: "global", modelConfig: { key: "dfmodel" }, upstreamKey: "dfmodel" },
+    ).result();
+
+    // The control: a pure legacy turn on the same transcript and session.
+    const control = prefixed(await legacyTurn("session-heal"));
+    const healedUsage = prefixed(healed);
+
+    expect(healed.stopReason, "the self-heal completed on legacy").toBe("stop");
+    for (const key of PREFIX_FIELDS) {
+      expect(healedUsage[key], `the forwarded legacy terminal carries ${key}`).toBeDefined();
+    }
+    expect(healedUsage.prefixHash, "one transcript, one prefixHash across the heal").toBe(control.prefixHash);
+    expect(healedUsage.payloadHash, "and the values are legacy's own, forwarded untouched").toBe(control.payloadHash);
+
+    // The double-stamp falsifier: v2's rider digests a different view, so had the
+    // tail also stamped the forwarded events these would agree with v2 instead.
+    // Warmed first — a cold v2 turn writes no payloadHash at all, and comparing
+    // against undefined would pass whether or not the double stamp existed.
+    await v2Turn("session-heal-v2", context);
+    const v2Usage = prefixed(await v2Turn("session-heal-v2"));
+    expect(v2Usage.payloadHash, "the control v2 row is stamped, so the comparison is real").toBeDefined();
+    expect(healedUsage.payloadHash, "v2's rider did not also write the forwarded terminal").not.toBe(
+      v2Usage.payloadHash,
+    );
   });
 });
