@@ -120,6 +120,8 @@ The streamed response is normalized into pi thinking blocks regardless of how th
 | `QODER_MODEL_SERVER_HOST` | Override the v2 model-server base URL (for example to reach a v2 host from the China region). |
 | `QODER_CACHE_WARM` | Set to `1` to approve pi's cache-warming refreshes on every provider, or `0` to veto them even where the approval file arms one (still requires pi's `cacheWarming` setting; refreshes spend Credits). Either value overrides `qoder-warm-approval.json`. With the gate on, refreshes are budget-governed per opportunity (`QODER_WARM_BUDGET`). |
 | `QODER_WARM_BUDGET` | Fraction of the protected cache miss an idle window may spend on refreshes (default `0.5`); `off` disables the cap. Invalid values fall back to `0.5` with one debug entry. |
+| `QODER_LEGACY_AFFINITY` | Set to `off` to suppress every legacy cache-affinity placement (the probe-gated `prompt_cache_key` body field and the unsigned header trio) at request time, no rebuild — the rollback path for a promoted placement. |
+| `QODER_LEGACY_CONTEXT_LENGTH` | Set to `off` to remove `context_length` from the legacy request body at request time, no rebuild — the rollback path for the promoted top-level-number placement. |
 
 ## How it works (protocol notes)
 
