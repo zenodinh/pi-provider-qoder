@@ -92,6 +92,7 @@ describe("one producer, two readers (spec CU-04, T-05/AC-06)", () => {
     const legacy = readFileSync(fileURLToPath(new URL("../protocol/stream.ts", import.meta.url)), "utf8");
     expect(legacy.match(/context_config/g) ?? []).toHaveLength(1);
     expect(legacy).toContain("plan?.contextLength ?? resolveContextLength(modelConfig.context_config");
+    expect(legacy.match(/contextWindow/g) ?? []).toHaveLength(1);
     expect(legacy.match(/is_default|token_count/g) ?? []).toHaveLength(0);
 
     // v2's single context_config read is the gate-off fallback calling the

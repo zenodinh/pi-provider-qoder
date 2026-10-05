@@ -956,8 +956,13 @@ describe("legacy context tier (fs-qoder-legacy-context-length)", () => {
   }
 
   /** The wire the gateway receives: the encoded body decoded back to JSON. */
-  async function runLegacyTierWire(model: Model<Api>, options: SimpleStreamOptions, gate: "on" | "off" = "on") {
-    seedLegacyTieredKey(TIERS);
+  async function runLegacyTierWire(
+    model: Model<Api>,
+    options: SimpleStreamOptions,
+    gate: "on" | "off" = "on",
+    contextConfig: Record<string, { token_count?: number; is_default?: boolean }> = TIERS,
+  ) {
+    seedLegacyTieredKey(contextConfig);
     vi.stubEnv("QODER_CORE_PLAN", gate === "on" ? "1" : "");
     let init: RequestInit | undefined;
     const fetch = vi.fn(async (_input: unknown, requestInit?: RequestInit) => {
@@ -1016,20 +1021,11 @@ describe("legacy context tier (fs-qoder-legacy-context-length)", () => {
 
   // T-02 / AC-03: undefined omits the member entirely — no null, no zero.
   it("omits context_length when no tier is marked default", async () => {
-    seedLegacyTieredKey({ "200K": { token_count: 200_000 }, "1M": { token_count: 1_000_000 } });
-    vi.stubEnv("QODER_CORE_PLAN", "1");
-    let init: RequestInit | undefined;
-    const fetch = vi.fn(async (_input: unknown, requestInit?: RequestInit) => {
-      init = requestInit;
-      return new Response(legacySuccess);
-    }) as typeof globalThis.fetch;
-    const result = await streamQoderRouter(tieredModel(123_456), context, {
-      apiKey: "fake",
-      fetch,
-    }).result();
-    expect(result.stopReason).toBe("stop");
-    const body = decodeWireBody(init?.body);
-    expect("context_length" in body).toBe(false);
+    const run = await runLegacyTierWire(tieredModel(123_456), {}, "on", {
+      "200K": { token_count: 200_000 },
+      "1M": { token_count: 1_000_000 },
+    });
+    expect("context_length" in run.body).toBe(false);
   });
 
   // T-03 / AC-04: one environment value disables the tier at request time, on
