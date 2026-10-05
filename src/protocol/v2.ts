@@ -21,6 +21,7 @@ import { createDebugFetch, type DebugFetchMeta } from "../debug-log.js";
 import { openAICompletionsApi } from "../host-seam.js";
 import { type RateSource, rateForUpstreamKey } from "../pricing.js";
 import type { QoderMode } from "../region.js";
+import { resolveContextLength } from "./context-length.js";
 import { PROCESS_FALLBACK_SESSION_ID, planQoderTurn, type TurnPlan, type TurnPlanSeed } from "./plan.js";
 import { extendPrefixChain, prefixStampFields } from "./prefix-chain.js";
 import { markLegacyOnly } from "./routing.js";
@@ -90,30 +91,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * Effective `context_length` for one request. The model's window as pi resolved
- * it — `models.json` `provider.modelOverrides.<modelId>.contextWindow` included —
- * wins when it matches one of the catalog's available windows; otherwise the
- * catalog's `is_default` tier (Qoder's own default). No largest-tier fallback:
- * an unmatched window omits the field and the server default governs (owner
- * direction 2026-09-29 — a hidden max can spend more than the user intended).
- * Mirrors qodercli's window validation (its `$6`/`Gf` helpers, decoded
- * 2026-09-29: an invalid selection falls back to the default window).
- */
-function resolveContextLength(
-  contextConfig: QoderModelEntry["context_config"],
-  requested: number | undefined,
-): number | undefined {
-  if (requested === undefined) return undefined;
-  const tiers = Object.values(contextConfig ?? {});
-  const windows = tiers
-    .map((tier) => tier?.token_count)
-    .filter((count): count is number => typeof count === "number" && Number.isFinite(count));
-  if (windows.length === 0 || windows.includes(requested)) return requested;
-  const fallback = tiers.find((tier) => tier?.is_default)?.token_count;
-  return typeof fallback === "number" && Number.isFinite(fallback) ? fallback : undefined;
-}
-
-/**
  * The Qoder field injector. Runs inside pi-ai's onPayload (which replaces the
  * body with a non-undefined return), then CHAINS pi's own hook — replacing it
  * without calling it would silence before_provider_request for every other
@@ -137,7 +114,9 @@ function injectQoderFields(
   // One producer for the session value: the plan's v2 wire form when the gate
   // is on, the same expression inline when it is off (identical by construction).
   const sessionId = plan?.wireSession.v2.envelopeAndHeaders ?? options?.sessionId ?? PROCESS_FALLBACK_SESSION_ID;
-  const tier = resolveContextLength(route.modelConfig.context_config, model.contextWindow);
+  // Same posture for the context tier: the plan's value when the gate is on,
+  // the same shared resolver inline when it is off (identical by construction).
+  const tier = plan?.contextLength ?? resolveContextLength(route.modelConfig.context_config, model.contextWindow);
   const { requestSetId } = resolveRunIdentity({
     mode: route.mode,
     upstreamKey: route.upstreamKey,

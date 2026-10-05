@@ -1,8 +1,8 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { Api, Context, Model } from "@earendil-works/pi-ai";
+import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { normalizeContext } from "@earendil-works/pi-ai";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { resolveQoderIdentity } from "../auth/oauth.js";
 import { clearQoderModelsMemCache, staticModels } from "../catalog.js";
 import {
@@ -13,6 +13,7 @@ import {
   qoderModeFor,
   resolveUpstreamKey,
 } from "../protocol/plan.js";
+import { streamQoderRouter } from "../protocol/router.js";
 import { clearQoderFallbackCache, clearQoderRoutingMemCache } from "../protocol/routing.js";
 import { clearQoderFilterMemCache } from "../protocol/sampling.js";
 import { QODER_WIRE_COMPAT } from "../protocol/wire-compat.js";
@@ -58,6 +59,7 @@ function route(overrides: Partial<PlanRoute> = {}): PlanRoute {
     mode: "global",
     upstreamKey: "dfmodel",
     rejectedSamplingKeys: REJECTED_KEYS,
+    contextConfig: undefined,
     ...overrides,
   };
 }
@@ -194,5 +196,117 @@ describe("planQoderTurn", () => {
     // An id the catalog never declared is undefined — never an invented key.
     expect(resolveUpstreamKey("no-such-model-id", "global")).toBeUndefined();
     expect(resolveUpstreamKey("no-such-model-id", "cn")).toBeUndefined();
+  });
+});
+
+/**
+ * The context tier joins the plan (spec fs-qoder-context-window-plan CU-02/CU-03,
+ * T-02/T-03). One resolution per dispatch, identical on both surfaces, with the
+ * tiers handed to the plan by the router rather than looked up twice.
+ */
+describe("contextLength on the plan", () => {
+  // invented: the tier set the v2 wire-capture fixture seeds — 200K is_default,
+  // 400K, 1M — so the plan rows and the wire rows hold one fixture set.
+  const TIERS = {
+    "200K": { token_count: 200_000, is_default: true },
+    "400K": { token_count: 400_000 },
+    "1M": { token_count: 1_000_000 },
+  } as const;
+
+  function tieredRoute(): PlanRoute {
+    return route({ contextConfig: TIERS });
+  }
+
+  // T-02 / AC-02, AC-03: one resolution, identical on both surfaces.
+  it("T-02 resolves the tier once and carries it identically on both plan surfaces", async () => {
+    const { resolveIdentity } = identityStub();
+    const model = { ...modelNamed("Ultimate"), contextWindow: 1_000_000 } as Model<Api>;
+    const planRoute = tieredRoute();
+    const projection = planSyncProjection(model, { apiKey: "fake" }, planRoute);
+    const plan = await planQoderTurn(model, context, { apiKey: "fake" }, planRoute, { resolveIdentity });
+
+    expect(projection.contextLength).toBe(1_000_000);
+    expect(plan.contextLength).toBe(1_000_000);
+    expect(plan.contextLength).toBe(projection.contextLength);
+  });
+
+  it("T-02 a window matching no tier yields the is_default tier on both surfaces", async () => {
+    const { resolveIdentity } = identityStub();
+    const mismatched = { ...modelNamed("Ultimate"), contextWindow: 123_456 } as Model<Api>;
+    const planRoute = tieredRoute();
+    const projection = planSyncProjection(mismatched, { apiKey: "fake" }, planRoute);
+    const plan = await planQoderTurn(mismatched, context, { apiKey: "fake" }, planRoute, { resolveIdentity });
+
+    // AC-03: the catalog default tier, never the largest advertised one.
+    expect(projection.contextLength).toBe(200_000);
+    expect(plan.contextLength).toBe(200_000);
+  });
+
+  it("T-02 a model with no context_config carries its window unchanged on both surfaces", async () => {
+    const { resolveIdentity } = identityStub();
+    const model = { ...modelNamed("Ultimate"), contextWindow: 123_456 } as Model<Api>;
+    const planRoute = route(); // contextConfig: undefined
+    const projection = planSyncProjection(model, { apiKey: "fake" }, planRoute);
+    const plan = await planQoderTurn(model, context, { apiKey: "fake" }, planRoute, {
+      resolveIdentity,
+    });
+
+    // No tier table: the model's own window governs, exactly as v2 did.
+    expect(projection.contextLength).toBe(123_456);
+    expect(plan.contextLength).toBe(123_456);
+  });
+
+  it("T-02 a tier table with no default marked resolves undefined on both surfaces", async () => {
+    const { resolveIdentity } = identityStub();
+    const model = { ...modelNamed("Ultimate"), contextWindow: 123_456 } as Model<Api>;
+    const planRoute = route({
+      contextConfig: { "200K": { token_count: 200_000 }, "1M": { token_count: 1_000_000 } },
+    });
+    const projection = planSyncProjection(model, { apiKey: "fake" }, planRoute);
+    const plan = await planQoderTurn(model, context, { apiKey: "fake" }, planRoute, {
+      resolveIdentity,
+    });
+
+    // Undefined stays undefined — never zero, never the largest tier.
+    expect(projection.contextLength).toBeUndefined();
+    expect(plan.contextLength).toBeUndefined();
+  });
+
+  // T-03 / AC-02: the router hands the plan the tiers it already resolved.
+  // Observed end-to-end with the gate on and a MISMATCHED window, because a
+  // route that dropped contextConfig would pass the raw window through and
+  // emit 123456 — only the route's tiers can produce the 200000 default here.
+  it("T-03 the router route carries the catalog entry's context_config into the plan", async () => {
+    seedCache({
+      Ultimate: {
+        key: "ultimate",
+        enable: true,
+        display_name: "Ultimate",
+        context_config: TIERS,
+      },
+    });
+    const mismatched = { ...modelNamed("Ultimate"), contextWindow: 123_456 } as Model<Api>;
+    // invented: the minimal OpenAI-shaped SSE trio v2 needs to complete a turn.
+    const v2Success = [
+      `data: ${JSON.stringify({ id: "x", model: "ultimate", choices: [{ delta: { content: "OK" }, index: 0 }] })}`,
+      `data: ${JSON.stringify({ id: "x", model: "ultimate", choices: [{ delta: {}, finish_reason: "stop", index: 0 }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } })}`,
+      "data: [DONE]",
+    ].join("\n\n");
+    const bodies: Record<string, unknown>[] = [];
+    const fetch = vi.fn(async (_input: unknown, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return new Response(v2Success, { headers: { "content-type": "text/event-stream" } });
+    }) as unknown as typeof globalThis.fetch;
+
+    await streamQoderRouter(mismatched, context, {
+      apiKey: "fake",
+      fetch,
+      sessionId: "sess-tiers",
+      env: { QODER_PROTOCOL: "v2", QODER_CORE_PLAN: "1" },
+    } as SimpleStreamOptions).result();
+
+    // The is_default tier, not the raw window: proof the plan resolved from the
+    // route's tiers rather than a lookup that could disagree with them.
+    expect(bodies[0]?.context_length).toBe(200_000);
   });
 });
