@@ -338,7 +338,12 @@ describe("learned profile feed (AC-06)", () => {
       id: string;
       promptCache?: { short?: number };
     }>;
-    expect(reregistered.find((model) => model.id === "DeepSeek-V4-Flash")?.promptCache?.short).toBe(600);
+    expect(
+      reregistered.find((model) => model.id === "DeepSeek-V4-Flash")?.promptCache?.short,
+      // Observed-second learner (BUG-0003): the largest observed gap among the
+      // qualifying buckets is 500 s, so that is what publishes — not the 600 s
+      // bucket boundary the pre-fix rule emitted.
+    ).toBe(500);
   });
 
   it("keeps the prior registration when the learner scan throws", async () => {
