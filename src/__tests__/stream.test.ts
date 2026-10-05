@@ -1436,10 +1436,12 @@ describe("plan seam on the legacy transport", () => {
     mode: "global",
     upstreamKey: "dfmodel",
     rejectedSamplingKeys: [],
+    contextConfig: undefined,
     piSessionId: "session-plan",
     wireSessionV2: { promptCacheKey: "session-plan", envelopeAndHeaders: "session-plan" },
     turnKind: "real",
     capture: { protocol: "legacy", model: "Lite", session: "session-plan" },
+    contextLength: undefined,
   } as const;
 
   /** The ids the run registry rotates per dispatch (OD-5) — not the wire contract under test. */

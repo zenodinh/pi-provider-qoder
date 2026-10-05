@@ -67,11 +67,13 @@ export function streamQoderRouter(model: Model<Api>, context: TranscriptContext,
 
   // One routing-table read per dispatch: the route carries the rejected-sampling
   // list, so the filter no longer needs the second lookup router.ts:63 held.
+  // contextConfig hands the plan the tiers the same catalog read already held.
   const route: PlanRoute = {
     protocol: decision.protocol,
     mode,
     upstreamKey,
     rejectedSamplingKeys: getRoutingData().rejectedSamplingKeys,
+    contextConfig: modelConfig.context_config,
   };
   const seed: TurnPlanSeed | undefined = corePlanEnabled(options)
     ? { ...route, ...planSyncProjection(model, options, route) }

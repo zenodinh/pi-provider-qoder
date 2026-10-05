@@ -299,6 +299,61 @@ describe("v2 field injector", () => {
     expect(bodyOf(b.calls, 0).context_length).toBe(200000);
   });
 
+  /**
+   * Spec fs-qoder-context-window-plan CU-04, T-04 (AC-04, AC-05) — the
+   * pure-refactor bar. The tier moved from a v2-local function to the plan
+   * producer; for the same fixtures the emitted context values must be
+   * byte-identical in BOTH gate states, and the omit case must omit both keys.
+   */
+  it("emits byte-identical context values with QODER_CORE_PLAN on and off (T-04/AC-04, AC-05)", async () => {
+    for (const gate of ["", "1"]) {
+      vi.stubEnv("QODER_CORE_PLAN", gate);
+      seedCatalogWithTiers();
+      clearQoderFallbackCache();
+      clearQoderRoutingMemCache();
+
+      // The matched override: both emitted forms carry 400000.
+      const overridden = { ...modelNamed("Ultimate"), contextWindow: 400000 } as Model<Api>;
+      const a = v2FetchCapture();
+      await streamQoderRouter(overridden, context, { apiKey: "fake", fetch: a.fetch, sessionId: "sess-gate" }).result();
+      expect(bodyOf(a.calls, 0).context_length).toBe(400000);
+      expect((bodyOf(a.calls, 0).metadata as { context: Record<string, unknown> }).context.context_length).toBe(
+        "400000",
+      );
+
+      // The mismatched override: the is_default tier, 200000, both forms.
+      const mismatched = { ...modelNamed("Ultimate"), contextWindow: 123456 } as Model<Api>;
+      const b = v2FetchCapture();
+      await streamQoderRouter(mismatched, context, { apiKey: "fake", fetch: b.fetch, sessionId: "sess-gate" }).result();
+      expect(bodyOf(b.calls, 0).context_length).toBe(200000);
+      expect((bodyOf(b.calls, 0).metadata as { context: Record<string, unknown> }).context.context_length).toBe(
+        "200000",
+      );
+
+      // The omit case: a model whose entry declares no tiers and whose window
+      // is unset carries NEITHER key in either gate state.
+      const windowless = { ...modelNamed("Ultimate"), contextWindow: undefined } as unknown as Model<Api>;
+      writeFileSync(
+        cachePath(),
+        JSON.stringify({
+          updatedAt: Date.now(),
+          models: [],
+          configs: { Ultimate: { key: "ultimate", enable: true, display_name: "Ultimate" } },
+        }),
+        "utf8",
+      );
+      clearQoderModelsMemCache();
+      clearQoderFallbackCache();
+      clearQoderRoutingMemCache();
+      const c = v2FetchCapture();
+      await streamQoderRouter(windowless, context, { apiKey: "fake", fetch: c.fetch, sessionId: "sess-gate" }).result();
+      expect("context_length" in bodyOf(c.calls, 0)).toBe(false);
+      expect("context_length" in (bodyOf(c.calls, 0).metadata as { context: Record<string, unknown> }).context).toBe(
+        false,
+      );
+    }
+  });
+
   it("sends enable_thinking:false when the level is unset or clamps to off", async () => {
     const { calls, fetch } = v2FetchCapture();
     // Efficient is reasoning:false in the static seed, so "high" clamps to off.
@@ -822,10 +877,12 @@ describe("plan seam on the v2 transport", () => {
           mode: "global",
           upstreamKey: "ultimate",
           rejectedSamplingKeys: [],
+          contextConfig: undefined,
           piSessionId: "sess-plan",
           wireSessionV2: { promptCacheKey: "sess-plan", envelopeAndHeaders: "sess-plan" },
           turnKind: "real",
           capture: { protocol: "v2", model: "Ultimate", session: "sess-plan" },
+          contextLength: undefined,
         } as const,
       },
     );
