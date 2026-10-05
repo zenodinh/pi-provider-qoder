@@ -37,6 +37,7 @@ const ARRAY_ROWS = [
   "affinityPlacement",
   "affinityPlacementGated",
   "contextLengthEmission",
+  "contextLengthEmissionGated",
   "enableThinkingPath",
   "systemSlot",
   "businessLifecycle",
@@ -209,5 +210,39 @@ describe("wire-compat is code-owned", () => {
 
     expect(fsSpies.existsSync).not.toHaveBeenCalled();
     expect(fsSpies.readFileSync).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Spec fs-qoder-legacy-context-length T-01 (AC-02, AC-05): the context-tier
+ * emission posture. The owner promoted the legacy top-level number on
+ * 2026-10-04, so the live row carries it and the gated row ships empty — the
+ * retained mechanism for a future placement form, moved between rows as a
+ * data edit with no adapter change.
+ */
+describe("contextLengthEmission posture (fs-qoder-legacy-context-length)", () => {
+  it("ships the legacy tier promoted, holds the gated row empty, and demotes by data alone (T-01)", () => {
+    expect(QODER_WIRE_COMPAT.contextLengthEmission).toEqual(["legacy:top-level-number", "v2:both"]);
+    expect(QODER_WIRE_COMPAT.contextLengthEmissionGated).toEqual([]);
+    expect(carrierValue(QODER_WIRE_COMPAT.contextLengthEmission, "legacy")).toBe("top-level-number");
+    expect(carrierValue(QODER_WIRE_COMPAT.contextLengthEmission, "v2")).toBe("both");
+
+    // Demotion is a one-string data move on a clone — never a mutation of the
+    // frozen export — and it empties the live legacy value with no code change.
+    const demoted = structuredClone(QODER_WIRE_COMPAT);
+    demoted.contextLengthEmission = demoted.contextLengthEmission.filter(
+      (entry) => entry !== "legacy:top-level-number",
+    );
+    demoted.contextLengthEmissionGated = ["legacy:top-level-number"];
+    expect(carrierValue(demoted.contextLengthEmission, "legacy")).toBeUndefined();
+    // The demotion is legacy-scoped: v2's entry is untouched.
+    expect(carrierValue(demoted.contextLengthEmission, "v2")).toBe("both");
+    // The clone's move left the shipped table promoted.
+    expect(carrierValue(QODER_WIRE_COMPAT.contextLengthEmission, "legacy")).toBe("top-level-number");
+  });
+
+  it("rejects a table missing the gated row wholesale (T-01 / AC-05)", () => {
+    expect(isWireCompatData(QODER_WIRE_COMPAT)).toBe(true);
+    expect(isWireCompatData(without("contextLengthEmissionGated"))).toBe(false);
   });
 });
