@@ -13,8 +13,9 @@
  * verdict-out and testable without a repository.
  *
  * Scope is the published artifact (`src/**`, excluding tests and fixtures —
- * `package.json` ships `files: ["src", "README.md"]`). Dev tooling under
- * `scripts/` is deliberately out of scope: it never runs inside a user's pi.
+ * `package.json` ships `src/` and `README.md` minus `__tests__` and
+ * `__fixtures__`). Dev tooling under `scripts/` is deliberately out of scope:
+ * it never runs inside a user's pi.
  */
 // shape: pure function module + thin CLI — trigger #1 (stateless transforms,
 //   one input shape → one verdict); `main` only reads files and maps the

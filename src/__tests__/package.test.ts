@@ -23,6 +23,10 @@ describe("published Pi extension entry", () => {
     // every model straight from src/index.ts.
     expect(pkg.files).toContain("src");
     expect(pkg.files).not.toContain("dist");
+    // The test suite and recorded fixtures are development-only: npm's `!`
+    // entries keep them out of the published tarball's file list.
+    expect(pkg.files).toContain("!src/__tests__");
+    expect(pkg.files).toContain("!src/__fixtures__");
     expect(pkg.pi.extensions).toEqual(["./src/index.ts"]);
   });
 
