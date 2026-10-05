@@ -10,6 +10,7 @@ import type {
   TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { normalizeContext } from "@earendil-works/pi-ai";
+import { isContextOverflow } from "@earendil-works/pi-ai/utils/overflow";
 import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cacheQoderIdentityForTest, clearQoderAuthMemCache } from "../auth/oauth.js";
@@ -685,5 +686,64 @@ describe("FS-5 — EOF alignment is the one intended verdict flip", () => {
       expect(isRetryableAssistantError(failedMessage(text))).toBe(false);
     }
     expect(isRetryableAssistantError(failedMessage(ALIGNED_EOF_TEXT))).toBe(true);
+  });
+});
+
+/**
+ * BUG-0008 — the overflow-contract pin (executed, not inferred).
+ *
+ * The register's 2026-10-02 finding was measured against pre-1.0.0 pi, whose
+ * OVERFLOW_PATTERNS had no match for Qoder's `context_length_exceeded` — so a
+ * context overflow hard-failed with no auto-compaction and no retry. pi-ai
+ * 1.0.0 added the generic fallback `/context[_ ]length[_ ]exceeded/i`
+ * (overflow.js:58), which matches all three Qoder overflow renderings below;
+ * pi gates auto-compaction on isContextOverflow BEFORE the retry classifier
+ * (agent-session.js:2942), so the compaction path now fires with zero provider
+ * changes. These rows pin that coupling by executing the real classifier
+ * read-only, so a future host change to the pattern list fails here loudly
+ * instead of silently re-breaking compaction. Registered 2026-10-02; refuted
+ * against 1.0.0 and pinned 2026-10-05.
+ */
+const OVERFLOW_VERDICTS: Array<{ text: string; overflow: boolean; note: string }> = [
+  {
+    // invented: exact instance of the legacy inner-envelope rendering (stream.ts error path)
+    text: 'Qoder upstream error: {"message":"context_length_exceeded"}',
+    overflow: true,
+    note: "BUG-0008 legacy inner-envelope path — matched by the host's generic fallback",
+  },
+  {
+    // invented: exact instance of the legacy HTTP-400 rendering (error body interpolated after the status)
+    text: 'Qoder API request failed: 400 Bad Request. Response: {"error":{"code":"context_length_exceeded","message":"input is too long"}}',
+    overflow: true,
+    note: "BUG-0008 legacy HTTP-400 path — same fallback match",
+  },
+  {
+    // invented: exact instance of v2's error-body rendering ("<status>: <body>")
+    text: '400: {"error":{"message":"context_length_exceeded","type":"invalid_request_error"}}',
+    overflow: true,
+    note: "BUG-0008 v2 error-body path — both protocols classified identically",
+  },
+  {
+    // control: a NON-overflow Qoder upstream error must stay unclassified,
+    // proving the rows read the classifier rather than answering always-true
+    text: 'Qoder upstream error: {"message":"boom"}',
+    overflow: false,
+    note: "control row — an ordinary upstream error is not an overflow",
+  },
+];
+
+describe("host overflow verdicts, executed rather than inferred (BUG-0008)", () => {
+  it.each(OVERFLOW_VERDICTS.map((row) => [row.text, row]))(
+    "classifies %s",
+    (_text, { overflow }: { overflow: boolean }) => {
+      expect(isContextOverflow(failedMessage(_text as string))).toBe(overflow);
+    },
+  );
+
+  it("auto-compaction's gate fires for every Qoder overflow rendering and only those", () => {
+    const classified = OVERFLOW_VERDICTS.filter((row) => isContextOverflow(failedMessage(row.text)));
+    expect(classified.map((row) => row.text)).toEqual(
+      OVERFLOW_VERDICTS.filter((row) => row.overflow).map((row) => row.text),
+    );
   });
 });
