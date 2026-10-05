@@ -3,7 +3,6 @@ import {
   affinityPlacements,
   carrierValue,
   isWireCompatData,
-  legacyAffinityCutoverLive,
   QODER_WIRE_COMPAT,
   type QoderWireCompatData,
   type WireCarrier,
@@ -111,9 +110,7 @@ describe("QODER_WIRE_COMPAT", () => {
     expect(affinityPlacements("legacy", moved)).toEqual(["session_id", "header-x-session-id"]);
 
     const movedTrio = structuredClone(QODER_WIRE_COMPAT);
-    movedTrio.affinityPlacement = movedTrio.affinityPlacement.filter(
-      (entry) => entry !== "legacy:header-x-session-id",
-    );
+    movedTrio.affinityPlacement = movedTrio.affinityPlacement.filter((entry) => entry !== "legacy:header-x-session-id");
     movedTrio.affinityPlacementGated.push("legacy:header-x-session-id");
     expect(affinityPlacements("legacy", movedTrio)).toEqual(["session_id", "prompt_cache_key"]); // trio demoted, body carrier still live
 
@@ -121,31 +118,6 @@ describe("QODER_WIRE_COMPAT", () => {
     expect(affinityPlacements("v2", moved)).toEqual(affinityPlacements("v2"));
     // With the module source unchanged, the shipped table emits all three.
     expect(affinityPlacements("legacy")).toEqual(["session_id", "prompt_cache_key", "header-x-session-id"]);
-  });
-});
-
-describe("legacyAffinityCutoverLive", () => {
-  // fs-qoder-legacy-affinity CU-06's guard: a reset fires only when a
-  // placement BEYOND the identity baseline is live. Both carriers were
-  // promoted 2026-10-05, so the shipped build DOES cut over (once, marker-
-  // guarded); a demoted or baseline-only table resets nothing, and
-  // the literal reading of "any placement live" would delete every learned
-  // profile at every session start.
-  it("is true on the shipped (promoted) table and false only when nothing beyond the identity baseline is live", () => {
-    // Promoted 2026-10-05: the shipped table carries both affinity carriers
-    // beyond the identity baseline, so the one-time parity cutover IS live.
-    expect(legacyAffinityCutoverLive()).toBe(true);
-
-    const baselineOnly = structuredClone(QODER_WIRE_COMPAT);
-    baselineOnly.affinityPlacement = ["legacy:session_id"];
-    expect(legacyAffinityCutoverLive(baselineOnly), "identity baseline alone is not a cutover").toBe(false);
-
-    // A demoted clone — every carrier rolled back — also performs no cutover.
-    const demoted = structuredClone(QODER_WIRE_COMPAT);
-    demoted.affinityPlacement = demoted.affinityPlacement.filter(
-      (entry) => entry === "legacy:session_id" || !entry.startsWith("legacy:"),
-    );
-    expect(legacyAffinityCutoverLive(demoted), "a fully demoted table is not a cutover").toBe(false);
   });
 });
 

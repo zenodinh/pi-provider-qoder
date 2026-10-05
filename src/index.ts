@@ -34,14 +34,12 @@ import {
   profileValuesChanged,
   type RateFit,
   readProfile,
-  resetProfileForParity,
   scanLedgers,
   writeProfile,
 } from "./lifetime.js";
 import { CREDITS_PER_USD, rateForUpstreamKey } from "./pricing.js";
 import { qoderModeFor } from "./protocol/plan.js";
 import { streamQoderRouter } from "./protocol/router.js";
-import { legacyAffinityCutoverLive, QODER_WIRE_COMPAT, type QoderWireCompatData } from "./protocol/wire-compat.js";
 import { getQoderBaseUrl, getQoderRegionConfig, QODER_MODES, type QoderMode } from "./region.js";
 import { resolveWarmGate } from "./warm-gate.js";
 import { evaluateGuard, parseBudgetEnv } from "./warm-guard.js";
@@ -65,30 +63,9 @@ export interface QoderExtensionDeps {
   profile?: LifetimeProfile;
   scanLedgers?: (budgetMs: number) => LedgerScan;
   writeProfile?: (profile: LifetimeProfile) => void;
-  /** Wire-compat table for the parity-cutover guard; tests inject a promoted clone. */
-  wireCompat?: QoderWireCompatData;
 }
 
 const QODER_API = "qoder-api" as Api;
-
-/**
- * Whether the legacy-affinity parity reset has already run in this process.
- * Belt to the marker file's braces: it also bounds the damage when the marker
- * write itself fails, so a broken install re-runs the idempotent reset at
- * most once per process instead of once per session start.
- */
-let legacyAffinityParityResetDone = false;
-
-/**
- * Marker recording that the legacy-affinity parity reset has run on this
- * install. The reset is exactly once per cutover, not once per process: a
- * later launch would otherwise delete the post-parity profile the first
- * post-cutover learn rebuilt (AC-08's falsifier, across the process
- * boundary). One cutover per install is the spec's "once" — a second, later
- * promotion re-invalidating evidence is a promotion-time decision for the
- * owner, not a behaviour this build invents.
- */
-const PARITY_RESET_MARKER_FILENAME = "qoder-cache-lifetime-parity-reset.txt";
 
 /**
  * Register qoder-api with the host's compat registry. The acquisition, the
@@ -288,26 +265,6 @@ export default async function (pi: ExtensionAPI, deps: QoderExtensionDeps = {}) 
     // a failed scan or write keeps the prior profile in force and never blocks
     // startup (the extension must not die from an auxiliary failure).
     try {
-      // Parity cutover (fs-qoder-legacy-affinity CU-06 / SA §3.3 OB-6): every
-      // published lifetime was learned under client-deficient affinity, so
-      // the profile is discarded once when a promoted affinity carrier is
-      // live — never on the shipped build, where nothing beyond the identity
-      // baseline session_id is live and a reset would discard evidence for
-      // nothing. Runs before the learn so the rebuild starts from no prior.
-      if (!legacyAffinityParityResetDone && legacyAffinityCutoverLive(deps.wireCompat ?? QODER_WIRE_COMPAT)) {
-        legacyAffinityParityResetDone = true;
-        const parityMarkerPath = join(getPiAgentDir(), PARITY_RESET_MARKER_FILENAME);
-        if (!existsSync(parityMarkerPath)) {
-          resetProfileForParity();
-          try {
-            writeFileSync(parityMarkerPath, `${new Date().toISOString()}\n`, "utf8");
-          } catch (error) {
-            // Fail-soft with the rest of the hook: an unwritten marker only
-            // means the next process re-runs the idempotent reset.
-            debugLog("cache-lifetime parity marker write failed", error);
-          }
-        }
-      }
       const prior = readProfile();
       const scan = (deps.scanLedgers ?? scanLedgers)(LEARNER_BUDGET_MS);
       const learned = learnProfile(scan, prior);

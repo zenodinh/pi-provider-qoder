@@ -778,25 +778,3 @@ export function writeProfile(profile: LifetimeProfile, dir: string = getPiAgentD
   writeFileSync(temporary, `${JSON.stringify(profile, null, 2)}\n`);
   renameSync(temporary, path);
 }
-
-/**
- * Delete the profile once, at the legacy-affinity parity cutover, so no
- * lifetime learned under client-deficient affinity survives into a
- * post-parity schedule. Idempotent by construction: the dedup store is file
- * absence, so a second reset is a no-op, and a reset racing a session-start
- * relearn loses at most one scan's values to writeProfile's atomic rename.
- */
-// shape: none — dispatch object does not apply: one guarded filesystem delete
-//   with no discriminator; writeProfile two declarations up is the precedent.
-export function resetProfileForParity(dir: string = getPiAgentDir()): boolean {
-  const path = join(dir, PROFILE_FILENAME);
-  if (!existsSync(path)) return false;
-  try {
-    rmSync(path);
-  } catch (error) {
-    debugLog(`cache-lifetime parity reset failed at ${path}`, error);
-    return false;
-  }
-  debugLog(`cache-lifetime profile reset for parity at ${path}`);
-  return true;
-}

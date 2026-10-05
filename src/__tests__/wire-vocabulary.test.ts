@@ -508,7 +508,8 @@ describe("legacy parameters vocabulary (SA rows 2, 8)", () => {
     for (const name of AFFINITY_HEADER_NAMES) {
       expect(lower.has(name), `kill switch must remove the ${name} header`).toBe(false);
     }
-  });});
+  });
+});
 
 /**
  * AC-01/AC-05 — each protocol's emitted event-type vocabulary is the same
@@ -776,7 +777,6 @@ describe("legacy cache affinity surface (fs-qoder-legacy-affinity)", () => {
     }
     return table;
   }
-
 
   /** A clone of the shipped table with `carriers` demoted back into the gated row. */
   function demotedTable(carriers: string[]): QoderWireCompatData {

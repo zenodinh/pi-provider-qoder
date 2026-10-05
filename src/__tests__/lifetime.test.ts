@@ -11,11 +11,9 @@ import {
   learnProfile,
   PROFILE_FILENAME,
   readProfile,
-  resetProfileForParity,
   scanLedgers,
   writeProfile,
 } from "../lifetime.js";
-import { QODER_WIRE_COMPAT } from "../protocol/wire-compat.js";
 import { assistantEntry, compactionEntry, warmEntry } from "./session-fixtures.js";
 
 const MODEL = "DeepSeek-V4-Flash";
@@ -399,8 +397,8 @@ describe("parseLedgerLine prefix whitelist (spec CU-05)", () => {
 /**
  * The observed-second learner (fs-qoder-cache-learner CUs 01-05, SA CU-4 /
  * BUG-0003). Every row drives the public seam — scanLedgers over a temp
- * fixture ledger, then estimate / learnProfile / readProfile / writeProfile /
- * resetProfileForParity — never the private parser.
+ * fixture ledger, then estimate / learnProfile / readProfile / writeProfile —
+ * never the private parser.
  *
  * `learnProfile` is imported at the top of this block's enclosing module scope
  * via the same seam table (S5): it is exercised through the profile it
@@ -702,45 +700,6 @@ describe("observed-second learner (fs-qoder-cache-learner)", () => {
 
   // spec: CU-04 / T-07 / AC-07 — the parity reset discards the profile exactly
   // once and is a no-op thereafter.
-  it("T-07 removes a present profile once, is a no-op on the second call, and leaves the next learn to rebuild from post-parity rows", () => {
-    const dir = mkdtempSync(join(tmpdir(), "qoder-parity-"));
-    createdDirs.push(dir);
-    const path = join(dir, PROFILE_FILENAME);
-
-    const preParity: LifetimeProfile = {
-      version: 2,
-      updatedAt: "2026-10-01T00:00:00.000Z",
-      models: {
-        [MODEL]: {
-          lifetimeSeconds: 3600,
-          samples: 42,
-          computedAt: "2026-09-30T12:00:00.000Z",
-          buckets: [{ upperSeconds: 3600, medianRatio: 0.9, samples: 42 }],
-        },
-      },
-    };
-    writeProfile(preParity, dir);
-    expect(existsSync(path)).toBe(true);
-
-    expect(resetProfileForParity(dir)).toBe(true);
-    expect(existsSync(path)).toBe(false);
-    expect(readProfile(dir)).toBeUndefined();
-
-    // A profile written by a concurrent relearn between two resets is removed
-    // by the later one, and a second reset with no profile is a no-op.
-    writeProfile(preParity, dir);
-    expect(resetProfileForParity(dir)).toBe(true);
-    expect(resetProfileForParity(dir)).toBe(false);
-    expect(existsSync(path)).toBe(false);
-
-    // The next learn over a post-parity fixture ledger publishes only from
-    // those rows — no pre-parity value survives into the rebuilt profile.
-    const root = sessionsRoot();
-    writeSession(root, "session.jsonl", observedSurvivalChain(640, 21));
-    const scan = scanLedgers(5000, [root]);
-    const rebuilt = learnProfile(scan, readProfile(dir));
-    expect(rebuilt.models[MODEL]?.lifetimeSeconds).toBe(640);
-  });
 
   // spec: CU-05 / T-08 / AC-08 — a diverged-prefix gap is excluded from the
   // lifetime sample; an unmarked gap and a stable-prefix gap are not.
@@ -792,185 +751,5 @@ describe("observed-second learner (fs-qoder-cache-learner)", () => {
     expect(estimate(unmarked.models[MODEL]?.gaps ?? []).lifetimeSeconds).toBe(640);
     expect(estimate(diverged.models[MODEL]?.gaps ?? []).lifetimeSeconds).toBeUndefined();
     expect(estimate(stable.models[MODEL]?.gaps ?? []).lifetimeSeconds).toBe(640);
-  });
-});
-
-/**
- * Spec fs-qoder-legacy-affinity CU-06 / T-07 / AC-08 — the parity cutover
- * rides the session-start learn hook through the real factory: the profile is
- * discarded exactly once, only when a placement beyond the identity baseline
- * is live, and the learn that follows rebuilds from post-parity rows only.
- *
- * Everything real except the pi host (the providers.test.ts fake shape) and
- * the injected scan, so the claim is about the file on disk, not a mock. The
- * per-file HOME the vitest setup installs is the learner's own agent dir.
- */
-describe("session-start parity cutover (fs-qoder-legacy-affinity CU-06)", () => {
-  // The factory's startup logs in from PAT env names; delete them so the
-  // session_start rows below exercise the learn hook, not a login path.
-  const patEnvNames = [
-    "QODER_API_KEY",
-    "QODER_PERSONAL_ACCESS_TOKEN",
-    "QODER_PAT",
-    "QODERCN_API_KEY",
-    "QODERCN_PERSONAL_ACCESS_TOKEN",
-    "QODERCN_PAT",
-  ] as const;
-  const originalPats = Object.fromEntries(patEnvNames.map((name) => [name, process.env[name]]));
-
-  afterEach(() => {
-    for (const name of patEnvNames) {
-      const value = originalPats[name];
-      if (value === undefined) delete process.env[name];
-      else process.env[name] = value;
-    }
-    vi.resetModules();
-    rmSync(join(getPiAgentDir(), PROFILE_FILENAME), { force: true });
-    rmSync(join(getPiAgentDir(), "qoder-cache-lifetime-parity-reset.txt"), { force: true });
-  });
-
-  /** The factory-time pi host: providers register, handlers land in the map. */
-  function fakePi() {
-    const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
-    const pi = {
-      registerProvider: vi.fn(),
-      unregisterProvider: vi.fn(),
-      registerCommand: vi.fn(),
-      on: vi.fn((name: string, handler: (event: unknown, ctx: unknown) => unknown) => {
-        handlers.set(name, handler);
-      }),
-    };
-    return { pi, handlers };
-  }
-
-  const sessionStartCtx = (): unknown => ({
-    modelRegistry: { getApiKeyForProvider: async () => undefined },
-  });
-
-  /** The shipped table with the header-trio carrier promoted out of the gated row. */
-  function promotedTable() {
-    const table = structuredClone(QODER_WIRE_COMPAT);
-    table.affinityPlacement.push("legacy:header-x-session-id");
-    table.affinityPlacementGated = table.affinityPlacementGated.filter(
-      (entry) => entry !== "legacy:header-x-session-id",
-    );
-    return table;
-  }
-
-  /** An empty scan: nothing publishable, so only carried prior values could survive. */
-  const emptyScan = () => scanLedgers(5000, [sessionsRoot()]);
-
-  const seededProfile = (): LifetimeProfile => ({
-    version: 2,
-    updatedAt: "2026-10-01T00:00:00.000Z",
-    models: {
-      [MODEL]: {
-        lifetimeSeconds: 3600,
-        samples: 42,
-        computedAt: "2026-09-30T12:00:00.000Z",
-        buckets: [{ upperSeconds: 3600, medianRatio: 0.9, samples: 42 }],
-      },
-    },
-  });
-
-  async function startSession(handlers: Map<string, (event: unknown, ctx: unknown) => unknown>): Promise<void> {
-    await handlers.get("session_start")?.({}, sessionStartCtx());
-  }
-
-  it("T-07 discards pre-parity carried evidence at cutover, when a promoted placement is live", async () => {
-    for (const name of patEnvNames) delete process.env[name];
-    // The scan publishes nothing, so the seeded 3600 s value could only survive
-    // by being carried forward through learnProfile's prior — exactly the
-    // pre-parity evidence OB-6 invalidates. A cutover start leaves no profile.
-    writeProfile(seededProfile());
-    const { pi, handlers } = fakePi();
-    const { default: registerProviders } = await import("../index.js");
-    await registerProviders(pi as never, { scanLedgers: emptyScan, wireCompat: promotedTable() });
-    await startSession(handlers);
-
-    expect(readProfile()).toBeUndefined();
-    expect(existsSync(join(getPiAgentDir(), PROFILE_FILENAME))).toBe(false);
-  });
-
-  it("T-07 rebuilds from post-parity rows once, and a second session start deletes nothing", async () => {
-    for (const name of patEnvNames) delete process.env[name];
-    const postParityRoot = sessionsRoot();
-    writeSession(postParityRoot, "session.jsonl", observedSurvivalChain(640, 21));
-    const postParityScan = () => scanLedgers(5000, [postParityRoot]);
-
-    writeProfile(seededProfile());
-    const first = fakePi();
-    const { default: registerProviders } = await import("../index.js");
-    await registerProviders(first.pi as never, { scanLedgers: postParityScan, wireCompat: promotedTable() });
-    await startSession(first.handlers);
-    // Rebuilt from the post-parity ledger alone — the seeded 3600 s is gone.
-    expect(readProfile()?.models[MODEL]?.lifetimeSeconds).toBe(640);
-
-    // Same process, same module: the once-flag must hold, so a second start
-    // whose scan publishes nothing cannot delete the freshly rebuilt profile.
-    const second = fakePi();
-    const { default: registerAgain } = await import("../index.js");
-    await registerAgain(second.pi as never, { scanLedgers: emptyScan, wireCompat: promotedTable() });
-    await startSession(second.handlers);
-    expect(readProfile()?.models[MODEL]?.lifetimeSeconds).toBe(640);
-    expect(existsSync(join(getPiAgentDir(), PROFILE_FILENAME))).toBe(true);
-  });
-
-  it("T-07 performs the one-time cutover reset on the shipped (promoted) build, and a baseline-only table performs none", async () => {
-    for (const name of patEnvNames) delete process.env[name];
-    // Promoted 2026-10-05: the shipped table carries both affinity carriers
-    // beyond the identity baseline, so the cutover IS live — the seeded profile
-    // (measured under the old wire) is discarded once and the marker written.
-    writeProfile(seededProfile());
-    const { pi, handlers } = fakePi();
-    vi.resetModules();
-    const { default: registerProviders } = await import("../index.js");
-    await registerProviders(pi as never, { scanLedgers: emptyScan });
-    await startSession(handlers);
-
-    expect(readProfile()?.models[MODEL]).toBeUndefined();
-    expect(existsSync(join(getPiAgentDir(), "qoder-cache-lifetime-parity-reset.txt"))).toBe(true);
-
-    // The negative half: with every carrier demoted (a clone the probe could
-    // produce), the profile must survive untouched — the guard is live-placement
-    // driven, not hard-coded true.
-    rmSync(join(getPiAgentDir(), "qoder-cache-lifetime-parity-reset.txt"));
-    writeProfile(seededProfile());
-    const baselineTable = structuredClone(QODER_WIRE_COMPAT);
-    baselineTable.affinityPlacement = baselineTable.affinityPlacement.filter(
-      (entry) => entry === "legacy:session_id" || !entry.startsWith("legacy:"),
-    );
-    const { pi: pi2, handlers: handlers2 } = fakePi();
-    vi.resetModules();
-    const { default: registerProviders2 } = await import("../index.js");
-    await registerProviders(pi2 as never, { scanLedgers: emptyScan, wireCompat: baselineTable });
-    await startSession(handlers2);
-    expect(readProfile()?.models[MODEL]?.lifetimeSeconds).toBe(3600);
-    expect(existsSync(join(getPiAgentDir(), "qoder-cache-lifetime-parity-reset.txt"))).toBe(false);
-  });
-
-  it("T-07 performs no second reset in a later process once the cutover marker exists", async () => {
-    for (const name of patEnvNames) delete process.env[name];
-    // First process: the cutover runs and writes the marker.
-    writeProfile(seededProfile());
-    const cutover = fakePi();
-    const { default: registerCutover } = await import("../index.js");
-    await registerCutover(cutover.pi as never, { scanLedgers: emptyScan, wireCompat: promotedTable() });
-    await startSession(cutover.handlers);
-    expect(existsSync(join(getPiAgentDir(), "qoder-cache-lifetime-parity-reset.txt"))).toBe(true);
-
-    // A later process sees the same promoted table but the marker too: the
-    // profile that process rebuilt must survive its own session start, thin
-    // scan and all (AC-08's "second reset deleting a freshly learned profile"
-    // falsifier, across the process boundary).
-    vi.resetModules();
-    writeProfile(seededProfile());
-    const later = fakePi();
-    const { default: registerLater } = await import("../index.js");
-    await registerLater(later.pi as never, { scanLedgers: emptyScan, wireCompat: promotedTable() });
-    await startSession(later.handlers);
-
-    expect(readProfile()?.models[MODEL]?.lifetimeSeconds).toBe(3600);
-    expect(readProfile()?.models[MODEL]?.samples).toBe(42);
   });
 });
