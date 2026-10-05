@@ -1,7 +1,8 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { getPiAgentDir } from "../home.js";
 import {
   estimate,
   fitRates,
@@ -14,6 +15,7 @@ import {
   scanLedgers,
   writeProfile,
 } from "../lifetime.js";
+import { QODER_WIRE_COMPAT } from "../protocol/wire-compat.js";
 import { assistantEntry, compactionEntry, warmEntry } from "./session-fixtures.js";
 
 const MODEL = "DeepSeek-V4-Flash";
@@ -790,5 +792,141 @@ describe("observed-second learner (fs-qoder-cache-learner)", () => {
     expect(estimate(unmarked.models[MODEL]?.gaps ?? []).lifetimeSeconds).toBe(640);
     expect(estimate(diverged.models[MODEL]?.gaps ?? []).lifetimeSeconds).toBeUndefined();
     expect(estimate(stable.models[MODEL]?.gaps ?? []).lifetimeSeconds).toBe(640);
+  });
+});
+
+/**
+ * Spec fs-qoder-legacy-affinity CU-06 / T-07 / AC-08 — the parity cutover
+ * rides the session-start learn hook through the real factory: the profile is
+ * discarded exactly once, only when a placement beyond the identity baseline
+ * is live, and the learn that follows rebuilds from post-parity rows only.
+ *
+ * Everything real except the pi host (the providers.test.ts fake shape) and
+ * the injected scan, so the claim is about the file on disk, not a mock. The
+ * per-file HOME the vitest setup installs is the learner's own agent dir.
+ */
+describe("session-start parity cutover (fs-qoder-legacy-affinity CU-06)", () => {
+  // The factory's startup logs in from PAT env names; delete them so the
+  // session_start rows below exercise the learn hook, not a login path.
+  const patEnvNames = [
+    "QODER_API_KEY",
+    "QODER_PERSONAL_ACCESS_TOKEN",
+    "QODER_PAT",
+    "QODERCN_API_KEY",
+    "QODERCN_PERSONAL_ACCESS_TOKEN",
+    "QODERCN_PAT",
+  ] as const;
+  const originalPats = Object.fromEntries(patEnvNames.map((name) => [name, process.env[name]]));
+
+  afterEach(() => {
+    for (const name of patEnvNames) {
+      const value = originalPats[name];
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    vi.resetModules();
+    rmSync(join(getPiAgentDir(), PROFILE_FILENAME), { force: true });
+  });
+
+  /** The factory-time pi host: providers register, handlers land in the map. */
+  function fakePi() {
+    const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    const pi = {
+      registerProvider: vi.fn(),
+      unregisterProvider: vi.fn(),
+      registerCommand: vi.fn(),
+      on: vi.fn((name: string, handler: (event: unknown, ctx: unknown) => unknown) => {
+        handlers.set(name, handler);
+      }),
+    };
+    return { pi, handlers };
+  }
+
+  const sessionStartCtx = (): unknown => ({
+    modelRegistry: { getApiKeyForProvider: async () => undefined },
+  });
+
+  /** The shipped table with the header-trio carrier promoted out of the gated row. */
+  function promotedTable() {
+    const table = structuredClone(QODER_WIRE_COMPAT);
+    table.affinityPlacement.push("legacy:header-x-session-id");
+    table.affinityPlacementGated = table.affinityPlacementGated.filter(
+      (entry) => entry !== "legacy:header-x-session-id",
+    );
+    return table;
+  }
+
+  /** An empty scan: nothing publishable, so only carried prior values could survive. */
+  const emptyScan = () => scanLedgers(5000, [sessionsRoot()]);
+
+  const seededProfile = (): LifetimeProfile => ({
+    version: 2,
+    updatedAt: "2026-10-01T00:00:00.000Z",
+    models: {
+      [MODEL]: {
+        lifetimeSeconds: 3600,
+        samples: 42,
+        computedAt: "2026-09-30T12:00:00.000Z",
+        buckets: [{ upperSeconds: 3600, medianRatio: 0.9, samples: 42 }],
+      },
+    },
+  });
+
+  async function startSession(handlers: Map<string, (event: unknown, ctx: unknown) => unknown>): Promise<void> {
+    await handlers.get("session_start")?.({}, sessionStartCtx());
+  }
+
+  it("T-07 discards pre-parity carried evidence at cutover, when a promoted placement is live", async () => {
+    for (const name of patEnvNames) delete process.env[name];
+    // The scan publishes nothing, so the seeded 3600 s value could only survive
+    // by being carried forward through learnProfile's prior — exactly the
+    // pre-parity evidence OB-6 invalidates. A cutover start leaves no profile.
+    writeProfile(seededProfile());
+    const { pi, handlers } = fakePi();
+    const { default: registerProviders } = await import("../index.js");
+    await registerProviders(pi as never, { scanLedgers: emptyScan, wireCompat: promotedTable() });
+    await startSession(handlers);
+
+    expect(readProfile()).toBeUndefined();
+    expect(existsSync(join(getPiAgentDir(), PROFILE_FILENAME))).toBe(false);
+  });
+
+  it("T-07 rebuilds from post-parity rows once, and a second session start deletes nothing", async () => {
+    for (const name of patEnvNames) delete process.env[name];
+    const postParityRoot = sessionsRoot();
+    writeSession(postParityRoot, "session.jsonl", observedSurvivalChain(640, 21));
+    const postParityScan = () => scanLedgers(5000, [postParityRoot]);
+
+    writeProfile(seededProfile());
+    const first = fakePi();
+    const { default: registerProviders } = await import("../index.js");
+    await registerProviders(first.pi as never, { scanLedgers: postParityScan, wireCompat: promotedTable() });
+    await startSession(first.handlers);
+    // Rebuilt from the post-parity ledger alone — the seeded 3600 s is gone.
+    expect(readProfile()?.models[MODEL]?.lifetimeSeconds).toBe(640);
+
+    // Same process, same module: the once-flag must hold, so a second start
+    // whose scan publishes nothing cannot delete the freshly rebuilt profile.
+    const second = fakePi();
+    const { default: registerAgain } = await import("../index.js");
+    await registerAgain(second.pi as never, { scanLedgers: emptyScan, wireCompat: promotedTable() });
+    await startSession(second.handlers);
+    expect(readProfile()?.models[MODEL]?.lifetimeSeconds).toBe(640);
+    expect(existsSync(join(getPiAgentDir(), PROFILE_FILENAME))).toBe(true);
+  });
+
+  it("T-07 performs no reset at all on the shipped build, where nothing is promoted", async () => {
+    for (const name of patEnvNames) delete process.env[name];
+    // Shipped table: legacy:session_id alone is live, and it has always been —
+    // that is not a cutover. The seeded profile must survive untouched.
+    writeProfile(seededProfile());
+    const { pi, handlers } = fakePi();
+    vi.resetModules();
+    const { default: registerProviders } = await import("../index.js");
+    await registerProviders(pi as never, { scanLedgers: emptyScan });
+    await startSession(handlers);
+
+    expect(readProfile()?.models[MODEL]?.lifetimeSeconds).toBe(3600);
+    expect(readProfile()?.models[MODEL]?.samples).toBe(42);
   });
 });

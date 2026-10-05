@@ -43,6 +43,7 @@ import { stripThinkingTags, ThinkingTagParser } from "./thinking.js";
 import { ToolCallAccumulator } from "./tool-calls.js";
 import { contentToText, transformMessagesForQoder, transformTools } from "./transform.js";
 import { parseQoderCreditsUsage, type QoderCreditsUsage } from "./usage.js";
+import { affinityPlacements } from "./wire-compat.js";
 
 type QoderAssistantUsage = AssistantMessage["usage"] & QoderCreditsUsage & { rateSource?: RateSource };
 
@@ -414,6 +415,10 @@ export function streamQoder(
         request_set_id: requestSetId,
         chat_record_id: requestID,
         session_id: sessionID,
+        // v2/qodercli carry the session identity twice (source_session_id in
+        // metadata.context equals session_id); a receiver keys on field
+        // presence, so legacy sends the same pair instead of omitting one.
+        source_session_id: sessionID,
         stream: true,
         chat_task: "FREE_INPUT",
         is_reply: true,
@@ -463,6 +468,25 @@ export function streamQoder(
       if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
         throw new Error("Qoder onPayload must return a JSON object or undefined");
       }
+      // Legacy cache affinity (SA §3.1 FR-7 / fs-qoder-legacy-affinity): the
+      // placement set comes from the plan's affinity tier when the router
+      // produced one and from the frozen table otherwise — the same data, so
+      // a probe verdict promoting a carrier is a one-string table edit that
+      // reaches both paths with no adapter change. QODER_LEGACY_AFFINITY=off
+      // (§6.3) empties the set at request time: one environment change stops
+      // every legacy affinity field on the next dispatch of a running process.
+      const affinityKillSwitch = options?.env?.QODER_LEGACY_AFFINITY ?? process.env.QODER_LEGACY_AFFINITY;
+      const legacyAffinity =
+        affinityKillSwitch === "off" ? [] : (plan?.affinity.placements.legacy ?? affinityPlacements("legacy"));
+      // v2 gates the body key and the header trio on cacheRetention separately
+      // (openai-completions.js:542 and :576-579); legacy mirrors both gates so
+      // a retention-none turn leaves neither half of the surface on the wire.
+      const affinityRetentionNone = options?.cacheRetention === "none";
+      if (!affinityRetentionNone && legacyAffinity.includes("prompt_cache_key")) {
+        // Written onto the resolved payload, never reqBody: a host hook that
+        // returns a replacement object discards fields written to the original.
+        (payload as Record<string, unknown>).prompt_cache_key = sessionID;
+      }
       const bodyBytes = Buffer.from(JSON.stringify(payload));
       throwIfAborted();
       await yieldToEventLoop();
@@ -483,6 +507,15 @@ export function streamQoder(
 
       const outgoingConfig = (payload as { model_config?: { key?: string; source?: string } }).model_config;
       const modelSource = outgoingConfig?.source || modelConfig.source || "system";
+      // The unsigned affinity trio (SA §3.1 FR-7): COSY signs the encoded body
+      // bytes and never the headers, so these cannot invalidate a signature.
+      // All three carry the body's own session value — the gateway must see
+      // one identity, not two — and later merge sources (model, caller) still
+      // override them, per mergeQoderHeaders' source order.
+      const affinityHeaderEntries: Record<string, string> =
+        !affinityRetentionNone && legacyAffinity.includes("header-x-session-id")
+          ? { session_id: sessionID, "x-client-request-id": sessionID, "x-session-affinity": sessionID }
+          : {};
       // Resolve the (optional) idle-timeout override once per request instead of
       // re-reading process.env on every streamed chunk.
       const configuredIdleTimeout = Number(
@@ -508,6 +541,7 @@ export function streamQoder(
           "Accept-Encoding": "identity",
           "X-Model-Key": outgoingConfig?.key || qoderModel,
           "X-Model-Source": modelSource,
+          ...affinityHeaderEntries,
           ...headers,
         },
         model.headers,
@@ -515,8 +549,9 @@ export function streamQoder(
       );
       if (debugEnabled()) {
         // Logical payload before COSY encoding — the wire bytes are opaque
-        // base64, so the request record is written here, not in the fetch
-        // wrapper (which captures the raw response side instead). Records are
+        // base64, so the request record is written here rather than in the
+        // fetch wrapper (whose debug half is request-meta only; response
+        // capture rides the consumer-side read loop below). Records are
         // keyed by the PI session id (the ledger join key), with the hashed
         // wire session id carried as a field — legacy and v2 must land in the
         // same per-session file.

@@ -34,12 +34,14 @@ import {
   profileValuesChanged,
   type RateFit,
   readProfile,
+  resetProfileForParity,
   scanLedgers,
   writeProfile,
 } from "./lifetime.js";
 import { CREDITS_PER_USD, rateForUpstreamKey } from "./pricing.js";
 import { qoderModeFor } from "./protocol/plan.js";
 import { streamQoderRouter } from "./protocol/router.js";
+import { legacyAffinityCutoverLive, QODER_WIRE_COMPAT, type QoderWireCompatData } from "./protocol/wire-compat.js";
 import { getQoderBaseUrl, getQoderRegionConfig, QODER_MODES, type QoderMode } from "./region.js";
 import { resolveWarmGate } from "./warm-gate.js";
 import { evaluateGuard, parseBudgetEnv } from "./warm-guard.js";
@@ -63,9 +65,19 @@ export interface QoderExtensionDeps {
   profile?: LifetimeProfile;
   scanLedgers?: (budgetMs: number) => LedgerScan;
   writeProfile?: (profile: LifetimeProfile) => void;
+  /** Wire-compat table for the parity-cutover guard; tests inject a promoted clone. */
+  wireCompat?: QoderWireCompatData;
 }
 
 const QODER_API = "qoder-api" as Api;
+
+/**
+ * Whether the legacy-affinity parity reset has already run in this process.
+ * The reset is once per process, not once per session: a promoted carrier is
+ * live for every later session too, and deleting again would discard the
+ * profile the first post-parity learn just rebuilt (AC-08's falsifier).
+ */
+let legacyAffinityParityResetDone = false;
 
 /**
  * Register qoder-api with the host's compat registry. The acquisition, the
@@ -265,6 +277,16 @@ export default async function (pi: ExtensionAPI, deps: QoderExtensionDeps = {}) 
     // a failed scan or write keeps the prior profile in force and never blocks
     // startup (the extension must not die from an auxiliary failure).
     try {
+      // Parity cutover (fs-qoder-legacy-affinity CU-06 / SA §3.3 OB-6): every
+      // published lifetime was learned under client-deficient affinity, so
+      // the profile is discarded once when a promoted affinity carrier is
+      // live — never on the shipped build, where nothing beyond the identity
+      // baseline session_id is live and a reset would discard evidence for
+      // nothing. Runs before the learn so the rebuild starts from no prior.
+      if (!legacyAffinityParityResetDone && legacyAffinityCutoverLive(deps.wireCompat ?? QODER_WIRE_COMPAT)) {
+        legacyAffinityParityResetDone = true;
+        resetProfileForParity();
+      }
       const prior = readProfile();
       const scan = (deps.scanLedgers ?? scanLedgers)(LEARNER_BUDGET_MS);
       const learned = learnProfile(scan, prior);
