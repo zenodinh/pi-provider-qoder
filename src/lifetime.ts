@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { MODEL_PROMPT_CACHE } from "./catalog.js";
 import { debugLog } from "./debug.js";
 import { getPiAgentDir } from "./home.js";
+import type { PrefixStamp } from "./protocol/prefix-chain.js";
 import { parseQoderCreditsUsage } from "./protocol/usage.js";
 
 /** Extension-owned profile of per-model cache lifetimes and learned rate fits. */
@@ -111,7 +112,19 @@ export function clampLifetimeSeconds(seconds: number): number {
   return Math.min(Math.max(seconds, LIFETIME_MIN_SECONDS), LIFETIME_MAX_SECONDS);
 }
 
-interface LedgerAssistantLine {
+/**
+ * The six optional prefix-identity keys a dispatched turn stamps onto its usage
+ * row. Derived from the writer's own `PrefixStamp` rather than spelled out again:
+ * the ledger carries exactly what protocol/prefix-chain.ts writes, so a field the
+ * writer renames is a compile error here instead of a silent desync between the two
+ * modules. Absent keys stay absent rather than being defaulted — every row written
+ * before this change carries none of them, and inventing a value would make the
+ * census unable to distinguish a cold chain from a stale ledger. The same
+ * absent-rather-than-coerced posture `credits` follows.
+ */
+type LedgerPrefixFields = Partial<PrefixStamp>;
+
+interface LedgerAssistantLine extends LedgerPrefixFields {
   kind: "assistant";
   provider: string;
   model: string;
@@ -123,7 +136,7 @@ interface LedgerAssistantLine {
   credits: number | undefined;
 }
 
-interface LedgerWarmLine {
+interface LedgerWarmLine extends LedgerPrefixFields {
   kind: "cache_warm";
   provider: string;
   model: string;
@@ -150,9 +163,52 @@ function finiteNumber(value: unknown): number | undefined {
 }
 
 /**
+ * The six optional prefix keys off a usage record, or `undefined` to reject the
+ * whole row.
+ *
+ * A key that is ABSENT stays absent, so a pre-change row parses exactly as before.
+ * A key that is PRESENT but malformed rejects the row wholesale rather than being
+ * dropped on its own: partially admitting it would hand a reader a row carrying
+ * some of the six, which is the one shape the classifier must never see, and it
+ * would silently turn a corrupt stamp into a cold-chain verdict. Both branches of
+ * parseLedgerLine admit them, because assistant rows feed the gap filter and warm
+ * rows feed the death observations — admitting one branch only would strand the
+ * other's evidence in the ledger.
+ */
+function prefixFields(usage: Record<string, unknown>): LedgerPrefixFields | undefined {
+  const fields: LedgerPrefixFields = {};
+
+  if (usage.prefixLen !== undefined) {
+    const prefixLen = tokenCount(usage.prefixLen);
+    if (prefixLen === undefined) return undefined;
+    fields.prefixLen = prefixLen;
+  }
+  if (usage.prefixDivergedAt !== undefined) {
+    const prefixDivergedAt = tokenCount(usage.prefixDivergedAt);
+    if (prefixDivergedAt === undefined) return undefined;
+    fields.prefixDivergedAt = prefixDivergedAt;
+  }
+  if (usage.prefixStable !== undefined) {
+    if (typeof usage.prefixStable !== "boolean") return undefined;
+    fields.prefixStable = usage.prefixStable;
+  }
+  // One loop for the three digests: three structurally identical guards would be
+  // the duplication REU-2 extracts, and they share one malformed-value posture.
+  for (const key of ["prefixHash", "paramsHash", "payloadHash"] as const) {
+    const value = usage[key];
+    if (value === undefined) continue;
+    if (typeof value !== "string") return undefined;
+    fields[key] = value;
+  }
+  return fields;
+}
+
+/**
  * Narrow one JSONL line to the facts the learner reads, or skip it. Unknown
- * fields, corrupt lines, and non-numeric token counts are dropped — a single
- * malformed row must not abort the scan (best-effort posture).
+ * fields and corrupt lines are dropped, and a non-numeric token count rejects the
+ * row — a single malformed row must not abort the scan (best-effort posture). The
+ * whitelisted prefix keys are not "unknown": a malformed one rejects its row too,
+ * because dropping just that field would admit a half-stamped row.
  */
 function parseLedgerLine(line: string): LedgerLine | undefined {
   let raw: unknown;
@@ -174,6 +230,8 @@ function parseLedgerLine(line: string): LedgerLine | undefined {
     const cacheWrite = tokenCount(usage.cacheWrite);
     if (input === undefined || cacheRead === undefined || cacheWrite === undefined) return undefined;
     const cost = isRecord(usage.cost) ? finiteNumber(usage.cost.total) : undefined;
+    const prefix = prefixFields(usage);
+    if (prefix === undefined) return undefined;
     return {
       kind: "cache_warm",
       provider,
@@ -184,6 +242,7 @@ function parseLedgerLine(line: string): LedgerLine | undefined {
       cacheWrite,
       credits: parseQoderCreditsUsage(usage).credits,
       costTotal: cost ?? 0,
+      ...prefix,
     };
   }
   if (raw.type !== "message" || !isRecord(raw.message)) return undefined;
@@ -203,6 +262,8 @@ function parseLedgerLine(line: string): LedgerLine | undefined {
   if (input === undefined || cacheRead === undefined || cacheWrite === undefined || output === undefined) {
     return undefined;
   }
+  const prefix = prefixFields(usage);
+  if (prefix === undefined) return undefined;
   return {
     kind: "assistant",
     provider,
@@ -213,6 +274,7 @@ function parseLedgerLine(line: string): LedgerLine | undefined {
     cacheWrite,
     output,
     credits: parseQoderCreditsUsage(usage).credits,
+    ...prefix,
   };
 }
 

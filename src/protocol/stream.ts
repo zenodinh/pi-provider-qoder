@@ -33,6 +33,7 @@ import { yieldToEventLoop } from "../yield.js";
 import { type DsmlParserEvent, DsmlToolCallParser } from "./dsml.js";
 import { qoderEncodeBodyAsync } from "./encoding.js";
 import { PROCESS_FALLBACK_SESSION_ID, planQoderTurn, qoderModeFor, type TurnPlanSeed } from "./plan.js";
+import { extendPrefixChain, prefixStampFields } from "./prefix-chain.js";
 import { mergeQoderHeaders } from "./request.js";
 import { PROTOCOL } from "./routing.js";
 import { classifyTurnKind, resolveRunIdentity } from "./run-identity.js";
@@ -342,6 +343,49 @@ export function streamQoder(
         // thinking so the model does not reason by default.
         parameters.enable_thinking = false;
       }
+
+      // Per-turn prefix identity, stamped once per dispatch onto the assembled
+      // `output` message. This is the assembly site rather than the usage-chunk
+      // handler below because that handler sits inside `if (inner.usage)`: an HTTP
+      // failure, a malformed-SSE throw, an idle timeout or an external abort all
+      // reach the error terminal without any usage chunk, so stamping there would
+      // leave legacy's error and aborted rows carrying none of the six fields
+      // while v2's tail hook stamps them — identical turns diverging across
+      // protocols, which is the defect SA §7.8's v0.4 correction (OD-E) re-placed
+      // this write to fix. Here it precedes every downstream throw site, so every
+      // terminal that pushes `output` — the done event and the error event alike —
+      // carries it.
+      //
+      // The chain reads the RAW transcript view, the same one v2's payload hook
+      // reads, so `prefixHash` is transport-independent for one transcript.
+      // `payloadHash` and `paramsHash` are NOT comparable across transports: this
+      // view is legacy's own logical prompt, resolved before the request body and
+      // before the caller's `onPayload` hook can reject, where v2 digests its own
+      // prompt view assembled inside that hook. Neither is the wire body, and
+      // neither reflects a host hook's rewrite. The view carries prompt-determining
+      // content only: one per-dispatch value in it (a request id, a timestamp, a
+      // session id) would move the digest every turn, make `prefixStable`
+      // unreachable, and leave the field written, hashed and meaningless.
+      const prefixChain = extendPrefixChain({
+        // The pi session id is the ledger's own join key, so the memo groups chains
+        // the way the census groups rows. Both transports use it, which is what
+        // keeps the v2-to-legacy self-heal from reading as a divergence: the same
+        // transcript re-dispatched over the other wire extends the same chain.
+        sessionKey: options?.sessionId ?? PROCESS_FALLBACK_SESSION_ID,
+        systemText,
+        tools: currentTools,
+        messages: transcriptMessages,
+      });
+      const prefixStamp = prefixStampFields(prefixChain, parameters, {
+        systemText,
+        messages: normalizedMessages,
+        tools: toolsRaw ?? [],
+        parameters,
+      });
+      // Absent (undefined) exactly when the chain is cold, so a first turn writes
+      // none of the six keys and the ledger's class 0 stays an honest "no stamp"
+      // rather than a coerced verdict.
+      if (prefixStamp !== undefined) Object.assign(output.usage, prefixStamp);
 
       // Qoder groups billing/records per agentic "run". qodercli keeps one
       // request_set_id + business.id per run (created at run start, threaded

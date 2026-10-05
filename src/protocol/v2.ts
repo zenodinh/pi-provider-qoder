@@ -7,6 +7,8 @@ import {
   type AssistantMessageEventStream,
   clampThinkingLevel,
   createAssistantMessageEventStream,
+  getCurrentSystemMessage,
+  getSystemMessageText,
   type Model,
   type SimpleStreamOptions,
   type ThinkingLevel,
@@ -20,11 +22,12 @@ import { openAICompletionsApi } from "../host-seam.js";
 import { type RateSource, rateForUpstreamKey } from "../pricing.js";
 import type { QoderMode } from "../region.js";
 import { PROCESS_FALLBACK_SESSION_ID, planQoderTurn, type TurnPlan, type TurnPlanSeed } from "./plan.js";
+import { extendPrefixChain, prefixStampFields } from "./prefix-chain.js";
 import { markLegacyOnly } from "./routing.js";
 import { classifyTurnKind, type QoderRunMessage, resolveRunIdentity } from "./run-identity.js";
 import { clampPromptCacheKey } from "./session-key.js";
 import { createReframedFetch } from "./sse-reframe.js";
-import { withTerminalStamp } from "./stamp.js";
+import { type TerminalStamp, withTerminalStamp } from "./stamp.js";
 import { streamQoder } from "./stream.js";
 import { contentToText } from "./transform.js";
 
@@ -233,13 +236,23 @@ function errorStream(model: Model<Api>, message: string): AssistantMessageEventS
  * normalizes the terminal's `model` to the friendly catalog id `modelId`,
  * without touching pi-ai's computed cost; the shared wrapper supplies the
  * ordered terminal-before-end guarantee.
+ *
+ * `stamp` is the caller's own object and is populated rather than replaced or
+ * spread into a fresh literal. That identity is load-bearing: this tail is wrapped
+ * synchronously while the payload hook that attaches the prefix rider is async,
+ * so a copy taken here would be snapshotted before the hook ran and the rider
+ * would be silently dropped. `modelId` is written before the tail invokes
+ * `onTerminal`, so a rider observes the normalized model.
  */
 function withRateSourceStamp(
   inner: AssistantMessageEventStream,
   rateSource: RateSource,
   modelId: string,
+  stamp: TerminalStamp,
 ): AssistantMessageEventStream {
-  return withTerminalStamp(inner, { rateSource, modelId });
+  stamp.rateSource = rateSource;
+  stamp.modelId = modelId;
+  return withTerminalStamp(inner, stamp);
 }
 
 /**
@@ -279,6 +292,13 @@ export function streamQoderV2(
   };
 
   const callerOnPayload = options?.onPayload;
+  // Created before the tail is wrapped below and populated inside the async payload
+  // hook, because the hook is the one place v2 holds the transcript view beside the
+  // assembled body while the tail is wrapped synchronously. A turn that never
+  // reaches the hook — a pre-dispatch allowlist or credential rejection — leaves it
+  // unpopulated, so its terminal carries none of the six fields rather than a
+  // partial set.
+  const terminalStamp: TerminalStamp = {};
   const wrappedOnPayload = async (payload: unknown, selected: Model<Api>): Promise<unknown> => {
     const body = isRecord(payload) ? payload : {};
     // The raw transcript view, matching the legacy transport's input. Both
@@ -287,6 +307,59 @@ export function streamQoderV2(
     // One plan per v2 dispatch: no identity lookup happens on this protocol.
     const plan = route.plan ? await planQoderTurn(model, context, options, route.plan) : undefined;
     injectQoderFields(body, route, v2Model, options, messages, plan);
+
+    // Per-turn prefix identity, riding the tail's reserved onTerminal hook. pi-ai
+    // invokes this hook before any chunk, so before any terminal the tail stamps,
+    // and the hook is exception-isolated by the tail — a throwing rider can neither
+    // drop a terminal nor leave the host awaiting forever.
+    //
+    // The chain reads the same raw view and the same two transcript helpers legacy
+    // reads, so prefixLen/prefixHash/prefixStable/prefixDivergedAt are
+    // transport-independent for one transcript. paramsHash and payloadHash are not
+    // comparable across transports: each digests its own transport's logical prompt
+    // view, and both are resolved before the caller's hook below can replace the
+    // body. FR-6 cross-checks payloadHash same-transport only.
+    const currentSystem = getCurrentSystemMessage(context.messages);
+    const systemText = currentSystem ? getSystemMessageText(currentSystem) : "";
+    const tools = currentSystem?.toolsAdded ?? [];
+    // The sampling view, built from the option fields pi-ai merges into the body
+    // rather than read back off it: pi-ai owns the body's key set, so reading
+    // sampling keys out of it would couple a persisted ledger digest to an upstream
+    // key change. `max_tokens` is the warm replay's one-token cap, which
+    // prefix-chain.ts excludes from the digest so a warm row never reads as class 3.
+    const sampling = {
+      max_tokens: options?.maxTokens,
+      temperature: options?.temperature,
+      enable_thinking: body.enable_thinking,
+      ...model.samplingParams,
+      ...options?.samplingParams,
+    };
+    const prefixChain = extendPrefixChain({
+      // The pi session id, the ledger's own join key and the same key legacy uses —
+      // which is what keeps the self-heal below from reading as a divergence when it
+      // re-dispatches one transcript over the other wire.
+      sessionKey: options?.sessionId ?? PROCESS_FALLBACK_SESSION_ID,
+      systemText,
+      tools,
+      messages,
+    });
+    // The payload view carries prompt-determining content ONLY. `body` itself is
+    // deliberately not the view: injectQoderFields puts a fresh
+    // `metadata.context.request_id` and a run-rotating `request_set_id` on it, so
+    // digesting the body would move payloadHash on every single dispatch and leave
+    // the field written, hashed and meaningless.
+    const prefixStamp = prefixStampFields(prefixChain, sampling, {
+      systemText,
+      messages,
+      tools,
+      parameters: sampling,
+    });
+    if (prefixStamp !== undefined) {
+      terminalStamp.onTerminal = (message: AssistantMessage): void => {
+        Object.assign(message.usage, prefixStamp);
+      };
+    }
+
     if (callerOnPayload) {
       const next = await callerOnPayload(body, selected);
       return next !== undefined ? next : body;
@@ -296,8 +369,10 @@ export function streamQoderV2(
 
   // The gateway intermittently splits event JSON across lines (recorded
   // 2026-09-28); repair the framing before the SDK's strict SSE parser sees it.
-  // Debug capture wraps the base fetch INSIDE the reframe wrapper: the capture
-  // tees raw server bytes, and reframe still repairs the framing downstream.
+  // Debug capture wraps the base fetch INSIDE the reframe wrapper: capture keeps
+  // the request record and neither tees nor re-wraps a body, while reframe owns
+  // the response record off its own consumer-side transform. So the framing is
+  // still repaired downstream and the SDK reads a body nothing observed perturbed.
   const syncSession = options?.sessionId ?? PROCESS_FALLBACK_SESSION_ID;
   const debugMeta: DebugFetchMeta = {
     protocol: "v2",
@@ -324,7 +399,7 @@ export function streamQoderV2(
   // decides whether the first event hands the turn to legacy. `model.id` is the
   // friendly catalog id: pi-ai dispatched under `route.upstreamKey`, so without
   // normalizing it back the persisted row would key by the wire key.
-  const stamped = withRateSourceStamp(inner, rateSource, model.id);
+  const stamped = withRateSourceStamp(inner, rateSource, model.id, terminalStamp);
   if (!fallbackEnabled) return stamped;
 
   // Self-heal (opt-in): on a pre-start 400 invalid_model_error, the routing

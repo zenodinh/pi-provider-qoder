@@ -233,3 +233,158 @@ describe("profile read/write (AC-06)", () => {
     expect(readProfile(dir)).toBeUndefined();
   });
 });
+
+/**
+ * The ledger whitelist for the six prefix-identity keys (spec CU-05).
+ *
+ * `parseLedgerLine` is module-private, so admission is observed through the
+ * exported `scanLedgers` by REJECTION ASYMMETRY rather than by field presence: a
+ * malformed prefix key must make its row vanish, which it can only do if that
+ * branch read the key at all. Sample-structure propagation is FS-E's gap-filter
+ * edit at the gap push, not this whitelist's, so a stamped row publishes exactly
+ * what the same row unstamped publishes.
+ */
+describe("parseLedgerLine prefix whitelist (spec CU-05)", () => {
+  const STAMPED_AT = Date.UTC(2026, 8, 30, 0, 0, 0);
+
+  // invented: prefixLen 412300 is SA §5.1's own example value; the three digests
+  // are that example's truncated forms ("9f2c…", "41ab…", "77e0…") padded to the
+  // 32-hex width prefix-chain.ts publishes.
+  const PREFIX_FIELDS = {
+    prefixLen: 412300,
+    prefixHash: "9f2c000000000000000000000000abcd",
+    prefixStable: true,
+    paramsHash: "41ab000000000000000000000000abcd",
+    payloadHash: "77e0000000000000000000000000abcd",
+  };
+
+  /** One fixture row as a JSONL line, with extra keys merged into its usage object. */
+  function row(entry: unknown, usage: Record<string, unknown>): string {
+    const line = structuredClone(entry) as {
+      usage?: Record<string, unknown>;
+      message?: { usage?: Record<string, unknown> };
+    };
+    const target = line.message?.usage ?? line.usage;
+    if (!target) throw new Error("fixture row carries no usage object");
+    Object.assign(target, usage);
+    return JSON.stringify(line);
+  }
+
+  function assistantRow(at: number, usage: Record<string, unknown> = PREFIX_FIELDS): string {
+    return row(assistantEntry(MODEL, at, TOKENS, 1.94), usage);
+  }
+
+  function warmRow(at: number, usage: Record<string, unknown> = PREFIX_FIELDS): string {
+    return row(warmEntry(at, TOKENS, 0.0259, 1.94), usage);
+  }
+
+  // spec: T-11 / AC-08 — both ledger row kinds carry the prefix fields through the
+  // parse, and rows without them are unaffected.
+  it("T-11 admits all six keys in both branches and publishes exactly what an unstamped ledger publishes", () => {
+    const unstampedRoot = sessionsRoot();
+    writeSession(unstampedRoot, "session.jsonl", [
+      JSON.stringify(assistantEntry(MODEL, STAMPED_AT, TOKENS, 1.94)),
+      JSON.stringify(warmEntry(STAMPED_AT + 60_000, TOKENS, 0.0259, 1.94)),
+    ]);
+    const unstamped = scanLedgers(5000, [unstampedRoot]);
+
+    const stampedRoot = sessionsRoot();
+    writeSession(stampedRoot, "session.jsonl", [assistantRow(STAMPED_AT), warmRow(STAMPED_AT + 60_000)]);
+    const stamped = scanLedgers(5000, [stampedRoot]);
+
+    // Both rows still parse with all six keys present: the warm row reaches
+    // scan.warm and the assistant row reaches the model's turn sample.
+    expect(stamped.warm, "the cache_warm branch admitted the stamp").toHaveLength(1);
+    expect(stamped.models[MODEL]?.turns, "the assistant branch admitted the stamp").toHaveLength(1);
+    // And admitting them changes no published value, which is the additive-field
+    // compatibility claim: the sample structures are built fresh, so nothing leaks.
+    expect(stamped.warm).toEqual(unstamped.warm);
+    expect(stamped.models[MODEL]?.turns).toEqual(unstamped.models[MODEL]?.turns);
+    expect(stamped.models[MODEL]?.gaps).toEqual(unstamped.models[MODEL]?.gaps);
+  });
+
+  it("T-11 rejects a warm row whose prefixLen is malformed, so the warm branch demonstrably reads the key", () => {
+    const root = sessionsRoot();
+    writeSession(root, "session.jsonl", [warmRow(STAMPED_AT, { ...PREFIX_FIELDS, prefixLen: "not-a-number" })]);
+
+    // Had the branch ignored the key as unknown, the row would have survived.
+    expect(scanLedgers(5000, [root]).warm, "a malformed stamp rejects the row wholesale").toHaveLength(0);
+  });
+
+  it("T-11 rejects an assistant row whose prefixLen is malformed, so the assistant branch demonstrably reads it", () => {
+    const root = sessionsRoot();
+    writeSession(root, "session.jsonl", [assistantRow(STAMPED_AT, { ...PREFIX_FIELDS, prefixLen: "not-a-number" })]);
+
+    expect(scanLedgers(5000, [root]).models[MODEL]?.turns ?? [], "the row was refused, not half-admitted").toHaveLength(
+      0,
+    );
+  });
+
+  // spec: T-12 / AC-09 — the reject-wholesale posture and the unknown-key drop both
+  // survive the whitelist extension.
+  it("T-12 still refuses a corrupt line and a malformed stamp, and keeps scanning past both", () => {
+    const root = sessionsRoot();
+    writeSession(root, "session.jsonl", [
+      "{not json at all",
+      assistantRow(STAMPED_AT),
+      assistantRow(STAMPED_AT + 20_000, { ...PREFIX_FIELDS, prefixStable: "true" }),
+      assistantRow(STAMPED_AT + 40_000),
+    ]);
+
+    const scan = scanLedgers(5000, [root]);
+    expect(scan.files, "the scan completed rather than aborting on the corrupt line").toBe(1);
+    expect(scan.exceededBudget).toBe(false);
+    expect(
+      scan.models[MODEL]?.turns,
+      "the unparseable line and the non-boolean prefixStable are both refused; the two clean rows survive",
+    ).toHaveLength(2);
+  });
+
+  it("T-12 still drops unknown keys beyond the six", () => {
+    const root = sessionsRoot();
+    writeSession(root, "session.jsonl", [
+      assistantRow(STAMPED_AT, { ...PREFIX_FIELDS, prefixFromTheFuture: "ignored" }),
+    ]);
+
+    const turn = scanLedgers(5000, [root]).models[MODEL]?.turns[0];
+    expect(turn, "the row still parses with an unknown key beside the whitelist").toBeDefined();
+    expect(Object.keys(turn ?? {}).sort(), "and only the keys the parser names survive it").toEqual([
+      "cacheRead",
+      "credits",
+      "input",
+      "output",
+    ]);
+  });
+
+  it("T-12 rejects a malformed digest key, not only a malformed number", () => {
+    const root = sessionsRoot();
+    writeSession(root, "session.jsonl", [warmRow(STAMPED_AT, { ...PREFIX_FIELDS, paramsHash: 41 })]);
+
+    expect(
+      scanLedgers(5000, [root]).warm,
+      "a non-string digest rejects the row like any other malformation",
+    ).toHaveLength(0);
+  });
+
+  it("T-11 admits prefixDivergedAt, and rejects the row when that index is malformed", () => {
+    // The divergence index is the one field that says WHERE a prefix broke, so it
+    // must survive the parse on a diverged row rather than being dropped as unknown.
+    const divergedRoot = sessionsRoot();
+    writeSession(divergedRoot, "session.jsonl", [
+      assistantRow(STAMPED_AT, { ...PREFIX_FIELDS, prefixStable: false, prefixDivergedAt: 3 }),
+    ]);
+    expect(
+      scanLedgers(5000, [divergedRoot]).models[MODEL]?.turns,
+      "a diverged row carrying a valid index still parses",
+    ).toHaveLength(1);
+
+    const malformedRoot = sessionsRoot();
+    writeSession(malformedRoot, "session.jsonl", [
+      assistantRow(STAMPED_AT, { ...PREFIX_FIELDS, prefixStable: false, prefixDivergedAt: "third" }),
+    ]);
+    expect(
+      scanLedgers(5000, [malformedRoot]).models[MODEL]?.turns ?? [],
+      "and a malformed index rejects the row wholesale like any other malformation",
+    ).toHaveLength(0);
+  });
+});
