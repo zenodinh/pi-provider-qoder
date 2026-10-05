@@ -888,6 +888,19 @@ describe("legacy cache affinity surface (fs-qoder-legacy-affinity)", () => {
     for (const name of AFFINITY_HEADER_NAMES) {
       expect(on.headers[name]).toBe(WIRE_SESSION);
     }
+
+    // The process.env arm of the same knob: a shell export reaches dispatches
+    // whose options carry no provider env — the file's established dual read.
+    vi.stubEnv("QODER_LEGACY_AFFINITY", "off");
+    const offByProcessEnv = await runLegacyWire({ apiKey: "fake", sessionId: "session-aff-1" });
+    vi.unstubAllEnvs();
+    expect("prompt_cache_key" in offByProcessEnv.body).toBe(false);
+    const offProcessLower = new Set(
+      Object.keys(offByProcessEnv.headers).map((name) => name.toLowerCase()),
+    );
+    for (const name of AFFINITY_HEADER_NAMES) {
+      expect(offProcessLower.has(name), `process.env off must suppress the ${name} header`).toBe(false);
+    }
   });
 
   // T-08 / AC-10: legacy carries the session identity twice, as v2 and

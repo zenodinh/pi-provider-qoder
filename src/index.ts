@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Api, ModelCost, OAuthCredentials } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-agent";
@@ -73,11 +73,22 @@ const QODER_API = "qoder-api" as Api;
 
 /**
  * Whether the legacy-affinity parity reset has already run in this process.
- * The reset is once per process, not once per session: a promoted carrier is
- * live for every later session too, and deleting again would discard the
- * profile the first post-parity learn just rebuilt (AC-08's falsifier).
+ * Belt to the marker file's braces: it also bounds the damage when the marker
+ * write itself fails, so a broken install re-runs the idempotent reset at
+ * most once per process instead of once per session start.
  */
 let legacyAffinityParityResetDone = false;
+
+/**
+ * Marker recording that the legacy-affinity parity reset has run on this
+ * install. The reset is exactly once per cutover, not once per process: a
+ * later launch would otherwise delete the post-parity profile the first
+ * post-cutover learn rebuilt (AC-08's falsifier, across the process
+ * boundary). One cutover per install is the spec's "once" — a second, later
+ * promotion re-invalidating evidence is a promotion-time decision for the
+ * owner, not a behaviour this build invents.
+ */
+const PARITY_RESET_MARKER_FILENAME = "qoder-cache-lifetime-parity-reset.txt";
 
 /**
  * Register qoder-api with the host's compat registry. The acquisition, the
@@ -285,7 +296,17 @@ export default async function (pi: ExtensionAPI, deps: QoderExtensionDeps = {}) 
       // nothing. Runs before the learn so the rebuild starts from no prior.
       if (!legacyAffinityParityResetDone && legacyAffinityCutoverLive(deps.wireCompat ?? QODER_WIRE_COMPAT)) {
         legacyAffinityParityResetDone = true;
-        resetProfileForParity();
+        const parityMarkerPath = join(getPiAgentDir(), PARITY_RESET_MARKER_FILENAME);
+        if (!existsSync(parityMarkerPath)) {
+          resetProfileForParity();
+          try {
+            writeFileSync(parityMarkerPath, `${new Date().toISOString()}\n`, "utf8");
+          } catch (error) {
+            // Fail-soft with the rest of the hook: an unwritten marker only
+            // means the next process re-runs the idempotent reset.
+            debugLog("cache-lifetime parity marker write failed", error);
+          }
+        }
       }
       const prior = readProfile();
       const scan = (deps.scanLedgers ?? scanLedgers)(LEARNER_BUDGET_MS);

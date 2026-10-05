@@ -826,6 +826,7 @@ describe("session-start parity cutover (fs-qoder-legacy-affinity CU-06)", () => 
     }
     vi.resetModules();
     rmSync(join(getPiAgentDir(), PROFILE_FILENAME), { force: true });
+    rmSync(join(getPiAgentDir(), "qoder-cache-lifetime-parity-reset.txt"), { force: true });
   });
 
   /** The factory-time pi host: providers register, handlers land in the map. */
@@ -925,6 +926,32 @@ describe("session-start parity cutover (fs-qoder-legacy-affinity CU-06)", () => 
     const { default: registerProviders } = await import("../index.js");
     await registerProviders(pi as never, { scanLedgers: emptyScan });
     await startSession(handlers);
+
+    expect(readProfile()?.models[MODEL]?.lifetimeSeconds).toBe(3600);
+    expect(readProfile()?.models[MODEL]?.samples).toBe(42);
+    expect(existsSync(join(getPiAgentDir(), "qoder-cache-lifetime-parity-reset.txt"))).toBe(false);
+  });
+
+  it("T-07 performs no second reset in a later process once the cutover marker exists", async () => {
+    for (const name of patEnvNames) delete process.env[name];
+    // First process: the cutover runs and writes the marker.
+    writeProfile(seededProfile());
+    const cutover = fakePi();
+    const { default: registerCutover } = await import("../index.js");
+    await registerCutover(cutover.pi as never, { scanLedgers: emptyScan, wireCompat: promotedTable() });
+    await startSession(cutover.handlers);
+    expect(existsSync(join(getPiAgentDir(), "qoder-cache-lifetime-parity-reset.txt"))).toBe(true);
+
+    // A later process sees the same promoted table but the marker too: the
+    // profile that process rebuilt must survive its own session start, thin
+    // scan and all (AC-08's "second reset deleting a freshly learned profile"
+    // falsifier, across the process boundary).
+    vi.resetModules();
+    writeProfile(seededProfile());
+    const later = fakePi();
+    const { default: registerLater } = await import("../index.js");
+    await registerLater(later.pi as never, { scanLedgers: emptyScan, wireCompat: promotedTable() });
+    await startSession(later.handlers);
 
     expect(readProfile()?.models[MODEL]?.lifetimeSeconds).toBe(3600);
     expect(readProfile()?.models[MODEL]?.samples).toBe(42);
