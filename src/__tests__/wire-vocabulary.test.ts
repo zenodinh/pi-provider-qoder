@@ -314,6 +314,7 @@ const LEGACY_BODY_KEYS = [
   "chat_context",
   "model_config",
   "business",
+  "prompt_cache_key",
   "context_length",
 ];
 
@@ -352,6 +353,9 @@ const LEGACY_HEADER_NAMES = [
   "Cosy-Version",
   "Login-Version",
   "X-Request-Id",
+  "session_id",
+  "x-client-request-id",
+  "x-session-affinity",
 ].sort();
 
 /** The affinity trio v2 sends and legacy does not (AC-08's negative pin). */
@@ -446,7 +450,7 @@ describe("legacy parameters vocabulary (SA rows 2, 8)", () => {
     const { body } = await runLegacyCapture({ apiKey: "fake", reasoning: "high" });
     const keys = Object.keys(body);
     expect(keys).toEqual(LEGACY_BODY_KEYS);
-    expect(keys).toHaveLength(26);
+    expect(keys).toHaveLength(27); // + prompt_cache_key, promoted 2026-10-05
     expect(keys[0]).toBe("request_id");
     expect(keys.at(-1)).toBe("context_length");
     // A number, never a string or null: v2's top-level form is numeric, and the
@@ -455,14 +459,14 @@ describe("legacy parameters vocabulary (SA rows 2, 8)", () => {
   });
 
   // T-03 / AC-01: the merged 25-name header set.
-  it("merges the 6 base header names over the 19 COSY names into one 25-name set", async () => {
+  it("merges the base + COSY + promoted affinity headers into one 28-name set", async () => {
     const { headers } = await runLegacyCapture({ apiKey: "fake", reasoning: "high" });
     const names = Object.keys(headers);
     expect([...names].sort()).toEqual(LEGACY_HEADER_NAMES);
-    expect(names).toHaveLength(25);
+    expect(names).toHaveLength(28); // + the promoted affinity trio (2026-10-05)
     // mergeQoderHeaders is case-insensitive, so a set that lost that property
     // would show two spellings of one name and 26 entries.
-    expect(new Set(names.map((name) => name.toLowerCase())).size).toBe(25);
+    expect(new Set(names.map((name) => name.toLowerCase())).size).toBe(28);
     // The non-deterministic values are present but not compared; pin only that
     // they are non-empty, so a blanked signature is still caught.
     expect(String(headers.Authorization).startsWith("Bearer COSY.")).toBe(true);
@@ -472,18 +476,37 @@ describe("legacy parameters vocabulary (SA rows 2, 8)", () => {
 
   // T-04 / AC-08: the affinity gap, pinned as a negative so the CU-7 probe
   // verdict flips this row deliberately instead of silently.
-  it("sends no prompt_cache_key field and none of the three affinity headers", async () => {
-    // sessionId is supplied on purpose: were affinity implemented, this is the
-    // value it would carry, so the negative is meaningful rather than trivial.
+  it("sends prompt_cache_key and the three affinity headers on the shipped (promoted) build", async () => {
+    // Promoted 2026-10-05: the owner directed both legacy affinity carriers live
+    // ("we cannot be sure without them, so better send them"). The absence is
+    // still pinned — through the kill-switch row below and the demotion rows,
+    // i.e. the rollback paths rather than the shipped path.
     const { body, headers } = await runLegacyCapture({
       apiKey: "fake",
       reasoning: "high",
       sessionId: "session-1",
     });
-    expect("prompt_cache_key" in body).toBe(false);
+    expect(typeof body.prompt_cache_key).toBe("string");
+    expect(body.prompt_cache_key).toBe(body.session_id);
     const lower = new Set(Object.keys(headers).map((name) => name.toLowerCase()));
     for (const name of AFFINITY_HEADER_NAMES) {
-      expect(lower.has(name), `legacy must not send the ${name} header`).toBe(false);
+      expect(lower.has(name), `promoted legacy must send the ${name} header`).toBe(true);
+    }
+  });
+
+  it("QODER_LEGACY_AFFINITY=off removes every affinity placement from the shipped build", async () => {
+    const on = await runLegacyCapture({ apiKey: "fake", reasoning: "high", sessionId: "session-1" });
+    expect("prompt_cache_key" in on.body).toBe(true);
+    const off = await runLegacyCapture({
+      apiKey: "fake",
+      reasoning: "high",
+      sessionId: "session-1",
+      env: { QODER_LEGACY_AFFINITY: "off" },
+    });
+    expect("prompt_cache_key" in off.body).toBe(false);
+    const lower = new Set(Object.keys(off.headers).map((name) => name.toLowerCase()));
+    for (const name of AFFINITY_HEADER_NAMES) {
+      expect(lower.has(name), `kill switch must remove the ${name} header`).toBe(false);
     }
   });
 });
@@ -755,6 +778,15 @@ describe("legacy cache affinity surface (fs-qoder-legacy-affinity)", () => {
     return table;
   }
 
+  /** A clone of the shipped table with `carriers` demoted back into the gated row. */
+  function demotedTable(carriers: string[]): QoderWireCompatData {
+    const table = structuredClone(QODER_WIRE_COMPAT);
+    for (const carrier of carriers) {
+      table.affinityPlacement = table.affinityPlacement.filter((entry) => entry !== `legacy:${carrier}`);
+      table.affinityPlacementGated.push(`legacy:${carrier}`);
+    }
+    return table;
+  }
   /**
    * The wire the gateway actually receives: the encoded body decoded back to
    * JSON plus the merged header record. The affinity body field is written
@@ -807,17 +839,18 @@ describe("legacy cache affinity surface (fs-qoder-legacy-affinity)", () => {
   // T-02 / AC-01, AC-02: the body key ships exactly when its row is promoted,
   // carrying the legacy wire session form — the same value the body's own
   // session_id carries — inside the bytes COSY signs.
-  it("puts prompt_cache_key on the wire only when its row is promoted, with the body's own session value", async () => {
+  it("puts prompt_cache_key on the wire on the promoted build, and a demoted clone removes it", async () => {
     const shipped = await runLegacyWire({ apiKey: "fake", sessionId: "session-aff-1" });
-    expect("prompt_cache_key" in shipped.body).toBe(false);
+    expect(typeof shipped.body.prompt_cache_key).toBe("string");
+    expect(shipped.body.prompt_cache_key).toBe(shipped.body.session_id);
 
-    planTableOverride.table = promotedTable(["prompt_cache_key"]);
-    const promoted = await runLegacyWire({ apiKey: "fake", sessionId: "session-aff-1" });
-    expect(promoted.body.prompt_cache_key).toBe(WIRE_SESSION);
-    expect(promoted.body.prompt_cache_key).toBe(promoted.body.session_id);
-    expectBodyhashOverSentBytes(promoted);
+    // Promotion is data: moving the string back on a clone un-sends it. The
+    // frozen export is never mutated.
+    planTableOverride.table = demotedTable(["prompt_cache_key"]);
+    const demotedRun = await runLegacyWire({ apiKey: "fake", sessionId: "session-aff-1" });
+    expect("prompt_cache_key" in demotedRun.body).toBe(false);
+    planTableOverride.table = undefined;
   });
-
   // T-03 / AC-06: the field is written onto the post-hook payload object, so a
   // host or extension that replaces the body outright cannot silently drop it.
   it("keeps prompt_cache_key through an onPayload hook that returns a replacement object", async () => {
@@ -833,29 +866,31 @@ describe("legacy cache affinity surface (fs-qoder-legacy-affinity)", () => {
 
   // T-04 / AC-01, AC-03: the header trio ships exactly when its row is
   // promoted, unsigned, carrying the body's session value, overridable.
-  it("sends the affinity header trio only when promoted, with the body's session value, and a caller header still wins", async () => {
+  it("sends the affinity header trio on the promoted build, with the body's session value; a caller header still wins; a demoted clone removes them", async () => {
     const shipped = await runLegacyWire({ apiKey: "fake", sessionId: "session-aff-1" });
     const shippedLower = new Set(Object.keys(shipped.headers).map((name) => name.toLowerCase()));
     for (const name of AFFINITY_HEADER_NAMES) {
-      expect(shippedLower.has(name), `unpromoted legacy must not send the ${name} header`).toBe(false);
+      expect(shippedLower.has(name), `promoted legacy must send the ${name} header`).toBe(true);
     }
+    expect(shipped.headers["x-session-affinity"]).toBe(shipped.body.session_id); // the resolved wire session id, same value the body carries
 
-    planTableOverride.table = promotedTable(["header-x-session-id"]);
-    const promoted = await runLegacyWire({ apiKey: "fake", sessionId: "session-aff-1" });
-    for (const name of AFFINITY_HEADER_NAMES) {
-      expect(promoted.headers[name], `${name} carries the wire session value`).toBe(WIRE_SESSION);
-    }
-    expectBodyhashOverSentBytes(promoted);
-
+    // Caller-supplied headers still win over the affinity defaults.
     const overridden = await runLegacyWire({
       apiKey: "fake",
       sessionId: "session-aff-1",
-      headers: { "X-Session-Affinity": "custom-affinity" },
+      headers: { "x-session-affinity": "caller-wins" },
     });
-    expect(overridden.headers["x-session-affinity"]).toBe("custom-affinity");
-    expect(overridden.headers["x-client-request-id"]).toBe(WIRE_SESSION);
-  });
+    expect(overridden.headers["x-session-affinity"]).toBe("caller-wins");
 
+    // Demotion is data: the clone without the carrier sends none of the trio.
+    planTableOverride.table = demotedTable(["header-x-session-id"]);
+    const demotedRun = await runLegacyWire({ apiKey: "fake", sessionId: "session-aff-1" });
+    const demotedLower = new Set(Object.keys(demotedRun.headers).map((name) => name.toLowerCase()));
+    for (const name of AFFINITY_HEADER_NAMES) {
+      expect(demotedLower.has(name), `demoted clone must not send ${name}`).toBe(false);
+    }
+    planTableOverride.table = undefined;
+  });
   // T-05 / AC-04: retention none omits the body field and the header trio
   // independently, mirroring v2's two separate gates.
   it("omits the body field and the header trio independently under cacheRetention none", async () => {

@@ -3,7 +3,6 @@ import {
   affinityPlacements,
   carrierValue,
   isWireCompatData,
-  legacyAffinityCutoverLive,
   QODER_WIRE_COMPAT,
   type QoderWireCompatData,
   type WireCarrier,
@@ -95,55 +94,30 @@ describe("QODER_WIRE_COMPAT", () => {
   });
 
   it("turns a probe verdict into a one-string data move between rows (T-02)", () => {
-    expect(affinityPlacements("legacy")).toEqual(["session_id"]);
-    // fs-qoder-legacy-affinity CU-01 / T-01: both probe-pending legacy carriers
-    // — the prompt_cache_key body field and the unsigned header trio — sit in
-    // the gated row, out of the live set, until each is individually promoted.
-    expect(QODER_WIRE_COMPAT.affinityPlacementGated).toEqual(["legacy:prompt_cache_key", "legacy:header-x-session-id"]);
+    // Promoted 2026-10-05 (owner: "we cannot be sure without them, so better
+    // send them"): both legacy affinity carriers are LIVE and the gated row
+    // ships empty — the retained mechanism for a probe verdict that a carrier
+    // is harmful.
+    expect(affinityPlacements("legacy")).toEqual(["session_id", "prompt_cache_key", "header-x-session-id"]);
+    expect(QODER_WIRE_COMPAT.affinityPlacementGated).toEqual([]);
 
-    // The CU-7 verdict arrives as data: move one string into the live row on a
-    // clone — the frozen export must never be mutated by the test. Either
-    // carrier promotes on its own, which is the point of per-field verdicts.
+    // Promotion/demotion is data: move one string back on a clone — the frozen
+    // export must never be mutated by the test. Either carrier demotes on its
+    // own, which is the point of per-field rollbacks.
     const moved = structuredClone(QODER_WIRE_COMPAT);
-    moved.affinityPlacement.push("legacy:prompt_cache_key");
-    moved.affinityPlacementGated = moved.affinityPlacementGated.filter((entry) => entry !== "legacy:prompt_cache_key");
-    expect(affinityPlacements("legacy", moved)).toEqual(["session_id", "prompt_cache_key"]);
+    moved.affinityPlacement = moved.affinityPlacement.filter((entry) => entry !== "legacy:prompt_cache_key");
+    moved.affinityPlacementGated.push("legacy:prompt_cache_key");
+    expect(affinityPlacements("legacy", moved)).toEqual(["session_id", "header-x-session-id"]);
 
     const movedTrio = structuredClone(QODER_WIRE_COMPAT);
-    movedTrio.affinityPlacement.push("legacy:header-x-session-id");
-    movedTrio.affinityPlacementGated = movedTrio.affinityPlacementGated.filter(
-      (entry) => entry !== "legacy:header-x-session-id",
-    );
-    expect(affinityPlacements("legacy", movedTrio)).toEqual(["session_id", "header-x-session-id"]);
+    movedTrio.affinityPlacement = movedTrio.affinityPlacement.filter((entry) => entry !== "legacy:header-x-session-id");
+    movedTrio.affinityPlacementGated.push("legacy:header-x-session-id");
+    expect(affinityPlacements("legacy", movedTrio)).toEqual(["session_id", "prompt_cache_key"]); // trio demoted, body carrier still live
 
     // The move is legacy-scoped: v2's live placements are untouched.
     expect(affinityPlacements("v2", moved)).toEqual(affinityPlacements("v2"));
-    // With the module source unchanged, the shipped table still emits session_id alone.
-    expect(affinityPlacements("legacy")).toEqual(["session_id"]);
-  });
-});
-
-describe("legacyAffinityCutoverLive", () => {
-  // fs-qoder-legacy-affinity CU-06's guard: a reset fires only when a
-  // placement BEYOND the identity baseline is live. session_id has always
-  // been live — it is not a change — so the shipped build resets nothing and
-  // the literal reading of "any placement live" would delete every learned
-  // profile at every session start.
-  it("is false on the shipped table and true only when a placement beyond the identity baseline is live", () => {
-    expect(legacyAffinityCutoverLive()).toBe(false);
-
-    const baselineOnly = structuredClone(QODER_WIRE_COMPAT);
-    baselineOnly.affinityPlacement = ["legacy:session_id"];
-    expect(legacyAffinityCutoverLive(baselineOnly)).toBe(false);
-
-    for (const carrier of ["prompt_cache_key", "header-x-session-id"]) {
-      const promoted = structuredClone(QODER_WIRE_COMPAT);
-      promoted.affinityPlacement.push(`legacy:${carrier}`);
-      promoted.affinityPlacementGated = promoted.affinityPlacementGated.filter(
-        (entry) => entry !== `legacy:${carrier}`,
-      );
-      expect(legacyAffinityCutoverLive(promoted), `${carrier} promoted is a cutover`).toBe(true);
-    }
+    // With the module source unchanged, the shipped table emits all three.
+    expect(affinityPlacements("legacy")).toEqual(["session_id", "prompt_cache_key", "header-x-session-id"]);
   });
 });
 
@@ -205,7 +179,7 @@ describe("wire-compat is code-owned", () => {
   it("performs no filesystem read while the table and its accessors are exercised (T-03)", () => {
     expect(isWireCompatData(QODER_WIRE_COMPAT)).toBe(true);
     expect(carrierValue(QODER_WIRE_COMPAT.affinityPlacement, "v2")).toBeDefined();
-    expect(affinityPlacements("legacy")).toEqual(["session_id"]);
+    expect(affinityPlacements("legacy")).toEqual(["session_id", "prompt_cache_key", "header-x-session-id"]);
     for (const key of PER_PROTOCOL_ROWS) carrierValue(QODER_WIRE_COMPAT[key], "v2");
 
     expect(fsSpies.existsSync).not.toHaveBeenCalled();

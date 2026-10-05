@@ -23,17 +23,27 @@ export interface QoderWireCompatData {
 // Flattened from the SA's §5 QoderWireCompat literal: every per-protocol row is
 // one string[] of `carrier:value` entries, because FR-2's failure condition is a
 // nested-map row and the merged draft's D2 restricts rows to RoutingData-flat
-// kinds. `affinityPlacementGated` keeps the CU-7 probe-gated legacy placements
-// (the prompt_cache_key body field and the unsigned header trio) out of the
-// live set so a probe verdict moves one string between two rows. The module is
-// the whole policy: no user-override file can change it.
+// kinds. `affinityPlacementGated` is the retained mechanism for holding a
+// placement out of the live set; it ships EMPTY since the owner promoted both
+// legacy affinity carriers on 2026-10-05 — the reasoning recorded there:
+// whether the gateway HONORS the carriers is the OB-7 probe question, but
+// absence guarantees zero effect, so sending is the cheaper error. A probe
+// verdict that a carrier is harmful moves one string back into this row
+// (or QODER_LEGACY_AFFINITY=off removes everything at request time).
 export const QODER_WIRE_COMPAT: QoderWireCompatData = deepFrozen({
   version: 1,
   fallbackScope: "process",
   sessionKeyBoundPolicy: ["legacy:hash", "v2:clamp"],
   osVocabulary: ["legacy:Cosy-Machineos=*_linux-on-macos", "v2:pi-ai-owned"],
-  affinityPlacement: ["v2:prompt_cache_key", "v2:header-x-session-id", "v2:envelope-session-id", "legacy:session_id"],
-  affinityPlacementGated: ["legacy:prompt_cache_key", "legacy:header-x-session-id"],
+  affinityPlacement: [
+    "v2:prompt_cache_key",
+    "v2:header-x-session-id",
+    "v2:envelope-session-id",
+    "legacy:session_id",
+    "legacy:prompt_cache_key",
+    "legacy:header-x-session-id",
+  ],
+  affinityPlacementGated: [],
   // SA §5 printed this row as {legacy: "envelope-string", v2: "top-level-number"},
   // but both printed forms are v2's (v2.ts:146 envelope-string, v2.ts:152
   // top-level number) and legacy emitted context_length in no form — the
@@ -106,17 +116,4 @@ export function carrierValue(row: readonly string[], carrier: WireCarrier): stri
 /** The live affinity placements for `carrier`; the probe-gated row is never merged into this set. */
 export function affinityPlacements(carrier: WireCarrier, table: QoderWireCompatData = QODER_WIRE_COMPAT): string[] {
   return carrierValues(table.affinityPlacement, carrier);
-}
-
-/**
- * True when the live legacy row carries an affinity placement beyond the
- * identity baseline `session_id` — i.e. a probe verdict has promoted a gated
- * carrier and the parity cutover (fs-qoder-legacy-affinity CU-06) must
- * discard profiles learned under the pre-promotion wire. The shipped table
- * answers false: `session_id` has always been live and is not a change.
- */
-// shape: none — a one-line predicate over the frozen rows; dispatch object does
-//   not apply: no discriminator, no state, no I/O.
-export function legacyAffinityCutoverLive(table: QoderWireCompatData = QODER_WIRE_COMPAT): boolean {
-  return affinityPlacements("legacy", table).some((placement) => placement !== "session_id");
 }

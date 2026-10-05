@@ -107,11 +107,11 @@ describe("planQoderTurn", () => {
       { resolveIdentity },
     );
 
-    expect(plan.affinity.placements.legacy).toEqual(["session_id"]);
+    expect(plan.affinity.placements.legacy).toEqual(["session_id", "prompt_cache_key", "header-x-session-id"]); // both carriers promoted 2026-10-05
     expect(plan.affinity.placements.v2).toEqual(["prompt_cache_key", "header-x-session-id", "envelope-session-id"]);
-    // affinityPlacementGated holds v2's probe-gated legacy placement; it is never
-    // merged, so no unprobed prompt_cache_key reaches the legacy wire (AC-05).
-    expect(plan.affinity.placements.legacy).not.toContain("prompt_cache_key");
+    // Both legacy carriers were promoted 2026-10-05, so the gated row holds
+    // nothing for legacy; the AC-05 absence is pinned by the demotion rows in
+    // wire-vocabulary.test.ts (a demoted clone un-sends each carrier).
     expect(plan.affinity.promptCacheKey).toBe("qoder-session-user-dfmodel-session-affinity");
   });
 
