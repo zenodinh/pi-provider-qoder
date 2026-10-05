@@ -916,10 +916,11 @@ describe("session-start parity cutover (fs-qoder-legacy-affinity CU-06)", () => 
     expect(existsSync(join(getPiAgentDir(), PROFILE_FILENAME))).toBe(true);
   });
 
-  it("T-07 performs no reset at all on the shipped build, where nothing is promoted", async () => {
+  it("T-07 performs the one-time cutover reset on the shipped (promoted) build, and a baseline-only table performs none", async () => {
     for (const name of patEnvNames) delete process.env[name];
-    // Shipped table: legacy:session_id alone is live, and it has always been —
-    // that is not a cutover. The seeded profile must survive untouched.
+    // Promoted 2026-10-05: the shipped table carries both affinity carriers
+    // beyond the identity baseline, so the cutover IS live — the seeded profile
+    // (measured under the old wire) is discarded once and the marker written.
     writeProfile(seededProfile());
     const { pi, handlers } = fakePi();
     vi.resetModules();
@@ -927,8 +928,24 @@ describe("session-start parity cutover (fs-qoder-legacy-affinity CU-06)", () => 
     await registerProviders(pi as never, { scanLedgers: emptyScan });
     await startSession(handlers);
 
+    expect(readProfile()?.models[MODEL]).toBeUndefined();
+    expect(existsSync(join(getPiAgentDir(), "qoder-cache-lifetime-parity-reset.txt"))).toBe(true);
+
+    // The negative half: with every carrier demoted (a clone the probe could
+    // produce), the profile must survive untouched — the guard is live-placement
+    // driven, not hard-coded true.
+    rmSync(join(getPiAgentDir(), "qoder-cache-lifetime-parity-reset.txt"));
+    writeProfile(seededProfile());
+    const baselineTable = structuredClone(QODER_WIRE_COMPAT);
+    baselineTable.affinityPlacement = baselineTable.affinityPlacement.filter(
+      (entry) => entry === "legacy:session_id" || !entry.startsWith("legacy:"),
+    );
+    const { pi: pi2, handlers: handlers2 } = fakePi();
+    vi.resetModules();
+    const { default: registerProviders2 } = await import("../index.js");
+    await registerProviders(pi2 as never, { scanLedgers: emptyScan, wireCompat: baselineTable });
+    await startSession(handlers2);
     expect(readProfile()?.models[MODEL]?.lifetimeSeconds).toBe(3600);
-    expect(readProfile()?.models[MODEL]?.samples).toBe(42);
     expect(existsSync(join(getPiAgentDir(), "qoder-cache-lifetime-parity-reset.txt"))).toBe(false);
   });
 
