@@ -30,6 +30,7 @@ import { readResponseText, withAbort } from "../http.js";
 import { priceTurnCost, type RateSource, rateForUpstreamKey } from "../pricing.js";
 import { getQoderChatURL, getQoderRegionConfig } from "../region.js";
 import { yieldToEventLoop } from "../yield.js";
+import { resolveContextLength } from "./context-length.js";
 import { type DsmlParserEvent, DsmlToolCallParser } from "./dsml.js";
 import { qoderEncodeBodyAsync } from "./encoding.js";
 import { PROCESS_FALLBACK_SESSION_ID, planQoderTurn, qoderModeFor, type TurnPlanSeed } from "./plan.js";
@@ -43,7 +44,7 @@ import { stripThinkingTags, ThinkingTagParser } from "./thinking.js";
 import { ToolCallAccumulator } from "./tool-calls.js";
 import { contentToText, transformMessagesForQoder, transformTools } from "./transform.js";
 import { parseQoderCreditsUsage, type QoderCreditsUsage } from "./usage.js";
-import { affinityPlacements } from "./wire-compat.js";
+import { affinityPlacements, carrierValue, QODER_WIRE_COMPAT } from "./wire-compat.js";
 
 type QoderAssistantUsage = AssistantMessage["usage"] & QoderCreditsUsage & { rateSource?: RateSource };
 
@@ -486,6 +487,29 @@ export function streamQoder(
         // Written onto the resolved payload, never reqBody: a host hook that
         // returns a replacement object discards fields written to the original.
         (payload as Record<string, unknown>).prompt_cache_key = sessionID;
+      }
+      // Legacy context tier (SA §3.3 OB-10 / fs-qoder-legacy-context-length):
+      // the plan owns the resolution and the adapter resolves nothing itself —
+      // the gate-off arm calls the same shared resolver over the same catalog
+      // entry, so the tier is identical with QODER_CORE_PLAN on or off. The
+      // policy row is data: legacy emits while `legacy:top-level-number` sits
+      // in the live row, and moving the string into the gated row stops
+      // emission with no adapter edit. QODER_LEGACY_CONTEXT_LENGTH=off (§6.3)
+      // suppresses the member at request time, the same rollback posture as
+      // the affinity switch above.
+      const contextLengthKillSwitch =
+        options?.env?.QODER_LEGACY_CONTEXT_LENGTH ?? process.env.QODER_LEGACY_CONTEXT_LENGTH;
+      const contextTier =
+        contextLengthKillSwitch === "off"
+          ? undefined
+          : (plan?.contextLength ?? resolveContextLength(modelConfig.context_config, model.contextWindow));
+      if (
+        carrierValue(QODER_WIRE_COMPAT.contextLengthEmission, "legacy") === "top-level-number" &&
+        contextTier !== undefined
+      ) {
+        // Written onto the resolved payload, never reqBody: a host hook that
+        // returns a replacement object discards fields written to the original.
+        (payload as Record<string, unknown>).context_length = contextTier;
       }
       const bodyBytes = Buffer.from(JSON.stringify(payload));
       throwIfAborted();

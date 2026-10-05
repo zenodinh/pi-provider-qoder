@@ -79,10 +79,21 @@ describe("one producer, two readers (spec CU-04, T-05/AC-06)", () => {
   });
 
   it("no adapter computes a context tier inline from context_config", () => {
-    // Legacy must hold no tier logic at all: its future emission (wave 5) reads
-    // the plan's contextLength, never the tier table.
+    // Legacy's single context_config read is the same gate-off fallback v2 uses
+    // (plan?.contextLength ?? resolveContextLength over the same catalog entry),
+    // added by fs-qoder-legacy-context-length CU-02. This scan originally
+    // assumed wave 5 would read the plan only — but plan-only emission would
+    // make QODER_CORE_PLAN change the legacy wire (no seed -> no plan -> no
+    // context_length), violating that spec's AC-03/AC-06/T-04 and the gate's
+    // rollback posture, so the amended shape is the identical-by-construction
+    // fallback both adapters share (supervisor ruling 2026-10-05). What stays
+    // forbidden is tier LOGIC: the tier-table internals appear nowhere in
+    // either adapter, so a hand-rolled second resolution still fails this row.
     const legacy = readFileSync(fileURLToPath(new URL("../protocol/stream.ts", import.meta.url)), "utf8");
-    expect(legacy.match(/context_config|contextWindow/g) ?? []).toHaveLength(0);
+    expect(legacy.match(/context_config/g) ?? []).toHaveLength(1);
+    expect(legacy).toContain("plan?.contextLength ?? resolveContextLength(modelConfig.context_config");
+    expect(legacy.match(/contextWindow/g) ?? []).toHaveLength(1);
+    expect(legacy.match(/is_default|token_count/g) ?? []).toHaveLength(0);
 
     // v2's single context_config read is the gate-off fallback calling the
     // shared resolver — the plan-or-identical-inline posture, not a second
