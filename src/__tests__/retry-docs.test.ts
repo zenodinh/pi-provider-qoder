@@ -4,13 +4,15 @@ import { describe, expect, it } from "vitest";
 /**
  * FS-5 CU-03 — the README retry truth.
  *
- * `package.json` ships `files: ["src", "README.md"]`, so this prose is part of
- * the published artifact, not a comment: a user deciding whether to set
- * `settings.retry.provider` reads exactly these bytes. The rows read README.md
- * from the repo root rather than a copy, so the document and its pin cannot
- * drift apart.
+ * `package.json` ships `src/` and `README.md`, so this prose is part of the
+ * published artifact, not a comment: a user deciding whether to set
+ * `settings.retry.provider` reads exactly these bytes. The rows read the files
+ * from the repo root rather than a copy, so the documents and their pins cannot
+ * drift apart. Internal repo rules live in AGENTS.md, which is not published;
+ * T-05 pins the pi-upgrade re-check list there, where it now lives.
  */
 const readme = readFileSync(new URL("../../README.md", import.meta.url), "utf8");
+const agents = readFileSync(new URL("../../AGENTS.md", import.meta.url), "utf8");
 
 describe("README retry documentation", () => {
   it("T-04 names both retry layers and the tripwire, and drops the blanket no-retry claim", () => {
@@ -34,11 +36,11 @@ describe("README retry documentation", () => {
     expect(readme).toContain("GET-only");
   });
 
-  it("T-05 carries the OB-2 pi-upgrade re-check list", () => {
-    expect(readme).toContain("host seam module");
-    expect(readme).toContain("parity suite");
-    expect(readme).toContain("retry patterns");
-    expect(readme).toContain("history-repair dependency");
+  it("T-05 carries the OB-2 pi-upgrade re-check list (AGENTS.md — internal, not shipped)", () => {
+    expect(agents).toContain("host seam module");
+    expect(agents).toContain("parity suite");
+    expect(agents).toContain("retry patterns");
+    expect(agents).toContain("history-repair dependency");
   });
 
   it("names the text_end -> message_update frame class legacy now emits", () => {
