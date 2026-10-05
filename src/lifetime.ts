@@ -3,7 +3,7 @@
 //   commands/context.ts; the estimators are straight-line math over sample
 //   arrays. The one boundary (session JSONL on disk) is narrowed line by line.
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { MODEL_PROMPT_CACHE } from "./catalog.js";
 import { debugLog } from "./debug.js";
@@ -22,6 +22,9 @@ export const MIN_RATE_SAMPLES = 20;
 /** Per-bucket publish rule: >= this many gaps and a median survival ratio >= 0.8. */
 export const MIN_BUCKET_SAMPLES = 3;
 export const SURVIVAL_MEDIAN = 0.8;
+/** A death bound shortens the published lifetime only when >= this many
+ *  independent miss signals support it — one unexplained miss moves nothing. */
+export const MIN_DEATH_SIGNALS = 2;
 export const RATE_FIT_MIN_R_SQUARED = 0.95;
 /** Lifetime clamp — the last line of defense against a corrupt-but-valid value. */
 export const LIFETIME_MIN_SECONDS = 120;
@@ -89,13 +92,30 @@ export interface LedgerModelSamples {
 
 /** One warm-refresh row as pi's CacheWarmer writes it (health-monitoring sample). */
 export interface LedgerWarmSample {
-  /** The row's own model column (often `auto` — never used for attribution). */
+  /**
+   * The row's own model column. Since warm-attribution landed, pi stamps the
+   * friendly id here (`responseModel ?? model`), so the column is the
+   * attribution key; pre-attribution rows carry `auto` and are unattributable.
+   */
   model: string;
   timestamp: number;
   promptTokens: number;
   cacheRead: number;
   credits: number | undefined;
   costTotal: number;
+  /**
+   * Seconds since the previous same-model real turn — the idle offset this
+   * row's hit or miss is observed at. Undefined when no such predecessor
+   * exists: without a cache-write marker to measure from, the observation sits
+   * on no timeline and can neither corroborate a death nor prove survival.
+   */
+  idleSeconds?: number | undefined;
+  /**
+   * The model this row's hit or miss is attributed to: the row's model column
+   * when a same-model predecessor anchors the offset, undefined otherwise.
+   * Deaths corroborate per model, never pooled.
+   */
+  attributedModel?: string | undefined;
 }
 
 /** One bounded scan of the session ledgers, feeding both estimators. */
@@ -323,6 +343,17 @@ function scanSessionText(text: string, scan: LedgerScan, budget: { startedAt: nu
     if (entry.kind === "cache_warm") {
       if (!QODER_PROVIDERS.has(entry.provider)) continue;
       broken = true;
+      // The idle offset is measured from the last real turn of the SAME model:
+      // the cache entry this row hit or missed was written by that turn. A
+      // different model's predecessor anchored a different entry, and no
+      // predecessor at all leaves the observation on no timeline — both stay
+      // undefined rather than being invented. A predecessor timestamped at or
+      // after the warm row is an out-of-order ledger, not an observation: the
+      // gap push guards `seconds > 0` against the same hazard.
+      const sameModelPredecessor =
+        previous !== undefined && previous.model === entry.model && entry.timestamp > previous.timestamp
+          ? previous
+          : undefined;
       scan.warm.push({
         model: entry.model,
         timestamp: entry.timestamp,
@@ -330,6 +361,9 @@ function scanSessionText(text: string, scan: LedgerScan, budget: { startedAt: nu
         cacheRead: entry.cacheRead,
         credits: entry.credits,
         costTotal: entry.costTotal,
+        idleSeconds:
+          sameModelPredecessor !== undefined ? (entry.timestamp - sameModelPredecessor.timestamp) / 1000 : undefined,
+        attributedModel: sameModelPredecessor !== undefined ? entry.model : undefined,
       });
       continue;
     }
@@ -343,7 +377,12 @@ function scanSessionText(text: string, scan: LedgerScan, budget: { startedAt: nu
     const promptTokens = entry.input + entry.cacheRead + entry.cacheWrite;
     if (previous !== undefined && previous.model === entry.model && !broken) {
       const seconds = (entry.timestamp - previous.timestamp) / 1000;
-      if (seconds > 0 && promptTokens > 0) {
+      // A gap whose later row carries `prefixStable: false` measures a cold
+      // start, not cache survival — the prompt the entry cached was never sent
+      // — so it is excluded from the sample. An absent field is every
+      // pre-prefix-chain ledger row and is included: the exclusion must degrade
+      // to the old behaviour, not drop all history.
+      if (seconds > 0 && promptTokens > 0 && entry.prefixStable !== false) {
         samplesFor(scan, entry.model).gaps.push({ seconds, ratio: entry.cacheRead / promptTokens });
       }
     }
@@ -355,7 +394,12 @@ function scanSessionText(text: string, scan: LedgerScan, budget: { startedAt: nu
         credits: entry.credits,
       });
     }
-    previous = { model: entry.model, timestamp: entry.timestamp };
+    // A zero-usage assistant row anchors nothing: its turn read no prompt, so
+    // it wrote no cache entry and its timestamp proves nothing about survival.
+    // Clearing (not skipping) the anchor matters — a retained anchor under the
+    // reset `broken` below would fabricate a gap measured across the rows in
+    // between, which the pre-existing chain discipline already forbids.
+    previous = promptTokens > 0 ? { model: entry.model, timestamp: entry.timestamp } : undefined;
     broken = false;
   }
 }
@@ -419,6 +463,18 @@ export function medianOf(values: readonly number[]): number | undefined {
   return sorted.length % 2 === 1 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
 }
 
+/**
+ * One miss observation: the cache entry a warm refresh failed to find was
+ * dead by this many idle seconds. Carries the model the miss is attributed
+ * to, so deaths corroborate per model rather than pooled — but the grouping
+ * is the caller's duty: `estimate` applies the list it is given as-is, and
+ * `learnProfile` is the caller that groups by `attributedModel`.
+ */
+export interface WarmDeath {
+  seconds: number;
+  model: string | undefined;
+}
+
 export interface LifetimeEstimateResult {
   lifetimeSeconds?: number;
   samples: number;
@@ -426,34 +482,61 @@ export interface LifetimeEstimateResult {
 }
 
 /**
- * Publish rule: >= 20 natural samples; the lifetime is the largest bucket
- * boundary whose median survival ratio holds >= 0.8 with >= 3 samples, clamped
- * to 120-3600 s. A sparse or fast-decaying model publishes nothing.
+ * The earliest death bound at least two independent miss signals support.
+ *
+ * A miss at X seconds observes "the entry was dead by X" — it proves nothing
+ * about any shorter offset — so a bound B is corroborated by every miss at or
+ * below B, and the earliest bound two misses support is the SECOND-SMALLEST
+ * miss offset. Grouping by exact offset instead would make the gate dead code
+ * against real ledgers, where two refreshes never fire at the same idle second.
  */
-export function estimate(gaps: readonly LedgerGap[]): LifetimeEstimateResult {
+// shape: none — dispatch object does not apply: one ordering decision over a
+//   flat sample array, no discriminator and no per-case handler.
+export function earliestCorroboratedDeathSeconds(deaths: readonly WarmDeath[]): number | undefined {
+  const seconds = [...deaths].sort((a, b) => a.seconds - b.seconds);
+  return seconds.length >= MIN_DEATH_SIGNALS ? seconds[MIN_DEATH_SIGNALS - 1].seconds : undefined;
+}
+
+/**
+ * Publish rule: >= 20 natural samples; the lifetime is the clamped minimum of
+ * the largest observed gap among the qualifying buckets and the earliest
+ * corroborated death, never a bucket's upper boundary — the edge beyond the
+ * largest observed gap is a claim nobody observed (BUG-0003). A death bound
+ * counts only when at least two independent miss signals support it, so one
+ * unexplained miss cannot shorten a schedule. A sparse or fast-decaying model
+ * publishes nothing.
+ */
+export function estimate(gaps: readonly LedgerGap[], deaths: readonly WarmDeath[] = []): LifetimeEstimateResult {
   const buckets: LifetimeBucket[] = [];
+  // Parallel to `buckets`: the largest observed gap inside each bucket, which
+  // is the survival second the publish rule reads — the bucket's boundary is a
+  // selection edge, not an observation.
+  const bucketMaxGapSeconds: number[] = [];
   for (let index = 0; index < BUCKET_UPPER_BOUNDS_SECONDS.length; index += 1) {
     const upperSeconds = BUCKET_UPPER_BOUNDS_SECONDS[index];
     const lowerSeconds = index === 0 ? 0 : BUCKET_UPPER_BOUNDS_SECONDS[index - 1];
-    const ratios = gaps
-      .filter((gap) => gap.seconds > lowerSeconds && gap.seconds <= upperSeconds)
-      .map((gap) => gap.ratio)
-      .sort((a, b) => a - b);
+    const inBucket = gaps.filter((gap) => gap.seconds > lowerSeconds && gap.seconds <= upperSeconds);
+    const ratios = inBucket.map((gap) => gap.ratio).sort((a, b) => a - b);
     if (ratios.length === 0) continue;
     const medianRatio = medianOf(ratios);
     if (medianRatio === undefined) continue;
     buckets.push({ upperSeconds, medianRatio, samples: ratios.length });
+    bucketMaxGapSeconds.push(Math.max(...inBucket.map((gap) => gap.seconds)));
   }
 
   const samples = gaps.length;
-  const qualifying = buckets.filter(
-    (bucket) => bucket.samples >= MIN_BUCKET_SAMPLES && bucket.medianRatio >= SURVIVAL_MEDIAN,
-  );
+  const qualifying = buckets
+    .map((bucket, index) => ({ bucket, maxGapSeconds: bucketMaxGapSeconds[index] }))
+    .filter(({ bucket }) => bucket.samples >= MIN_BUCKET_SAMPLES && bucket.medianRatio >= SURVIVAL_MEDIAN);
   if (samples < MIN_NATURAL_SAMPLES || qualifying.length === 0) {
     return { samples, buckets };
   }
-  const largest = qualifying[qualifying.length - 1].upperSeconds;
-  return { lifetimeSeconds: clampLifetimeSeconds(largest), samples, buckets };
+  // The observed survival is the largest gap among the qualifying buckets' gaps
+  // — the same evidence that qualifies the bucket — never a bucket boundary.
+  const observedSurvival = Math.max(...qualifying.map(({ maxGapSeconds }) => maxGapSeconds));
+  const corroboratedDeath = earliestCorroboratedDeathSeconds(deaths);
+  const published = corroboratedDeath === undefined ? observedSurvival : Math.min(observedSurvival, corroboratedDeath);
+  return { lifetimeSeconds: clampLifetimeSeconds(published), samples, buckets };
 }
 
 /** Solve a 3x3 linear system by Gauss-Jordan with partial pivoting; undefined when singular. */
@@ -536,6 +619,8 @@ export function fitRates(turns: readonly LedgerTurn[]): RateFitResult {
  * scan cannot publish (a thin session must not erase a valid earlier
  * estimate; the next sufficient scan recomputes it).
  */
+// shape: none — dispatch object does not apply: one fixed derivation per
+//   model over the samples the scan already collected; no discriminator.
 export function learnProfile(
   scan: LedgerScan,
   prior: LifetimeProfile | undefined,
@@ -543,8 +628,19 @@ export function learnProfile(
 ): LifetimeProfile {
   const computedAt = now.toISOString();
   const models: Record<string, LifetimeEstimate> = {};
+  // A miss observation corroborates a death only for the model it is
+  // attributed to, so the deaths are grouped by attributedModel before any
+  // model's estimate sees them — a miss attributed to no model corroborates
+  // nothing, and a miss never shortens another model's bound.
+  const deathsByModel = new Map<string, WarmDeath[]>();
+  for (const row of scan.warm) {
+    if (row.cacheRead > 0 || row.idleSeconds === undefined || row.attributedModel === undefined) continue;
+    const deaths = deathsByModel.get(row.attributedModel) ?? [];
+    deaths.push({ seconds: row.idleSeconds, model: row.attributedModel });
+    deathsByModel.set(row.attributedModel, deaths);
+  }
   for (const [model, samples] of Object.entries(scan.models)) {
-    const estimateResult = estimate(samples.gaps);
+    const estimateResult = estimate(samples.gaps, deathsByModel.get(model) ?? []);
     const { rateFit } = fitRates(samples.turns);
     const priorEntry = prior?.models[model];
     const publishedLifetime = estimateResult.lifetimeSeconds;
@@ -681,4 +777,26 @@ export function writeProfile(profile: LifetimeProfile, dir: string = getPiAgentD
   const temporary = `${path}.tmp`;
   writeFileSync(temporary, `${JSON.stringify(profile, null, 2)}\n`);
   renameSync(temporary, path);
+}
+
+/**
+ * Delete the profile once, at the legacy-affinity parity cutover, so no
+ * lifetime learned under client-deficient affinity survives into a
+ * post-parity schedule. Idempotent by construction: the dedup store is file
+ * absence, so a second reset is a no-op, and a reset racing a session-start
+ * relearn loses at most one scan's values to writeProfile's atomic rename.
+ */
+// shape: none — dispatch object does not apply: one guarded filesystem delete
+//   with no discriminator; writeProfile two declarations up is the precedent.
+export function resetProfileForParity(dir: string = getPiAgentDir()): boolean {
+  const path = join(dir, PROFILE_FILENAME);
+  if (!existsSync(path)) return false;
+  try {
+    rmSync(path);
+  } catch (error) {
+    debugLog(`cache-lifetime parity reset failed at ${path}`, error);
+    return false;
+  }
+  debugLog(`cache-lifetime profile reset for parity at ${path}`);
+  return true;
 }
