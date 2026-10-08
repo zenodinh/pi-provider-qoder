@@ -194,9 +194,59 @@ describe("Qoder model cache", () => {
     expect(cache.models.map((model: { id: string }) => model.id)).toEqual(["Cantus"]);
   });
 
-  it("filters auto from a legacy fallback cache when the service did not enable it", () => {
+  it("keeps Auto when the account's catalog enables the auto service model", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            chat: [
+              // invented: the live entry's fields, minimised — the owner's catalog
+              // returned { key: "auto", enable: true, display_name: "Auto", is_vl: true }
+              // (verified 2026-10-08).
+              { key: "auto", enable: true, display_name: "Auto", is_vl: true },
+              { key: "ultimate", enable: true, display_name: "Ultimate", is_reasoning: true },
+            ],
+          }),
+      }),
+    );
+
+    await updateQoderModelsCache("access-token", "user-id", "Test User", "test@example.com", "global");
+
+    const cache = JSON.parse(readFileSync(CACHE_PATHS.global, "utf8"));
+    expect(cache.models.map((model: { id: string }) => model.id)).toEqual(["Auto", "Ultimate"]);
+    // The read hands over exactly the cached rows — no list-time filtering.
+    expect(getCachedModels("global").map((model) => model.id)).toEqual(["Auto", "Ultimate"]);
+    expect(getCachedModelConfig("Auto", "global")?.key).toBe("auto");
+  });
+
+  it("keeps Auto on the CN catalog too", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            chat: [
+              // invented: the same minimal live-entry shape as the global case.
+              { key: "auto", enable: true, display_name: "Auto", is_vl: true },
+              { key: "qmodel_latest", enable: true, display_name: "Qwen3.7-Max" },
+            ],
+          }),
+      }),
+    );
+
+    await updateQoderModelsCache("access-token", "user-id", "Test User", "test@example.com", "cn");
+
+    expect(getCachedModels("cn").map((model) => model.id)).toEqual(["Auto", "Qwen3.7-Max"]);
+  });
+
+  it("serves an unbacked auto row from a legacy cache instead of filtering it", () => {
     writeFileSync(
       CACHE_PATHS.global,
+      // invented: the legacy cache shape written before 55e87cb — configs keyed by
+      // upstream key, plus an injected auto row the account's catalog never returned.
       JSON.stringify({
         updatedAt: Date.now(),
         models: [{ id: "auto" }, { id: "ultimate" }],
@@ -206,7 +256,24 @@ describe("Qoder model cache", () => {
     );
     clearQoderModelsMemCache();
 
-    expect(getCachedModels("global").map((model) => model.id)).toEqual(["Ultimate"]);
+    expect(getCachedModels("global").map((model) => model.id)).toEqual(["Auto", "Ultimate"]);
+  });
+
+  it("serves a cached row the catalog never declared, whatever its id", () => {
+    writeFileSync(
+      CACHE_PATHS.global,
+      // invented: a row with no config entry and no static seed, to prove the read
+      // applies no filter at all rather than an auto-specific removal.
+      JSON.stringify({
+        updatedAt: Date.now(),
+        models: [{ id: "rogue-model", name: "Rogue Model", contextWindow: 200000 }],
+        configs: { Ultimate: { key: "ultimate", enable: true, display_name: "Ultimate" } },
+      }),
+      "utf8",
+    );
+    clearQoderModelsMemCache();
+
+    expect(getCachedModels("global").map((model) => model.id)).toEqual(["RogueModel"]);
   });
 
   it("records a 1M context window when the catalog omits context_config", async () => {
