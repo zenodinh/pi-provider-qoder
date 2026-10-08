@@ -387,11 +387,6 @@ export function getCachedModels(mode: QoderMode): QoderModelDef[] {
       if (staticModel) return { ...model, id: staticModel.id, name: staticModel.name };
       return model.name ? { ...model, id: toQoderModelId(model.name) } : model;
     });
-    // Older releases injected `auto` without a corresponding service config.
-    // Keep an explicitly enabled service model, but drop the legacy fallback.
-    if (data.configs && typeof data.configs === "object" && !data.configs.auto) {
-      return models.filter((model: QoderModelDef) => model.id.toLowerCase() !== "auto");
-    }
     return models;
   }
   return mode === "cn" ? staticCnModels : staticModels;
