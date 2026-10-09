@@ -64,6 +64,63 @@ describe("Qoder model cache", () => {
     }
   });
 
+  it("takes the output cap from the entry, else qodercli's 32000 fallback", async () => {
+    // Spec: updateQoderModelsCache /model/list -> models[].maxTokens. Input: one
+    // entry advertising max_output_tokens, one without. Expected: the advertised
+    // value, else 32000 — the client's own `dl()` guard value. Error contract:
+    // a non-integer or non-positive value falls back rather than reaching the wire.
+    // Fixture: invented — the live catalog advertises the field on none of its 15
+    // entries (verified 2026-10-08), so both branches are stated here.
+    const catalog = {
+      chat: [
+        { key: "capped", enable: true, display_name: "Capped Model", is_reasoning: false, max_output_tokens: 65536 },
+        { key: "uncapped", enable: true, display_name: "Uncapped Model", is_reasoning: false },
+        { key: "zero", enable: true, display_name: "Zero Model", is_reasoning: false, max_output_tokens: 0 },
+      ],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response(JSON.stringify(catalog), { status: 200, headers: { "content-type": "application/json" } }),
+        ),
+    );
+
+    await updateQoderModelsCache("access-token", "user-id", "Test User", "test@example.com", "global");
+
+    const models = getCachedModels("global");
+    expect(models.find((model) => model.id === "CappedModel")?.maxTokens).toBe(65536);
+    expect(models.find((model) => model.id === "UncappedModel")?.maxTokens).toBe(32_000);
+    expect(models.find((model) => model.id === "ZeroModel")?.maxTokens).toBe(32_000);
+  });
+
+  it("re-derives the cap on load, so a stale value from an earlier version cannot survive", () => {
+    writeFileSync(
+      CACHE_PATHS.global,
+      // invented: the shape 0.1.2 wrote, whose rows carry the old 131072 ceiling.
+      // Real evidence for the value: the owner's own qoder-models-cache.json holds
+      // maxTokens 131072 on every row.
+      JSON.stringify({
+        updatedAt: Date.now(),
+        models: [
+          { id: "CappedModel", maxTokens: 131072 },
+          { id: "UncappedModel", maxTokens: 131072 },
+        ],
+        configs: {
+          CappedModel: { key: "capped", enable: true, display_name: "CappedModel", max_output_tokens: 65536 },
+          UncappedModel: { key: "uncapped", enable: true, display_name: "UncappedModel" },
+        },
+      }),
+      "utf8",
+    );
+    clearQoderModelsMemCache();
+
+    const caps = new Map(getCachedModels("global").map((model) => [model.id, model.maxTokens]));
+    expect(caps.get("CappedModel")).toBe(65_536);
+    expect(caps.get("UncappedModel")).toBe(32_000);
+  });
+
   it("treats a cache fetched for another account as stale", async () => {
     vi.stubGlobal(
       "fetch",

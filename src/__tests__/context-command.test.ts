@@ -1,7 +1,7 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { clearQoderModelsMemCache } from "../catalog.js";
+import { clearQoderModelsMemCache } from "../catalog.ts";
 import {
   applyCompactionOverride,
   applyWindowOverride,

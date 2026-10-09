@@ -1,7 +1,7 @@
 import { type Api, type Model, normalizeContext, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cacheQoderIdentityForTest, clearQoderAuthMemCache } from "../auth/oauth.js";
-import { clearQoderModelsMemCache, staticCnModels, staticModels } from "../catalog.js";
+import { clearQoderModelsMemCache, staticCnModels } from "../catalog.ts";
 import { resolveProtocol, streamQoderRouter } from "../protocol/router.js";
 import {
   clearQoderFallbackCache,
@@ -10,6 +10,7 @@ import {
   markLegacyOnly,
 } from "../protocol/routing.js";
 import { clearQoderFilterMemCache } from "../protocol/sampling.js";
+import { fixtureModel } from "./model-fixture.ts";
 
 // Counting seam for T-08's second clause (AC-07): with byte-identical bodies the
 // gate's only remaining observable effect is whether the plan is produced at
@@ -26,9 +27,7 @@ vi.mock("../protocol/plan.js", async (importOriginal) => {
 const context = normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: 0 }] });
 
 function modelNamed(id: string): Model<Api> {
-  const found = staticModels.find((model) => model.id === id);
-  if (!found) throw new Error(`fixture model missing from static seed: ${id}`);
-  return found as Model<Api>;
+  return fixtureModel(id);
 }
 
 function envelope(inner: unknown): string {
@@ -73,28 +72,50 @@ afterEach(() => {
 });
 
 describe("resolveProtocol", () => {
-  it("routes by routing data: v2-confirmed key to v2, legacy-only and unknown keys to legacy", () => {
-    expect(resolveProtocol("qmodel", "global")).toEqual({ protocol: "v2", source: "routing-data" });
+  it("sends every key to legacy unless v2 was asked for, and reports why by source", () => {
+    // Owner decision 2026-10-09: legacy is the default for every key, so v2 needs
+    // the flag. `source` still separates a known-legacy key from an unknown one,
+    // which is the whole content of the routing debug line.
+    expect(resolveProtocol("qmodel", "global")).toEqual({ protocol: "legacy", source: "default" });
     expect(resolveProtocol("dfmodel", "global")).toEqual({ protocol: "legacy", source: "routing-data" });
     expect(resolveProtocol("lite", "global")).toEqual({ protocol: "legacy", source: "default" });
   });
 
-  it("honors QODER_PROTOCOL over everything", () => {
+  it("honors QODER_PROTOCOL over everything, and gates the v2 opt-in on eligibility", () => {
     expect(resolveProtocol("qmodel", "global", { env: { QODER_PROTOCOL: "legacy" } } as SimpleStreamOptions)).toEqual({
       protocol: "legacy",
       source: "env",
     });
+    // Requested and proven: the only path to v2.
+    expect(resolveProtocol("qmodel", "global", { env: { QODER_PROTOCOL: "v2" } } as SimpleStreamOptions)).toEqual({
+      protocol: "v2",
+      source: "env",
+    });
+    // Requested but unproven: the flag is a request, not a capability grant.
+    expect(resolveProtocol("dfmodel", "global", { env: { QODER_PROTOCOL: "v2" } } as SimpleStreamOptions)).toEqual({
+      protocol: "legacy",
+      source: "default",
+    });
   });
 
-  it("keeps cn on legacy unless a v2 host override is set", () => {
+  it("keeps cn on legacy, and needs both a v2 host and the opt-in to leave it", () => {
     expect(resolveProtocol("qmodel", "cn")).toEqual({ protocol: "legacy", source: "env" });
+    // A declared v2 host is not an opt-in by itself: the transport default decides.
     expect(
       resolveProtocol("qmodel", "cn", {
         env: { QODER_MODEL_SERVER_HOST: "https://api2-v2.qoder.sh" },
       } as SimpleStreamOptions),
     ).toEqual({
+      protocol: "legacy",
+      source: "default",
+    });
+    expect(
+      resolveProtocol("qmodel", "cn", {
+        env: { QODER_MODEL_SERVER_HOST: "https://api2-v2.qoder.sh", QODER_PROTOCOL: "v2" },
+      } as SimpleStreamOptions),
+    ).toEqual({
       protocol: "v2",
-      source: "routing-data",
+      source: "env",
     });
   });
 
@@ -119,7 +140,7 @@ describe("streamQoderRouter", () => {
     expect(String(url)).toContain("agent_chat_generation");
   });
 
-  it("sends a v2-eligible key to the model-server and drops rejected sampling keys", async () => {
+  it("sends an opted-in v2 key to the model-server and drops rejected sampling keys", async () => {
     let url: unknown;
     let body: Record<string, unknown> | undefined;
     const fetch = vi.fn(async (input: unknown, init?: RequestInit) => {
@@ -132,7 +153,8 @@ describe("streamQoderRouter", () => {
       fetch,
       sessionId: "session-1",
       samplingParams: { presence_penalty: 0.5, temperature: 0.7 },
-    }).result();
+      env: { QODER_PROTOCOL: "v2" },
+    } as SimpleStreamOptions).result();
     expect(result.stopReason).toBe("stop");
     expect(String(url)).toBe("https://api2-v2.qoder.sh/model/v1/chat/completions");
     expect(body).toBeDefined();

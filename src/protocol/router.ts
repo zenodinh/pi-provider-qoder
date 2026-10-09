@@ -27,21 +27,36 @@ function corePlanEnabled(options: SimpleStreamOptions | undefined): boolean {
 
 /**
  * Protocol per request, from data rather than a compiled constant. Precedence:
- * QODER_PROTOCOL override → self-heal session cache → routing table → default
- * v2. cn mode has no verified v2 host, so it stays legacy unless
- * QODER_MODEL_SERVER_HOST points at one.
+ * QODER_PROTOCOL override → cn guard → self-heal session cache → routing table.
+ *
+ * Legacy is the default for every key (owner decision 2026-10-09). v2 is the
+ * BYOK-oriented transport: Qoder exposes it to bring-your-own-key usage, some
+ * accounts cannot reach an upstream through it at all (live: "Access to
+ * Anthropic models is not allowed for this account"), and its model server has
+ * refused instruction roles and cap values the legacy gateway accepts. Stability
+ * wins for a default install, so v2 needs an explicit `QODER_PROTOCOL=v2` AND a
+ * key the routing table lists as v2-eligible: the flag is a request, not a
+ * capability grant, and an unproven key would fail its turn on the v2 host.
  */
 export function resolveProtocol(upstreamKey: string, mode: QoderMode, options?: SimpleStreamOptions): RouteDecision {
   const forced = envValue(options, "QODER_PROTOCOL");
-  if (forced === PROTOCOL.V2 || forced === PROTOCOL.LEGACY) return { protocol: forced, source: "env" };
+  if (forced === PROTOCOL.LEGACY) return { protocol: PROTOCOL.LEGACY, source: "env" };
+  // Before the opt-in: a key v2 already proved legacy-only this session stays
+  // legacy even while the flag is set, or the correction would be re-armed into
+  // the same failure every turn.
+  if (isMarkedLegacyOnly(upstreamKey)) return { protocol: PROTOCOL.LEGACY, source: "fallback-cache" };
+  if (forced === PROTOCOL.V2) {
+    const eligible = getRoutingData((message) => debugLog(message)).v2Eligible.includes(upstreamKey);
+    if (eligible) return { protocol: PROTOCOL.V2, source: "env" };
+    debugLog(`provider.routing model_key=${upstreamKey} requested=v2 fell_back=legacy reason=not-v2-eligible`);
+    return { protocol: PROTOCOL.LEGACY, source: "default" };
+  }
   if (mode === "cn" && !envValue(options, "QODER_MODEL_SERVER_HOST"))
     return { protocol: PROTOCOL.LEGACY, source: "env" };
-  if (isMarkedLegacyOnly(upstreamKey)) return { protocol: PROTOCOL.LEGACY, source: "fallback-cache" };
+  // Legacy for every key that did not ask for v2. New Qoder models launch
+  // legacy-only, and the legacy gateway serves every key today — so the default
+  // can never produce a failed turn on a launch-day model.
   const routing = getRoutingData((message) => debugLog(message));
-  if (routing.v2Eligible.includes(upstreamKey)) return { protocol: PROTOCOL.V2, source: "routing-data" };
-  // Only a proven-v2 key takes the v2 path. New Qoder models launch
-  // legacy-only, and the legacy gateway serves every key today — so the
-  // default can never produce a failed turn on a launch-day model.
   return { protocol: PROTOCOL.LEGACY, source: routing.legacyOnly.includes(upstreamKey) ? "routing-data" : "default" };
 }
 

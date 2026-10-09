@@ -5,11 +5,11 @@ import { join } from "node:path";
 import { type Api, type Model, normalizeContext, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cacheQoderIdentityForTest, clearQoderAuthMemCache } from "../auth/oauth.js";
-import { staticModels } from "../catalog.js";
 import { streamQoder } from "../protocol/stream.js";
 import { readDebugRecords } from "./debug-sink.js";
+import { fixtureModel } from "./model-fixture.ts";
 
-const model = staticModels.find((model) => model.id === "Lite") as Model<Api>;
+const model = fixtureModel("Lite");
 const context = normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: 0 }] });
 function envelope(inner: unknown): string {
   return `data: ${JSON.stringify({ statusCodeValue: 200, body: JSON.stringify(inner) })}\n\n`;

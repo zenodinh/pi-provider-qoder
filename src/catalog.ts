@@ -7,6 +7,7 @@ import { getHomeDir } from "./home.js";
 import { fetchQoderJson } from "./http.js";
 import { rateForUpstreamKey } from "./pricing.js";
 import { parseQoderPriceFactor } from "./protocol/usage.js";
+import { SCENE } from "./protocol/vocabulary.ts";
 import { getQoderBaseUrl, getQoderModelListURL, getQoderRegionConfig, type QoderMode } from "./region.js";
 
 export const ZERO_COST: ModelCost = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
@@ -29,17 +30,38 @@ export const ZERO_COST: ModelCost = Object.freeze({ input: 0, output: 0, cacheRe
 export const MODEL_PROMPT_CACHE: ModelPromptCache = Object.freeze({ short: 300 });
 
 /**
- * Maximum output tokens sent per request. Aliyun Model Studio (the upstream
- * behind Qoder's CN catalog) documents Max Output Length = 131072 for every
- * model we expose (qwen3.8-max/flash, qwen3.7-max/plus/flash), in both normal
- * and thinking modes (thinking chain alone goes up to 262144). The Qoder
- * /model/list catalog does not return a per-model output cap, so this single
- * constant is the source of truth for both static models and request sending.
- * qodercli ships a conservative 32e3 default and caps its UI at 65536; we use
- * the documented upstream ceiling so reasoning chains and long generations
- * are not truncated.
+ * Output-token figure for a model whose catalog entry advertises no cap. pi
+ * needs a number for its own accounting (answer-room and compaction math), and
+ * qodercli keeps the same 32000 for the same purpose: its `dl(t)` guard
+ * (`Number.isSafeInteger(r)&&r>0?r:32000`) runs on the *metadata* path
+ * (`h = dl(a?.max_output_tokens)`), never on a request body.
+ *
+ * It is not sent. Both of qodercli's body builders take the cap through
+ * `k(n){ let r=lo(n); return r===void 0?void 0:Math.trunc(r) }`, so a model with
+ * no advertised cap reaches the wire with the field absent; this provider omits
+ * it too and sends a value only when Qoder advertised one or pi capped the turn
+ * itself. Decoded 2026-10-09 from 1.1.66; every live catalog entry carries no
+ * `max_output_tokens`.
+ *
+ * SCOPE OF IMPACT — every reader of this number, upstream of the wire:
+ *   - Nothing here reaches Qoder. Both transports omit `max_tokens` unless the
+ *     catalog advertises a cap, the user sets one on the model, or pi asks for a
+ *     per-turn cap (compaction, cache warming). Raising this value does NOT
+ *     change what the server receives.
+ *   - pi's compaction: the caps pi derives for summarization and its prefix
+ *     passes are bounded by this value — `min(4096, ...)` for the summary
+ *     request, `min(0.8 * reserve, ...)` and `min(0.5 * reserve, ...)` for the
+ *     prefix passes. Raising it therefore lengthens a compaction request only
+ *     after the 4096 clamp stops binding, and only up to what reserve allows.
+ *   - pi's reasoning budget: with no wire cap, the ceiling the host computes for a
+ *     thinking budget falls back to this value.
+ *   - pi's length recovery: a truncated answer is judged retryable against it
+ *     (`isRecoverableLength(assistantMessage, model.maxTokens)`).
+ *   - pi's model picker shows it as the `max-out` column.
+ * A catalog entry that advertises `max_output_tokens` replaces this value in
+ * every reader above.
  */
-export const MAX_OUTPUT_TOKENS = 131072;
+export const QODER_DEFAULT_MAX_OUTPUT_TOKENS = 32000;
 
 /**
  * Fallback context window when the catalog omits `context_config`.
@@ -59,6 +81,11 @@ export interface QoderModelEntry {
   enable?: boolean;
   display_name?: string;
   max_input_tokens?: number;
+  /**
+   * Per-model output cap. Absent in every live entry as of 2026-10-09, and an
+   * absent value means the request omits the cap rather than defaulting it.
+   */
+  max_output_tokens?: number;
   context_config?: Record<string, { token_count?: number; is_default?: boolean }>;
   is_vl?: boolean;
   is_reasoning?: boolean;
@@ -68,6 +95,23 @@ export interface QoderModelEntry {
   };
   source?: string;
   [key: string]: unknown;
+}
+
+/**
+ * The cap Qoder advertised for a model, or `undefined` when it advertised none.
+ *
+ * That distinction drives the wire: an advertised cap is sent, an absent one is
+ * omitted (qodercli's `k()`). `maxTokensForEntry` folds both into the single
+ * number pi's own accounting needs, which is why the two readers exist.
+ */
+export function advertisedMaxTokens(entry: QoderModelEntry | undefined): number | undefined {
+  const value = entry?.max_output_tokens;
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+/** pi's metadata figure for one catalog entry: the advertised cap, else 32000 (see the constant's SCOPE OF IMPACT). */
+function maxTokensForEntry(entry: QoderModelEntry): number {
+  return advertisedMaxTokens(entry) ?? QODER_DEFAULT_MAX_OUTPUT_TOKENS;
 }
 
 export interface QoderModelDef {
@@ -211,16 +255,49 @@ function buildStaticModels(mode: QoderMode, rows: readonly StaticModelRow[]): Qo
     cost: rateForUpstreamKey(row.upstreamKey) ?? ZERO_COST,
     promptCache: MODEL_PROMPT_CACHE,
     contextWindow: row.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
-    maxTokens: MAX_OUTPUT_TOKENS,
+    maxTokens: QODER_DEFAULT_MAX_OUTPUT_TOKENS,
     ...(row.description ? { description: row.description } : {}),
   }));
 }
 
+/**
+ * Offline fallback catalog: the four permanent tier aliases and nothing else.
+ *
+ * A model-named row is a snapshot a release invalidates — `Lite`, `Qwen3.7 Plus`
+ * and `DeepSeek-V4-Flash` are the shapes that stop resolving — and a dead id is
+ * only discovered at dispatch. The tiers are Qoder's stable interface: all four
+ * are in the live catalog (observed 2026-10-09) and in the routing table's
+ * verified key split, so a fallback built from them cannot rot.
+ *
+ * Flags mirror those live entries (Auto and Efficient advertise no reasoning;
+ * Performance advertises effort levels with reasoning off). Everything else —
+ * each model's own context window included — comes from the live catalog as soon
+ * as a fetch succeeds, so nothing here tracks model releases.
+ *
+ * CN keeps its named rows on purpose: no CN catalog has been observed from this
+ * checkout, and a guessed CN key fails at dispatch where a stale one still
+ * resolves.
+ */
 export const staticModels: QoderModelDef[] = buildStaticModels("global", [
-  { name: "Auto", upstreamKey: "auto", reasoning: true, vision: true },
+  { name: "Auto", upstreamKey: "auto", reasoning: false, vision: true },
   { name: "Ultimate", upstreamKey: "ultimate", reasoning: true, supportsEffort: true, vision: true },
-  { name: "Performance", upstreamKey: "performance", reasoning: true, supportsEffort: true, vision: true },
+  { name: "Performance", upstreamKey: "performance", reasoning: false, supportsEffort: true, vision: true },
   { name: "Efficient", upstreamKey: "efficient", reasoning: false, vision: true },
+]);
+
+/**
+ * Resolution seed: the ids a *stored* model can still name, over and above the
+ * tiers. Separate from `staticModels` on purpose, because the two solve
+ * different problems. The fallback is what a picker shows offline, so it must
+ * not offer names a release invalidates; a stored id is the other direction — a
+ * session, a settings file or an earlier catalog can pin `Lite` or
+ * `Qwen3.8-Max`, and those must keep dispatching. Nothing here is ever listed,
+ * so a stale row costs nothing until something names it.
+ *
+ * Rows are the pre-narrowing fallback list, so id-to-key resolution behaves
+ * exactly as it did before the picker was limited to the four tiers.
+ */
+const staticSeedExtra: readonly StaticModelRow[] = [
   { name: "Lite", upstreamKey: "lite", reasoning: false },
   { name: "Qwen3.7 Plus", upstreamKey: "qmodel", reasoning: false, vision: true },
   { name: "Cantus", upstreamKey: "cmodel", reasoning: true, supportsEffort: true, vision: true },
@@ -233,7 +310,9 @@ export const staticModels: QoderModelDef[] = buildStaticModels("global", [
   { name: "Kimi-K2.7-Code", upstreamKey: "kmodel", reasoning: false, vision: true, contextWindow: 256000 },
   { name: "Kimi-K3", upstreamKey: "kmodel_latest", reasoning: false, vision: true },
   { name: "MiniMax-M3", upstreamKey: "mmodel", reasoning: false, vision: true },
-]);
+];
+
+const staticSeeds: QoderModelDef[] = [...staticModels, ...buildStaticModels("global", staticSeedExtra)];
 
 export const staticCnModels: QoderModelDef[] = buildStaticModels("cn", [
   // CN Auto has not been live-tested at 1M; keep the conservative 200K
@@ -352,7 +431,7 @@ function buildThinkingLevelMap(entry: QoderModelEntry): ThinkingLevelMap | undef
 }
 
 /**
- * Lazily built indexes over the static fallback catalogs. `getCachedModels`
+ * Lazily built indexes over the resolution seeds (tiers plus stored-id rows). `getCachedModels`
  * maps every cached entry back to a seed (by upstream key) and
  * `getCachedModelConfig` resolves a fallback by public id; both used to run a
  * linear `.find` per call. The seed arrays are module constants, so the maps
@@ -367,7 +446,7 @@ function getStaticSeedIndex(mode: QoderMode, by: "upstreamKey" | "id"): Map<stri
   if (existing) return existing;
 
   const index = new Map<string, QoderModelDef>();
-  for (const model of mode === "cn" ? staticCnModels : staticModels) {
+  for (const model of mode === "cn" ? staticCnModels : staticSeeds) {
     const key = by === "upstreamKey" ? model.upstreamKey : model.id;
     if (key && !index.has(key)) index.set(key, model);
   }
@@ -381,11 +460,15 @@ export function getCachedModels(mode: QoderMode): QoderModelDef[] {
     const staticByKey = getStaticSeedIndex(mode, "upstreamKey");
     const models = data.models.map((model: QoderModelDef) => {
       const config = data.configs?.[model.id] as QoderModelEntry | undefined;
+      // The catalog entry owns the cap, not this file: a cache written by an
+      // earlier version carries the old 131072 ceiling, and re-deriving on load
+      // means such a value cannot outlive the release that replaced it.
+      const maxTokens = maxTokensForEntry(config ?? {});
       const display = config?.display_name;
       const staticModel = staticByKey.get(model.id);
-      if (display) return { ...model, id: toQoderModelId(display), name: display };
-      if (staticModel) return { ...model, id: staticModel.id, name: staticModel.name };
-      return model.name ? { ...model, id: toQoderModelId(model.name) } : model;
+      if (display) return { ...model, maxTokens, id: toQoderModelId(display), name: display };
+      if (staticModel) return { ...model, maxTokens, id: staticModel.id, name: staticModel.name };
+      return model.name ? { ...model, maxTokens, id: toQoderModelId(model.name) } : model;
     });
     return models;
   }
@@ -539,7 +622,9 @@ async function fetchAndCacheModelList(
       email,
     });
 
-    const resData = await fetchQoderJson<{ chat?: QoderModelEntry[] }>(
+    // The scene this extension reads: qodercli keys every group by name and then
+    // reads the account's configured scene, so the group is a choice.
+    const resData = await fetchQoderJson<{ [SCENE.chat.group]?: QoderModelEntry[] }>(
       modelListURL,
       {
         method: "GET",
@@ -551,7 +636,7 @@ async function fetchAndCacheModelList(
       { signal },
     );
     signal?.throwIfAborted();
-    const chatModels = resData.chat || [];
+    const chatModels = resData[SCENE.chat.group] || [];
     if (chatModels.length === 0) return;
 
     const newModels: QoderModelDef[] = [];
@@ -594,7 +679,7 @@ async function fetchAndCacheModelList(
         cost: rateForUpstreamKey(key) ?? ZERO_COST,
         promptCache: MODEL_PROMPT_CACHE,
         contextWindow: ctxLen,
-        maxTokens: MAX_OUTPUT_TOKENS,
+        maxTokens: maxTokensForEntry(entry),
         ...(priceFactor !== undefined ? { priceFactor } : {}),
       });
     }

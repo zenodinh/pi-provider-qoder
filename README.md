@@ -80,14 +80,14 @@ After login, `/model` (or `pi --list-models`) lists what that region offers.
 - `~/.pi/agent/qoder-models-cache.json` (global)
 - `~/.pi/agent/qoder-cn-models-cache.json` (China)
 
-**Fallback catalog.** When the live catalog is unavailable, an explicit static catalog is used so models work offline. IDs in the fallback are also used as seeds until a live catalog arrives.
+**Fallback catalog.** When the live catalog is unavailable, the four permanent tier aliases (`Auto`, `Ultimate`, `Performance`, `Efficient`) are offered so a model can always be picked offline. Model-named rows are deliberately not kept: a Qoder release renames them, and a dead id is only discovered at dispatch — the live catalog supplies every other model, and each one's context window, as soon as a fetch succeeds.
 
 **Model ids.** The pi-visible id is the server `display_name` with all whitespace stripped (e.g. `Qwen3.8-Max`, `Kimi-K3`). A hidden `upstreamKey` (`lite`, `qmodel`, `qmodel_latest`, `dmodel`, …) is kept internally and sent to the gateway on each request.
 
 **Context & output.**
 
 - Context window: taken from the **largest** context option the catalog advertises (e.g. 1M when 200K/400K/1M are offered). When the catalog omits context options, a 1M fallback is used for most models; a few models are pinned lower to what they actually advertise (e.g. Kimi 256K, and several CN models 200K).
-- Output: capped at 128K tokens (`max_tokens` 131072), which can be lowered per-request by pi (e.g. compaction).
+- Output: `max_tokens` goes on the wire only when it has an owner — a cap the catalog advertises (`max_output_tokens`), a value you set on the model, or pi's per-request cap (e.g. compaction at 40K). Without an owner the field is absent and Qoder's own default applies; qodercli's bodies drop it the same way. pi's answer-room and compaction math use the advertised cap, else 32000.
 - Cost: Qoder bills in Credits, not USD, so pi's monetary `cost` is left at zero. The relative Credit multiplier (`price_factor`) is exposed as `priceFactor` on each model when the live catalog reports it, and the official per-request `credits` / `original_credits` / `billable` fields are preserved on the runtime usage object when Qoder reports them.
 
 ### Thinking & effort

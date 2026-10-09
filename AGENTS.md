@@ -25,10 +25,41 @@ npm install
 npm test           # run the offline unit suite (replays recorded fixtures)
 npm run test:coverage  # the same suite plus coverage/lcov.info
 npm run test:live  # re-record live protocol fixtures (needs QODER_PAT / QODERCN_PAT)
-pi -e ./src/index.ts  # load the extension from source in pi
+pi -e ./src/index.ts  # load the extension from source in pi (see Dog fooding)
 ```
 
 See [`src/__fixtures__/live/README.md`](https://github.com/zenodinh/pi-provider-qoder/blob/main/src/__fixtures__/live/README.md) for the fixture format and how to re-record it.
+
+## Dog fooding (UAT against real Qoder)
+
+Run this checkout inside pi against the live gateway **without touching the npm
+install** — no `pi uninstall`, no settings edit:
+
+```bash
+pi -ne -e ./src/index.ts --list-models qoder   # the source, not the install
+QODER_DEBUG=1 pi -ne -e ./src/index.ts --provider qoder --model qoder/<id> -p "Reply with exactly: OK"
+```
+
+`-ne` turns off extension discovery and `-e ./src/index.ts` loads this checkout.
+Both flags matter: this provider is also installed as `npm:@zenodinh/pi-provider-qoder`
+(see `pi list`), and with discovery left on pi loads that copy as well — the model
+list does not say which of the two answered. `-ne` leaves the checkout as the only
+extension in the process, so what you observe belongs to the code you are testing.
+Authentication is your existing login in `~/.pi/agent/auth.json` — a dog-fooding
+run needs no PAT.
+
+Read the proof, not the answer. `QODER_DEBUG=1` appends each request's logical
+body (pre-encoding, i.e. what Qoder receives) to
+`~/.pi/agent/logs/qoder-debug/<sessionId>.jsonl`, where the `type:"request"`
+record carries `body.parameters` and `body.messages`. For a turn whose model
+advertises no output cap, that body must show `parameters` with
+`enable_thinking` / `reasoning_effort` and **no `max_tokens`**,
+`messages[0].role === "system"` with no `developer` role, and a
+`prompt_cache_key`.
+
+Re-recording the protocol fixtures is a different job with a different
+requirement — a regional PAT supplied through the environment only, never a
+file. See [`src/__fixtures__/live/README.md`](https://github.com/zenodinh/pi-provider-qoder/blob/main/src/__fixtures__/live/README.md).
 
 ## What publishes
 

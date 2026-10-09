@@ -15,13 +15,14 @@ import { join } from "node:path";
 import type { Api, AssistantMessageEvent, Context, Model, TranscriptContext } from "@earendil-works/pi-ai";
 import { normalizeContext } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { clearQoderModelsMemCache, staticModels } from "../catalog.js";
+import { clearQoderModelsMemCache } from "../catalog.ts";
 import { capText, createDebugFetch, redactHeadersForDebug, writeDebugRecord } from "../debug-log.js";
 import { streamQoderRouter } from "../protocol/router.js";
 import { clearQoderFallbackCache, clearQoderRoutingMemCache } from "../protocol/routing.js";
 import { streamQoder } from "../protocol/stream.js";
 import { readDebugRecords } from "./debug-sink.js";
 import { loadLiveFixture } from "./live-fixture.js";
+import { fixtureModel } from "./model-fixture.ts";
 
 // Same identity pin as stream.test.ts: the mocked fetch must only ever serve
 // the chat request, so /userinfo is short-circuited at the module boundary.
@@ -98,9 +99,7 @@ function makeModel(id: string): Model<Api> {
 // Full static entry (v2.test convention): pi-ai reads fields (input modalities,
 // compat) a bare {id,api,provider} cast does not carry.
 function staticModelNamed(id: string): Model<Api> {
-  const found = staticModels.find((model) => model.id === id);
-  if (!found) throw new Error(`fixture model missing from static seed: ${id}`);
-  return found as Model<Api>;
+  return fixtureModel(id);
 }
 
 function makeContext(): TranscriptContext {
@@ -228,6 +227,8 @@ describe("debug-mode capture (QODER_DEBUG)", () => {
       "utf8",
     );
     clearQoderModelsMemCache();
+    // v2 is opt-in since 2026-10-09; this row is about the v2 debug records.
+    vi.stubEnv("QODER_PROTOCOL", "v2");
     const events = await drain(
       streamQoderRouter(staticModelNamed("Ultimate"), makeContext(), {
         apiKey: "fake",
@@ -424,6 +425,8 @@ describe("wireSessionId on the response records", () => {
       "utf8",
     );
     clearQoderModelsMemCache();
+    // v2 is opt-in since 2026-10-09; this row pins the v2 wire capture end to end.
+    vi.stubEnv("QODER_PROTOCOL", "v2");
 
     const bodies: Record<string, unknown>[] = [];
     const fetch = vi.fn(async (input: unknown, init?: RequestInit) => {
