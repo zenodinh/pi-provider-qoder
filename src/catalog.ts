@@ -42,6 +42,24 @@ export const MODEL_PROMPT_CACHE: ModelPromptCache = Object.freeze({ short: 300 }
  * it too and sends a value only when Qoder advertised one or pi capped the turn
  * itself. Decoded 2026-10-09 from 1.1.66; every live catalog entry carries no
  * `max_output_tokens`.
+ *
+ * SCOPE OF IMPACT — every reader of this number, upstream of the wire:
+ *   - Nothing here reaches Qoder. Both transports omit `max_tokens` unless the
+ *     catalog advertises a cap, the user sets one on the model, or pi asks for a
+ *     per-turn cap (compaction, cache warming). Raising this value does NOT
+ *     change what the server receives.
+ *   - pi's compaction: the caps pi derives for summarization and its prefix
+ *     passes are bounded by this value — `min(4096, ...)` for the summary
+ *     request, `min(0.8 * reserve, ...)` and `min(0.5 * reserve, ...)` for the
+ *     prefix passes. Raising it therefore lengthens a compaction request only
+ *     after the 4096 clamp stops binding, and only up to what reserve allows.
+ *   - pi's reasoning budget: with no wire cap, the ceiling the host computes for a
+ *     thinking budget falls back to this value.
+ *   - pi's length recovery: a truncated answer is judged retryable against it
+ *     (`isRecoverableLength(assistantMessage, model.maxTokens)`).
+ *   - pi's model picker shows it as the `max-out` column.
+ * A catalog entry that advertises `max_output_tokens` replaces this value in
+ * every reader above.
  */
 export const QODER_DEFAULT_MAX_OUTPUT_TOKENS = 32000;
 
@@ -91,7 +109,7 @@ export function advertisedMaxTokens(entry: QoderModelEntry | undefined): number 
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
 
-/** pi's metadata figure for one catalog entry: the advertised cap, else 32000. */
+/** pi's metadata figure for one catalog entry: the advertised cap, else 32000 (see the constant's SCOPE OF IMPACT). */
 function maxTokensForEntry(entry: QoderModelEntry): number {
   return advertisedMaxTokens(entry) ?? QODER_DEFAULT_MAX_OUTPUT_TOKENS;
 }
