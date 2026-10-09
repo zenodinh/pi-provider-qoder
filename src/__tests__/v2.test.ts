@@ -14,7 +14,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cacheQoderIdentityForTest, clearQoderAuthMemCache } from "../auth/oauth.js";
-import { clearQoderModelsMemCache, staticModels } from "../catalog.js";
+import { clearQoderModelsMemCache } from "../catalog.ts";
 import { clearPrefixChainRegistry } from "../protocol/prefix-chain.js";
 import { streamQoderRouter } from "../protocol/router.js";
 import { clearQoderFallbackCache, clearQoderRoutingMemCache, isMarkedLegacyOnly } from "../protocol/routing.js";
@@ -23,6 +23,7 @@ import { clearQoderFilterMemCache } from "../protocol/sampling.js";
 import { streamQoder } from "../protocol/stream.js";
 import { streamQoderV2 } from "../protocol/v2.js";
 import { readDebugRecords } from "./debug-sink.js";
+import { fixtureModel } from "./model-fixture.ts";
 import { OVERSIZED_TEXT } from "./sse-fixtures.js";
 
 const context = normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: 0 }] });
@@ -73,9 +74,7 @@ const expectedOsType = process.platform === "darwin" ? "macos" : process.platfor
 const cachePath = () => join(process.env.HOME as string, ".pi", "agent", "qoder-models-cache.json");
 
 function modelNamed(id: string): Model<Api> {
-  const found = staticModels.find((model) => model.id === id);
-  if (!found) throw new Error(`fixture model missing from static seed: ${id}`);
-  return found as Model<Api>;
+  return fixtureModel(id);
 }
 
 function seedCatalogWithTiers() {
@@ -127,10 +126,10 @@ function v2FetchCapture() {
 }
 
 beforeEach(() => {
-  // Neutralize any developer-shell QODER_PROTOCOL so routing follows the shipped
-  // table (v2 for allowlisted keys); an override here would also rewrite the
-  // decision `source` these assertions pin (hermeticity).
-  vi.stubEnv("QODER_PROTOCOL", "");
+  // This suite is about the v2 transport, and v2 is opt-in since the owner
+  // decision of 2026-10-09, so the flag is stated here instead of being
+  // inherited from a shell (hermeticity): without it the router serves legacy.
+  vi.stubEnv("QODER_PROTOCOL", "v2");
   cacheQoderIdentityForTest("qoder:fake", {
     access: "fake",
     refresh: "",

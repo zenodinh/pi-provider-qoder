@@ -29,9 +29,12 @@ afterEach(() => {
 // ── staticModels ──────────────────────────────────────────────────────────
 
 describe("staticModels", () => {
-  it("is a non-empty array", () => {
-    expect(Array.isArray(staticModels)).toBe(true);
-    expect(staticModels.length).toBeGreaterThan(0);
+  it("carries the four permanent tier aliases and nothing else", () => {
+    // A model-named row is a snapshot a release invalidates — `Lite`, `Qwen3.7
+    // Plus` and `DeepSeek-V4-Flash` all stopped resolving — and a dead id is only
+    // discovered at dispatch. The tiers are Qoder's stable interface (present in
+    // the live catalog 2026-10-09), so the offline fallback is exactly these four.
+    expect(staticModels.map((m) => m.upstreamKey).sort()).toEqual(["auto", "efficient", "performance", "ultimate"]);
   });
 
   it("has auto as first entry", () => {
@@ -66,19 +69,17 @@ describe("staticModels", () => {
     expect(new Set(ids).size).toBe(ids.length);
   });
 
-  it("uses a 1M context window for models confirmed to support it", () => {
-    // Global lite was live-tested through 1,000K tokens (issue #13). auto,
-    // efficient, and gm51model share the same Qoder 1M catalog family.
-    for (const key of ["auto", "efficient", "lite", "gm51model"]) {
+  it("uses a 1M context window for the tiers confirmed to support it", () => {
+    // Global lite was live-tested through 1,000K tokens (issue #13). auto and
+    // efficient share the same Qoder 1M catalog family. The model-named keys that
+    // did too (lite, gm51model) left the fallback, and the live path takes their
+    // context from the catalog itself.
+    for (const key of ["auto", "efficient"]) {
       const model = staticModels.find((m) => m.upstreamKey === key);
       expect(model, key).toBeDefined();
       expect(model?.contextWindow).toBe(DEFAULT_CONTEXT_WINDOW);
       expect(model?.contextWindow).toBe(1_000_000);
     }
-  });
-
-  it("keeps kmodel at the catalog-advertised 256K window", () => {
-    expect(staticModels.find((m) => m.upstreamKey === "kmodel")?.contextWindow).toBe(256000);
   });
 
   it("declares the prompt-cache lifetime so pi can warm it", () => {
@@ -88,28 +89,29 @@ describe("staticModels", () => {
   });
 
   it("maps friendly ids to static upstream keys without raw-key aliases", () => {
+    // Asserted on a surviving tier row; the model-named mapping (Qwen3.8-Max →
+    // qmodel_preview) now belongs to the live-catalog suite, where the rows come
+    // from the catalog instead of from a hand-maintained snapshot.
+    expect(getCachedModelConfig("Ultimate", "global")?.key).toBe("ultimate");
+    expect(getCachedModelConfig("Efficient", "global")?.key).toBe("efficient");
+    expect(getCachedModelConfig("ultimate", "global")).toBeNull();
+    expect(getCachedModelConfig("efficient", "global")).toBeNull();
+  });
+
+  it("still resolves an id the fallback no longer offers, so a stored model keeps dispatching", () => {
+    // Two roles: `staticModels` is what a picker shows offline (the four tiers);
+    // the resolution seed behind getCachedModelConfig keeps the older display
+    // names (`Lite`, `Qwen3.8-Max`) mapping to their upstream keys.
     expect(getCachedModelConfig("Lite", "global")?.key).toBe("lite");
     expect(getCachedModelConfig("Qwen3.8-Max", "global")?.key).toBe("qmodel_preview");
     expect(getCachedModelConfig("lite", "global")).toBeNull();
-    expect(getCachedModelConfig("qmodel_preview", "global")).toBeNull();
   });
 
-  it("prices measured upstream keys from the rate table and keeps display-name divergences at ZERO_COST (spec T-09)", () => {
-    // recorded-from: SA §5.2 measured rate table (owner ledger fits, 2026-09-30).
-    expect(staticModels.find((m) => m.upstreamKey === "dfmodel")?.cost).toEqual({
-      input: 0.126984,
-      cacheRead: 0.00253968,
-      output: 0.507936,
-      cacheWrite: 0.126984,
-    });
-    // Qwen3.8-Max's static upstream key is qmodel_preview (the live catalog says
-    // qmodel_38max) — a display-name match must never price it.
-    const qwen38Max = staticModels.find((m) => m.id === "Qwen3.8-Max");
-    expect(qwen38Max?.upstreamKey).toBe("qmodel_preview");
-    expect(qwen38Max?.cost).toBe(ZERO_COST);
-    for (const m of staticModels) {
-      if (m.upstreamKey !== "dfmodel") expect(m.cost).toBe(ZERO_COST);
-    }
+  it("leaves every fallback row at ZERO_COST (measured pricing lives on the live path)", () => {
+    // The rate table keys on upstream names a fallback row no longer carries
+    // (dfmodel, qmodel_preview). "live catalog builder rates (spec T-09)" below
+    // asserts the measured fit where the rows come from the catalog.
+    for (const m of staticModels) expect(m.cost).toBe(ZERO_COST);
   });
 });
 

@@ -14,7 +14,7 @@ import { isContextOverflow } from "@earendil-works/pi-ai/utils/overflow";
 import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cacheQoderIdentityForTest, clearQoderAuthMemCache } from "../auth/oauth.js";
-import { clearQoderModelsMemCache } from "../catalog.js";
+import { clearQoderModelsMemCache } from "../catalog.ts";
 import { buildAuthHeaders } from "../cosy.js";
 import { MAX_DSML_BUFFER_LENGTH } from "../protocol/dsml.js";
 import { clearQoderFallbackCache, clearQoderRoutingMemCache } from "../protocol/routing.js";

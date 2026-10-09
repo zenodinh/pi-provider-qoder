@@ -14,7 +14,7 @@ import {
   withoutInitialSystemMessage,
 } from "@earendil-works/pi-ai";
 import { type QoderIdentity, resolveQoderIdentity } from "../auth/oauth.js";
-import { getCachedModelConfig, MAX_OUTPUT_TOKENS } from "../catalog.js";
+import { advertisedMaxTokens, getCachedModelConfig, QODER_DEFAULT_MAX_OUTPUT_TOKENS } from "../catalog.ts";
 import { buildAuthHeaders, getMachineId } from "../cosy.js";
 import {
   capText,
@@ -44,6 +44,7 @@ import { stripThinkingTags, ThinkingTagParser } from "./thinking.js";
 import { ToolCallAccumulator } from "./tool-calls.js";
 import { contentToText, transformMessagesForQoder, transformTools } from "./transform.js";
 import { parseQoderCreditsUsage, type QoderCreditsUsage } from "./usage.js";
+import { WIRE_ROLE } from "./vocabulary.ts";
 import { affinityPlacements, carrierValue, QODER_WIRE_COMPAT } from "./wire-compat.js";
 
 type QoderAssistantUsage = AssistantMessage["usage"] & QoderCreditsUsage & { rateSource?: RateSource };
@@ -299,16 +300,23 @@ export function streamQoder(
             })()
           : PROCESS_FALLBACK_SESSION_ID);
 
-      // Qoder's catalog exposes no per-model output cap, so we use the
-      // documented upstream ceiling (MAX_OUTPUT_TOKENS = 131072, see models.ts)
-      // and let pi cap it lower when the caller sets options.maxTokens (e.g.
-      // compaction at 40K). This avoids truncating reasoning chains / long
-      // generations that the 32K default would cut off.
-      let maxTokens = MAX_OUTPUT_TOKENS;
-      for (const limit of [model.maxTokens, options?.maxTokens]) {
-        if (limit === undefined) continue;
-        if (!Number.isInteger(limit) || limit <= 0) throw new Error("Qoder maxTokens must be a positive integer");
-        maxTokens = Math.min(maxTokens, limit);
+      // Three things can own the cap: what Qoder's catalog advertised, what the
+      // user set on the model itself (any value other than this provider's own
+      // 32000 metadata default), and what pi asked for in this call (compaction
+      // at 40K). With none of them the field is omitted so Qoder's own default
+      // applies — qodercli's bodies drop it through `k()`, and its 32000 belongs
+      // to the metadata path only (see QODER_DEFAULT_MAX_OUTPUT_TOKENS).
+      const advertised = advertisedMaxTokens(modelConfig);
+      const userCap =
+        Number.isInteger(model.maxTokens) && model.maxTokens > 0 && model.maxTokens !== QODER_DEFAULT_MAX_OUTPUT_TOKENS
+          ? model.maxTokens
+          : undefined;
+      let maxTokens = advertised ?? userCap;
+      if (options?.maxTokens !== undefined) {
+        if (!Number.isInteger(options.maxTokens) || options.maxTokens <= 0) {
+          throw new Error("Qoder maxTokens must be a positive integer");
+        }
+        maxTokens = Math.min(maxTokens ?? options.maxTokens, options.maxTokens);
       }
 
       const currentTools = currentSystem?.toolsAdded ?? [];
@@ -325,7 +333,11 @@ export function streamQoder(
       const requestedLevel = plan?.thinkingInputs.level ?? options?.reasoning;
       const clamped = requestedLevel ? clampThinkingLevel(model, requestedLevel) : undefined;
       const reasoningLevel = clamped === "off" ? undefined : clamped;
-      const parameters: Record<string, unknown> = { max_tokens: maxTokens };
+      const parameters: Record<string, unknown> = {};
+      // Absent, not defaulted: Qoder's own client omits the cap when it has no
+      // value for it, and an invented one would truncate an answer the server
+      // would otherwise have allowed to run longer.
+      if (maxTokens !== undefined) parameters.max_tokens = maxTokens;
       if (options?.temperature !== undefined) parameters.temperature = options.temperature;
       if (reasoningLevel) {
         parameters.enable_thinking = true;
@@ -437,7 +449,9 @@ export function streamQoder(
         // model never sees it). Inject the system prompt as a leading
         // role:system message instead, which the server does honor.
         system: "",
-        messages: systemText ? [{ role: "system", content: systemText }, ...normalizedMessages] : normalizedMessages,
+        messages: systemText
+          ? [{ role: WIRE_ROLE.system.wire, content: systemText }, ...normalizedMessages]
+          : normalizedMessages,
         tools: toolsRaw || [],
         parameters,
         chat_context: {

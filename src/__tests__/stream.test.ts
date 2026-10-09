@@ -11,12 +11,12 @@ import type {
 } from "@earendil-works/pi-ai";
 import { normalizeContext } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { staticModels } from "../catalog.js";
 import { clearPrefixChainRegistry } from "../protocol/prefix-chain.js";
 import { clearQoderRunRegistry } from "../protocol/run-identity.js";
 import { streamQoder } from "../protocol/stream.js";
 import { streamQoderV2 } from "../protocol/v2.js";
 import { loadLiveFixture } from "./live-fixture.js";
+import { fixtureModel } from "./model-fixture.ts";
 
 // Pin the identity so the mocked fetch below only ever serves the chat request.
 // Without a resolved identity, streamQoder fetches /userinfo first and consumes
@@ -1329,7 +1329,7 @@ describe("run identity on the wire", () => {
       }
       return new Response(SUCCESS_SSE);
     }) as unknown as typeof globalThis.fetch;
-    const ultimate = staticModels.find((model) => model.id === "Ultimate");
+    const ultimate = fixtureModel("Ultimate");
     if (!ultimate) throw new Error("fixture model missing from static seed: Ultimate");
     await consume(
       streamQoderV2(
@@ -1476,7 +1476,7 @@ describe("plan seam on the legacy transport", () => {
 
   it("T-10 the legacy body is identical across the gate, session-bearing and session-less alike", async () => {
     const { streamQoderRouter } = await import("../protocol/router.js");
-    const model = staticModels.find((candidate) => candidate.id === "DeepSeek-V4-Flash") as Model<Api>;
+    const model = fixtureModel("DeepSeek-V4-Flash");
 
     for (const sessionId of ["session-gate-parity", undefined]) {
       const bodies: Record<string, unknown>[] = [];
@@ -1512,7 +1512,7 @@ describe("plan seam on the legacy transport", () => {
     process.env.QODER_CORE_PLAN = "1";
     try {
       const { streamQoderRouter } = await import("../protocol/router.js");
-      const model = staticModels.find((candidate) => candidate.id === "DeepSeek-V4-Flash") as Model<Api>;
+      const model = fixtureModel("DeepSeek-V4-Flash");
       const bodies: Record<string, unknown>[] = [];
       globalThis.fetch = mockFetch(SUCCESS_SSE);
       await consume(
@@ -1539,7 +1539,7 @@ describe("plan seam on the legacy transport", () => {
   it("T-11 an onPayload rewrite of model_config.key still decides X-Model-Key", async () => {
     vi.stubEnv("QODER_CORE_PLAN", "1");
     const { streamQoderRouter } = await import("../protocol/router.js");
-    const model = staticModels.find((candidate) => candidate.id === "DeepSeek-V4-Flash") as Model<Api>;
+    const model = fixtureModel("DeepSeek-V4-Flash");
     const captured: Record<string, unknown>[] = [];
     let init: RequestInit | undefined;
     const fetch = vi.fn(async (_input: unknown, request?: RequestInit) => {
@@ -1781,9 +1781,7 @@ describe("qoder-warm-attribution: one ledger namespace", () => {
   });
 
   it("T-07/AC-01,AC-02,AC-04 lands one requested model in the same namespace on both transports", async () => {
-    const requested = staticModels.find((model) => model.id === "DeepSeek-V4-Flash");
-    if (!requested) throw new Error("fixture model missing from static seed: DeepSeek-V4-Flash");
-    const model = requested as Model<Api>;
+    const model = fixtureModel("DeepSeek-V4-Flash");
     const upstreamKey = "dfmodel";
 
     // Legacy: the gateway echoes its constant against a friendly-id request.

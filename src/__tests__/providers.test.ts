@@ -1,6 +1,8 @@
 import type { OAuthCredentials } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { LedgerScan, LifetimeProfile } from "../lifetime.js";
+import { rateForUpstreamKey } from "../pricing.ts";
+import { seedCatalogCache } from "./cache-fixture.ts";
 
 const patEnvNames = [
   "QODER_API_KEY",
@@ -274,6 +276,15 @@ function learnedProfile(): LifetimeProfile {
 describe("learned profile feed (AC-06)", () => {
   it("stamps learned lifetimes and rates at registration with hand-fitted precedence", async () => {
     for (const name of patEnvNames) delete process.env[name];
+    // Registration reads the on-disk catalog, not the offline fallback: the
+    // fallback is only the four tier aliases (catalog.ts), so the model-named ids
+    // this row asserts on come from a seeded cache — the shape a real registration
+    // reads after a fetch.
+    seedCatalogCache([
+      { id: "DeepSeek-V4-Flash", key: "dfmodel", cost: rateForUpstreamKey("dfmodel") },
+      { id: "Qwen3.8-Max", key: "qmodel_preview" },
+      { id: "Lite", key: "lite" },
+    ]);
     const providers = new Map<string, Record<string, unknown>>();
     const pi = {
       registerProvider(providerID: string, config: Record<string, unknown>) {
@@ -309,6 +320,11 @@ describe("learned profile feed (AC-06)", () => {
 
   it("re-registers both providers after the learner publishes", async () => {
     for (const name of patEnvNames) delete process.env[name];
+    seedCatalogCache([
+      { id: "DeepSeek-V4-Flash", key: "dfmodel", cost: rateForUpstreamKey("dfmodel") },
+      { id: "Qwen3.8-Max", key: "qmodel_preview" },
+      { id: "Lite", key: "lite" },
+    ]);
     const providers = new Map<string, Record<string, unknown>>();
     const registerProvider = vi.fn((providerID: string, config: Record<string, unknown>) => {
       providers.set(providerID, config);

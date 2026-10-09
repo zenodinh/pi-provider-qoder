@@ -4,11 +4,12 @@ import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/p
 import { normalizeContext } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cacheQoderIdentityForTest, clearQoderAuthMemCache } from "../auth/oauth.js";
-import { clearQoderModelsMemCache, staticModels } from "../catalog.js";
+import { clearQoderModelsMemCache } from "../catalog.ts";
 import { streamQoderRouter } from "../protocol/router.js";
 import { clearQoderFallbackCache, clearQoderRoutingMemCache } from "../protocol/routing.js";
 import { clearQoderFilterMemCache } from "../protocol/sampling.js";
 import { MAX_PROMPT_CACHE_KEY_LENGTH } from "../protocol/session-key.js";
+import { fixtureModel } from "./model-fixture.ts";
 
 /**
  * AC-04 — the two protocols' session-id wire forms.
@@ -40,9 +41,7 @@ const LONG_SESSION_ID = "session-that-is-deliberately-longer-than-the-64-char-pr
 const SHORT_SESSION_ID = "short-session";
 
 function modelNamed(id: string): Model<Api> {
-  const found = staticModels.find((model) => model.id === id);
-  if (!found) throw new Error(`fixture model missing from static seed: ${id}`);
-  return found as Model<Api>;
+  return fixtureModel(id);
 }
 
 const cachePath = () => join(process.env.HOME as string, ".pi", "agent", "qoder-models-cache.json");
@@ -126,6 +125,9 @@ async function v2SessionFields(options: SimpleStreamOptions): Promise<V2Capture>
     return new Response(v2Success, { headers: { "content-type": "text/event-stream" } });
   }) as typeof globalThis.fetch;
 
+  // v2 is opt-in since 2026-10-09, and these rows are about the v2 transport's
+  // identity fields, so the request states the flag itself.
+  vi.stubEnv("QODER_PROTOCOL", "v2");
   const result = await streamQoderRouter(modelNamed("Ultimate"), context, { ...options, fetch }).result();
   expect(result.stopReason).toBe("stop");
   if (!body) throw new Error("expected the v2 transport to receive a request body");

@@ -4,7 +4,7 @@ import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/p
 import { normalizeContext } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { resolveQoderIdentity } from "../auth/oauth.js";
-import { clearQoderModelsMemCache, staticModels } from "../catalog.js";
+import { clearQoderModelsMemCache } from "../catalog.ts";
 import {
   type PlanRoute,
   PROCESS_FALLBACK_SESSION_ID,
@@ -17,6 +17,7 @@ import { streamQoderRouter } from "../protocol/router.js";
 import { clearQoderFallbackCache, clearQoderRoutingMemCache } from "../protocol/routing.js";
 import { clearQoderFilterMemCache } from "../protocol/sampling.js";
 import { QODER_WIRE_COMPAT } from "../protocol/wire-compat.js";
+import { fixtureModel } from "./model-fixture.ts";
 
 /**
  * The plan producer (spec fs-qoder-turn-plan CU-01/CU-02, T-01..T-06).
@@ -36,9 +37,7 @@ const context = normalizeContext({
 const cachePath = () => join(process.env.HOME as string, ".pi", "agent", "qoder-models-cache.json");
 
 function modelNamed(id: string): Model<Api> {
-  const found = staticModels.find((model) => model.id === id);
-  if (!found) throw new Error(`fixture model missing from static seed: ${id}`);
-  return found as Model<Api>;
+  return fixtureModel(id);
 }
 
 /** A fixed identity plus the invocation log T-04 counts. */

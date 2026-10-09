@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -12,12 +12,13 @@ import {
 } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cacheQoderIdentityForTest, clearQoderAuthMemCache } from "../auth/oauth.js";
-import { clearQoderModelsMemCache, staticModels } from "../catalog.js";
+import { clearQoderModelsMemCache } from "../catalog.ts";
 import { streamQoderRouter } from "../protocol/router.js";
 import { clearQoderFallbackCache, clearQoderRoutingMemCache } from "../protocol/routing.js";
 import { clearQoderFilterMemCache } from "../protocol/sampling.js";
 import { QODER_WIRE_COMPAT, type QoderWireCompatData } from "../protocol/wire-compat.js";
 import { debugMessages } from "./debug-sink.js";
+import { fixtureModel } from "./model-fixture.ts";
 
 // SA rows 1/2/7/8/9 regression: the wire vocabulary the host contract promises.
 // Everything enters through the registered streamSimple (streamQoderRouter) with
@@ -72,9 +73,7 @@ const context = fixtureContext();
 const cachePath = () => join(process.env.HOME as string, ".pi", "agent", "qoder-models-cache.json");
 
 function modelNamed(id: string): Model<Api> {
-  const found = staticModels.find((model) => model.id === id);
-  if (!found) throw new Error(`fixture model missing from static seed: ${id}`);
-  return found as Model<Api>;
+  return fixtureModel(id);
 }
 
 /** Seed the live-cache shape so a legacy key carries thinking_config.enabled.efforts. */
@@ -83,13 +82,19 @@ function seedCache(configs: Record<string, unknown>) {
   clearQoderModelsMemCache();
 }
 
-function seedLegacyEffortKey() {
+/**
+ * The legacy key's catalog entry. `maxOutputTokens` is the advertised cap for the
+ * rows that need one: this seeder runs on every `runLegacy`, so a cap seeded
+ * anywhere else is overwritten before the dispatch reads it.
+ */
+function seedLegacyEffortKey(maxOutputTokens?: number) {
   seedCache({
     "DeepSeek-V4-Flash": {
       key: "dfmodel",
       enable: true,
       display_name: "DeepSeek-V4-Flash",
       is_reasoning: true,
+      ...(maxOutputTokens !== undefined ? { max_output_tokens: maxOutputTokens } : {}),
       thinking_config: { enabled: { efforts: { low: {}, high: {}, max: {} } } },
     },
   });
@@ -158,7 +163,52 @@ function bodyOf(calls: { url: unknown; body?: Record<string, unknown> }[], index
   return body;
 }
 
+/** Cache files this suite seeded, removed after each test. */
+const seededCaches = new Set<string>();
+
+afterEach(() => {
+  for (const path of seededCaches) rmSync(path, { force: true });
+  seededCaches.clear();
+  clearQoderModelsMemCache();
+});
+
+/**
+ * Seed the catalog config index with an advertised output cap, the way a real
+ * refresh would: the model list carries the row, the config map carries the cap,
+ * and the memo is dropped so `getCachedModelConfig` reads it back.
+ *
+ * Fixture: invented — every live entry omits `max_output_tokens` (verified
+ * 2026-10-09 against the account's own catalog), so the advertised branch has no
+ * live shape to record, and its absence is the branch production actually takes.
+ */
+function seedAdvertisedCap(id: string, key: string, cap: number): void {
+  const path = cachePath();
+  writeFileSync(
+    path,
+    JSON.stringify({
+      updatedAt: Date.now(),
+      // The suite's own identity: a cache with no userID counts as stale
+      // (catalog.ts:513) and would be refreshed away before the run reads it.
+      userID: "user",
+      models: [{ id, maxTokens: cap }],
+      configs: { [id]: { key, enable: true, display_name: id, max_output_tokens: cap } },
+    }),
+    "utf8",
+  );
+  seededCaches.add(path);
+  clearQoderModelsMemCache();
+}
+
 describe("v2 wire vocabulary (SA rows 1, 8, 9, 10)", () => {
+  // v2 is opt-in since the owner decision of 2026-10-09: every row states the
+  // flag, because without it the router deliberately serves legacy.
+  beforeEach(() => {
+    vi.stubEnv("QODER_PROTOCOL", "v2");
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it("keeps the transcript contract: exactly one system message, the tool set, the upstream key, and the provider.request debug line", async () => {
     vi.stubEnv("QODER_DEBUG", "1");
     const debugDir = mkdtempSync(join(tmpdir(), "wire-vocab-debug-"));
@@ -175,10 +225,15 @@ describe("v2 wire vocabulary (SA rows 1, 8, 9, 10)", () => {
 
     const body = bodyOf(calls);
     const messages = body.messages as Array<{ role: string; content?: unknown }>;
-    // pi-ai renders the prompt as the OpenAI "developer" role for reasoning
-    // models and "system" otherwise — exactly one instruction message either way.
+    // Spec: the instruction channel is `system`. The gateway's validator accepts
+    // system/assistant/user/tool/function and rejects `developer`; qodercli never
+    // sends it, on either body. Verified live 2026-10-08: `developer` failed
+    // `auto`/`performance` (validator) and two upstreams refused it while
+    // accepting `system`. Exactly one instruction message either way.
     const instruction = messages.filter((m) => m.role === "system" || m.role === "developer");
     expect(instruction).toHaveLength(1);
+    expect(instruction[0]?.role).toBe("system");
+    expect(messages.some((m) => m.role === "developer")).toBe(false);
     expect(String(instruction[0]?.content)).toContain("coding assistant");
     expect(messages.at(-1)?.role).toBe("user");
     const tools = body.tools as Array<{ function: { name: string } }>;
@@ -186,6 +241,17 @@ describe("v2 wire vocabulary (SA rows 1, 8, 9, 10)", () => {
     expect(tools[0]?.function.name).toBe("read");
     expect(body.model).toBe("ultimate");
     expect(body.stream).toBe(true);
+    // Spec: the cap is omitted when Qoder advertises none. qodercli's body
+    // builders take it through `k()` (`r===void 0?void 0:Math.trunc(r)`), which
+    // drops the field; its 32000 lives on the metadata path only. The host would
+    // send model.maxTokens — pi's accounting figure — so v2 removes it again:
+    // absent under both names.
+    expect("max_tokens" in body).toBe(false);
+    expect(body.max_tokens).toBeUndefined();
+    expect(body.max_completion_tokens).toBeUndefined();
+    // Spec: `store` is never sent by the client — the pin replaces the host's
+    // non-standard-provider default, which would have added it.
+    expect(body.store).toBeUndefined();
     const metadata = body.metadata as { context: { session_id?: string } };
     expect(metadata.context.session_id).toBe("session-1");
 
@@ -194,8 +260,40 @@ describe("v2 wire vocabulary (SA rows 1, 8, 9, 10)", () => {
     expect(errorSpy).not.toHaveBeenCalled();
     const sinkMessages = debugMessages(debugDir, "session-1");
     expect(
-      sinkMessages.some((line) => line.includes("provider.request model_key=ultimate protocol=v2 source=routing-data")),
+      sinkMessages.some((line) => line.includes("provider.request model_key=ultimate protocol=v2 source=env")),
     ).toBe(true);
+  });
+
+  it("keeps the cap pi asked for, and the one the catalog advertised", async () => {
+    // Fixture: invented cap — no live entry advertises one; the two owners that
+    // make a cap real are pi's own request and the catalog's field.
+    const asked = v2FetchCapture();
+    await streamQoderRouter(modelNamed("Ultimate"), context, {
+      apiKey: "fake",
+      fetch: asked.fetch,
+      sessionId: "cap-asked",
+      maxTokens: 40_000,
+    }).result();
+    expect(bodyOf(asked.calls).max_tokens).toBe(40_000);
+
+    seedAdvertisedCap("Ultimate", "ultimate", 65_536);
+    const advertised = v2FetchCapture();
+    await streamQoderRouter({ ...modelNamed("Ultimate"), maxTokens: 65_536 }, context, {
+      apiKey: "fake",
+      fetch: advertised.fetch,
+      sessionId: "cap-advertised",
+    }).result();
+    expect(bodyOf(advertised.calls).max_tokens).toBe(65_536);
+
+    // Third owner: the user's own model setting — any value but this provider's
+    // metadata default — with no catalog cap and no per-turn cap.
+    const userSet = v2FetchCapture();
+    await streamQoderRouter({ ...modelNamed("Ultimate"), maxTokens: 4096 }, context, {
+      apiKey: "fake",
+      fetch: userSet.fetch,
+      sessionId: "cap-user",
+    }).result();
+    expect(bodyOf(userSet.calls).max_tokens).toBe(4096);
   });
 
   it("maps a pi thinking level to enable_thinking + reasoning_effort + the default budget", async () => {
@@ -208,7 +306,7 @@ describe("v2 wire vocabulary (SA rows 1, 8, 9, 10)", () => {
     const body = bodyOf(calls);
     expect(body.enable_thinking).toBe(true);
     expect(body.reasoning_effort).toBe("high");
-    // Default thinkingBudgets.high = 16384; ceiling = max_tokens (131072) - 1024.
+    // Default thinkingBudgets.high = 16384; ceiling = the metadata cap (32000) - 1024.
     expect(body.reasoning_budget_tokens).toBe(16384);
   });
 
@@ -368,11 +466,15 @@ function isPlainHeaderRecord(value: HeadersInit): value is Record<string, string
 
 describe("legacy parameters vocabulary (SA rows 2, 8)", () => {
   /** The legacy body is signed after onPayload, so capture pre-signing. */
-  async function runLegacy(options: SimpleStreamOptions) {
-    seedLegacyEffortKey();
+  async function runLegacy(
+    options: SimpleStreamOptions,
+    model: Model<Api> = modelNamed("DeepSeek-V4-Flash"),
+    advertisedCap?: number,
+  ) {
+    seedLegacyEffortKey(advertisedCap);
     let captured: Record<string, unknown> | undefined;
     const fetch = vi.fn(async () => new Response(legacySuccess)) as typeof globalThis.fetch;
-    const result = await streamQoderRouter(modelNamed("DeepSeek-V4-Flash"), context, {
+    const result = await streamQoderRouter(model, context, {
       ...options,
       onPayload: async (payload: unknown) => {
         captured = payload as Record<string, unknown>;
@@ -433,8 +535,42 @@ describe("legacy parameters vocabulary (SA rows 2, 8)", () => {
     const parameters = body.parameters as Record<string, unknown>;
     expect(parameters.enable_thinking).toBe(true);
     expect(parameters.reasoning_effort).toBe("high");
+    // Spec: an unadvertised cap is absent, not defaulted — qodercli's `k()` drops
+    // the field, and its 32000 belongs to the metadata path only.
+    expect("max_tokens" in parameters).toBe(false);
     // OB-3 fallback: the legacy envelope never carries v2-only budget fields.
     expect("reasoning_budget_tokens" in parameters).toBe(false);
+  });
+
+  it("omits an unadvertised cap, and sends the advertised or pi-asked value", async () => {
+    // Spec: the cap rides the wire only when it has an owner — Qoder's catalog
+    // advertising it, the user's own model setting, or pi capping the turn
+    // (compaction at 40K). With none of them the field is absent so Qoder's own
+    // default applies.
+    // Fixture: invented cap — every live entry omits `max_output_tokens`.
+    const silent = await runLegacy({ apiKey: "fake", reasoning: "high" });
+    expect("max_tokens" in (silent.parameters as Record<string, unknown>)).toBe(false);
+
+    const asked = await runLegacy({ apiKey: "fake", reasoning: "high", maxTokens: 40_000 });
+    expect((asked.parameters as Record<string, unknown>).max_tokens).toBe(40_000);
+
+    const userSet = await runLegacy({ apiKey: "fake", reasoning: "high" }, {
+      ...modelNamed("DeepSeek-V4-Flash"),
+      maxTokens: 4096,
+    } as Model<Api>);
+    expect((userSet.parameters as Record<string, unknown>).max_tokens).toBe(4096);
+
+    // The cap rides this run's own catalog fixture: `seedLegacyEffortKey` is the
+    // seeder every run passes through, so nothing can overwrite it in between.
+    const advertised = await runLegacy({ apiKey: "fake", reasoning: "high" }, modelNamed("DeepSeek-V4-Flash"), 65_536);
+    expect((advertised.parameters as Record<string, unknown>).max_tokens).toBe(65_536);
+
+    const both = await runLegacy(
+      { apiKey: "fake", reasoning: "high", maxTokens: 40_000 },
+      modelNamed("DeepSeek-V4-Flash"),
+      65_536,
+    );
+    expect((both.parameters as Record<string, unknown>).max_tokens).toBe(40_000);
   });
 
   it("sends enable_thinking:false and no effort when thinking is off", async () => {
@@ -585,8 +721,15 @@ describe("event vocabulary parity (SA FR-5)", () => {
     const fetch = vi.fn(
       async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
     ) as typeof globalThis.fetch;
+    // Per-call opt-in: v2 is opt-in since 2026-10-09, and the sibling row in this
+    // describe must stay on legacy, so the flag rides the request, not the process.
     return collectTypes(
-      streamQoderRouter(modelNamed("Ultimate"), context, { apiKey: "fake", fetch, reasoning: "high" }),
+      streamQoderRouter(modelNamed("Ultimate"), context, {
+        apiKey: "fake",
+        fetch,
+        reasoning: "high",
+        env: { QODER_PROTOCOL: "v2" },
+      } as SimpleStreamOptions),
     );
   };
 
@@ -690,7 +833,12 @@ describe("event vocabulary parity (SA FR-5)", () => {
     );
     const v2 = new Set(
       await collectTypes(
-        streamQoderRouter(modelNamed("Ultimate"), context, { apiKey: "fake", fetch: v2Fetch, reasoning: "high" }),
+        streamQoderRouter(modelNamed("Ultimate"), context, {
+          apiKey: "fake",
+          fetch: v2Fetch,
+          reasoning: "high",
+          env: { QODER_PROTOCOL: "v2" },
+        } as SimpleStreamOptions),
       ),
     );
 
@@ -746,7 +894,11 @@ describe("sampling filter (SA row 7)", () => {
       ...modelNamed("Ultimate"),
       samplingParams: { presence_penalty: 0.5, frequency_penalty: 0.5, seed: 7, temperature: 0.7 },
     } as Model<Api>;
-    await streamQoderRouter(model, context, { apiKey: "fake", fetch }).result();
+    await streamQoderRouter(model, context, {
+      apiKey: "fake",
+      fetch,
+      env: { QODER_PROTOCOL: "v2" },
+    } as SimpleStreamOptions).result();
     const body = bodyOf(calls);
     expect("presence_penalty" in body).toBe(false);
     expect("frequency_penalty" in body).toBe(false);

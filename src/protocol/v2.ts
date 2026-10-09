@@ -16,6 +16,7 @@ import {
   withoutInitialSystemMessage,
 } from "@earendil-works/pi-ai";
 import type { QoderModelEntry } from "../catalog.js";
+import { advertisedMaxTokens, QODER_DEFAULT_MAX_OUTPUT_TOKENS } from "../catalog.ts";
 import { debugLog } from "../debug.js";
 import { createDebugFetch, type DebugFetchMeta } from "../debug-log.js";
 import { openAICompletionsApi } from "../host-seam.js";
@@ -31,6 +32,7 @@ import { createReframedFetch } from "./sse-reframe.js";
 import { type TerminalStamp, withTerminalStamp } from "./stamp.js";
 import { streamQoder } from "./stream.js";
 import { contentToText } from "./transform.js";
+import { MAX_TOKENS_FIELD } from "./vocabulary.ts";
 
 interface V2Route {
   mode: QoderMode;
@@ -260,6 +262,19 @@ export function streamQoderV2(
     api: "openai-completions" as Api,
     compat: {
       ...(model.compat as Record<string, unknown> | undefined),
+      // Pinned from live evidence (2026-10-08: 30 calls across all 15 catalog
+      // keys, plus qodercli 1.1.63 and the active 1.1.66):
+      //   - the model server rejects `developer` for some keys through its own
+      //     validator ("developer is not one of [...]"), and two upstreams
+      //     refuse it while accepting `system`; no catalog field predicts which;
+      //   - qodercli never sends `developer`, on either of its bodies;
+      //   - the cap field both of its bodies use is `max_tokens`;
+      //   - `store` is never sent.
+      // Pinning each field explicitly replaces the host's vendor/`isNonStandard`
+      // heuristic, whose `developer` choice was the reported failure's cause.
+      supportsDeveloperRole: false,
+      maxTokensField: MAX_TOKENS_FIELD.maxTokens,
+      supportsStore: false,
       thinkingTokenBudgetField: "reasoning_budget_tokens",
       supportsLongCacheRetention: false,
       // Replica affinity for prompt-cache routing: pi-ai then sends
@@ -286,6 +301,20 @@ export function streamQoderV2(
     // One plan per v2 dispatch: no identity lookup happens on this protocol.
     const plan = route.plan ? await planQoderTurn(model, context, options, route.plan) : undefined;
     injectQoderFields(body, route, v2Model, options, messages, plan);
+    // Absent, not defaulted: the host always writes a cap, but this provider's own
+    // 32000 figure is pi's accounting number, not a client instruction, and
+    // qodercli omits the field when Qoder advertises none. A cap from the catalog,
+    // from the user's own model settings, or from pi's per-turn request stays:
+    // each of those is a real instruction. The key name is pinned to the client's
+    // (`maxTokensField`), so `max_tokens` is the only cap the host can have written.
+    const metadataCap = Number.isInteger(model.maxTokens) ? model.maxTokens : undefined;
+    if (
+      options?.maxTokens === undefined &&
+      advertisedMaxTokens(route.modelConfig) === undefined &&
+      (metadataCap === undefined || metadataCap === QODER_DEFAULT_MAX_OUTPUT_TOKENS)
+    ) {
+      delete body.max_tokens;
+    }
 
     // Per-turn prefix identity, riding the tail's reserved onTerminal hook. pi-ai
     // invokes this hook before any chunk, so before any terminal the tail stamps,
@@ -363,6 +392,10 @@ export function streamQoderV2(
   };
   const inner = openAICompletionsApi().streamSimple(v2Model, context, {
     ...options,
+    // No maxTokens pass-through is needed: pi-ai's buildBaseOptions already
+    // resolves `options.maxTokens ?? model.maxTokens` and clamps it to the
+    // context, so the body carries the catalog's cap (or the 32000 fallback).
+    // Confirmed by inversion — adding the local pass-through changed no assertion.
     // One meta, two capture halves: createDebugFetch keeps the request record,
     // createReframedFetch keeps the response record off the consumer-side read.
     fetch: createReframedFetch(createDebugFetch(options?.fetch ?? globalThis.fetch, debugMeta), debugMeta),
