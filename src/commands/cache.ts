@@ -27,6 +27,15 @@ export const REWRITE_SHARE = 0.5;
 export const REFRESH_CACHE_READ_OK = 0.9;
 /** Below this many gaps a model's survival median is too noisy to flag on. */
 export const SURVIVAL_MIN_GAPS = 5;
+/**
+ * Fraction of the cache lifetime at which pi schedules its refresh. pi derives
+ * the delay as `min(ttlMs * 0.9, ttlMs - 10_000)` (`getCacheWarmingDelayMs`,
+ * host-owned, pi 1.1.0); the 0.9 branch always wins for the lifetimes this repo
+ * clamps to (`LIFETIME_MIN_SECONDS` = 120 s, where 0.9 x 120 = 108 < 110), so
+ * the ratio alone is the threshold. An idle window at least this long owed a
+ * refresh. Re-check on a pi upgrade.
+ */
+export const WARM_DELAY_RATIO = 0.9;
 
 export interface RefreshHealth {
   count: number;
@@ -41,6 +50,12 @@ export interface ModelSurvivalHealth {
   medianRatio: number | undefined;
   probableMisses: number;
   pricedTurns: number;
+  /** Idle windows long enough to owe a refresh in which the ledger records none. */
+  unwarmedWindows: number;
+  /** Of those, the ones that ended in a re-write — a refresh would have paid. */
+  unwarmedRewrites: number;
+  /** The window length that made a refresh owed, so the report can name it. */
+  delaySeconds: number;
 }
 
 export interface ModelProfileHealth {
@@ -93,18 +108,33 @@ export function assessCacheHealth(
     rewrites: shares.filter((share) => share < REWRITE_SHARE).length,
   };
 
+  const declaredDefault = MODEL_PROMPT_CACHE.short ?? 300;
   const survival: ModelSurvivalHealth[] = Object.entries(scan.models)
     .filter(([, samples]) => samples.gaps.length > 0)
-    .map(([modelId, samples]) => ({
-      modelId,
-      gaps: samples.gaps.length,
-      medianRatio: medianOf(samples.gaps.map((gap) => gap.ratio)),
-      probableMisses: samples.gaps.filter((gap) => gap.ratio < REWRITE_SHARE).length,
-      pricedTurns: samples.turns.length,
-    }))
+    .map(([modelId, samples]) => {
+      // The same lifetime resolution `profiles` uses below, so the threshold
+      // this reports and the lifetime it displays cannot disagree.
+      const lifetimeSeconds = profile?.models[modelId]?.lifetimeSeconds ?? declaredDefault;
+      const delaySeconds = lifetimeSeconds * WARM_DELAY_RATIO;
+      // A recorded gap contains no refresh *by construction*: scanSessionText
+      // marks the chain broken on every `cache_warm` row (lifetime.ts:343), so a
+      // gap survives only between two real turns with no ping between them.
+      // Counting long gaps therefore counts missed refresh opportunities rather
+      // than inferring them. No credit figure is invented for them — a gap
+      // carries no turn to bill against, and this report states what it knows.
+      const owed = samples.gaps.filter((gap) => gap.seconds >= delaySeconds);
+      return {
+        modelId,
+        gaps: samples.gaps.length,
+        medianRatio: medianOf(samples.gaps.map((gap) => gap.ratio)),
+        probableMisses: samples.gaps.filter((gap) => gap.ratio < REWRITE_SHARE).length,
+        pricedTurns: samples.turns.length,
+        unwarmedWindows: owed.length,
+        unwarmedRewrites: owed.filter((gap) => gap.ratio < REWRITE_SHARE).length,
+        delaySeconds,
+      };
+    })
     .sort((a, b) => b.gaps - a.gaps || a.modelId.localeCompare(b.modelId));
-
-  const declaredDefault = MODEL_PROMPT_CACHE.short ?? 300;
   const ids = new Set([...Object.keys(scan.models), ...Object.keys(profile?.models ?? {})]);
   const profiles: ModelProfileHealth[] = [...ids]
     .sort((a, b) => a.localeCompare(b))
@@ -128,7 +158,11 @@ export function assessCacheHealth(
   const survivalWarn = survival.some(
     (model) => model.gaps >= SURVIVAL_MIN_GAPS && (model.medianRatio ?? 1) < SURVIVAL_MEDIAN,
   );
-  const verdict = refreshes.count === 0 ? "inactive" : refreshWarn || survivalWarn ? "warn" : "ok";
+  // One unwarmed window that ended in a re-write is a cache the host declined
+  // to refresh and then had to re-bill — the failure this panel exists to show,
+  // so it warns on a single occurrence instead of needing a minimum sample.
+  const unwarmedWarn = survival.some((model) => model.unwarmedRewrites > 0);
+  const verdict = refreshes.count === 0 ? "inactive" : refreshWarn || survivalWarn || unwarmedWarn ? "warn" : "ok";
 
   return {
     filesScanned: scan.files,
@@ -178,6 +212,13 @@ export function renderCacheHealth(health: CacheHealth, now: number = Date.now())
         `  survival: ${model.modelId} · median ${shareText(model.medianRatio)} across ${model.gaps} gaps · ` +
           `${model.pricedTurns} priced turns · probable misses ${model.probableMisses}`,
       );
+      if (model.unwarmedWindows > 0) {
+        lines.push(
+          `  missed:   ${model.modelId} · ${model.unwarmedWindows} idle window(s) ≥ ` +
+            `${Math.round(model.delaySeconds)} s owed a refresh, none recorded · ` +
+            `${model.unwarmedRewrites} ended in a re-write`,
+        );
+      }
     }
   }
 
