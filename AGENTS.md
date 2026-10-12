@@ -220,6 +220,18 @@ version bump. Re-check:
 - the **history-repair dependency** (`src/protocol/transform.ts`) — errored and
   aborted turns are dropped before dispatch by this repo, not by pi, and the
   cache-neutral retry rotation rests on it.
+- the **cache-warming economics and delay constants** (`src/index.ts`,
+  `src/commands/cache.ts`) — pi hardcodes `IDLE_CONTINUATION_PROBABILITY = 0.15`
+  and `CACHE_WARMING_MINIMUM_EXPECTED_SAVINGS = 0.05`, which is the real reason
+  the `cache_warming_decision` override exists (a model with no published rate
+  stops earlier still, on `economicsAvailable: false`), and derives its refresh
+  delay as `min(ttlMs * 0.9, ttlMs - 10_000)` in `getCacheWarmingDelayMs`, whose
+  0.9 `WARM_DELAY_RATIO` mirrors to decide whether an idle window owed a
+  refresh. `MAX_IDLE_WARMING_AGE_MS` (30 min) caps an idle chain, anchored to
+  the last *real* request, so a parked session stops being warmed 30 minutes
+  after work ended no matter how many pings went out. None is configurable; if
+  pi ever exposes them, the override and the `/qoder-cache` `missed:` line
+  should read pi's value instead of restating it.
 
 ## Conventions
 

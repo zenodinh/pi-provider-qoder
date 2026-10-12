@@ -97,6 +97,137 @@ describe("assessCacheHealth (SA §10.2.1 metrics)", () => {
   });
 });
 
+describe("assessCacheHealth — missed-deadline inference (unwarmed windows)", () => {
+  // invented: gap shapes modelled on the 2026-10-11 ledger probe of session
+  // 6f1c167e — 163 recorded idle windows, 12 of them long enough to owe a
+  // refresh and ending cold — scaled to three gaps so the counts are checkable
+  // by eye. With no profile, lifetime resolves to the declared 300 s default,
+  // so a refresh is owed from 270 s (WARM_DELAY_RATIO 0.9, pi's default).
+  const nearPureRead = (): LedgerWarmSample => warmSample(1_000, 100_000, 99_000, 2.8673033579999996);
+
+  it("counts a long gap as an unwarmed window, and a cold one as an unwarmed rewrite", () => {
+    const health = assessCacheHealth(
+      scanOf({
+        warm: [nearPureRead()],
+        models: {
+          [MODEL]: {
+            gaps: [
+              { seconds: 300, ratio: 0.2 }, // owed a refresh, ended cold
+              { seconds: 280, ratio: 0.95 }, // owed a refresh, cache survived
+              { seconds: 200, ratio: 0.1 }, // too short to owe one
+            ],
+            turns: [],
+          },
+        },
+      }),
+      undefined,
+    );
+    const survival = health.survival[0];
+    expect(survival?.delaySeconds).toBe(270);
+    expect(survival?.unwarmedWindows).toBe(2);
+    expect(survival?.unwarmedRewrites).toBe(1);
+    // The pre-existing counters are untouched: all three gaps still count, and
+    // two of the three still read below REWRITE_SHARE.
+    expect(survival?.gaps).toBe(3);
+    expect(survival?.probableMisses).toBe(2);
+  });
+
+  it("warns on one unwarmed rewrite even with a healthy median and a short record", () => {
+    const health = assessCacheHealth(
+      scanOf({
+        warm: [nearPureRead()],
+        models: { [MODEL]: { gaps: [{ seconds: 300, ratio: 0.2 }], turns: [] } },
+      }),
+      undefined,
+    );
+    // gaps=1 is below SURVIVAL_MIN_GAPS and the refreshes are near-pure reads,
+    // so neither pre-existing warn condition can fire — this one must.
+    expect(health.verdict).toBe("warn");
+  });
+
+  it("stays ok when every owed window survived — an unwarmed window is not itself a failure", () => {
+    const health = assessCacheHealth(
+      scanOf({
+        warm: [nearPureRead()],
+        models: { [MODEL]: { gaps: [{ seconds: 300, ratio: 0.95 }], turns: [] } },
+      }),
+      undefined,
+    );
+    expect(health.survival[0]?.unwarmedWindows).toBe(1);
+    expect(health.survival[0]?.unwarmedRewrites).toBe(0);
+    expect(health.verdict).toBe("ok");
+  });
+
+  it("takes the threshold from a published profile lifetime, not the declared default", () => {
+    // invented: the SA §5.5 profile shape, with a lifetime long enough that a
+    // 500 s window is no longer owed a refresh.
+    const profile: LifetimeProfile = {
+      version: 2,
+      updatedAt: "2026-10-01T06:00:00.000Z",
+      models: {
+        [MODEL]: {
+          lifetimeSeconds: 1000,
+          samples: 30,
+          computedAt: "2026-10-01T10:00:00.000Z",
+          buckets: [],
+        },
+      },
+    };
+    const health = assessCacheHealth(
+      scanOf({
+        warm: [nearPureRead()],
+        // 500 s owes a refresh against the 300 s default (delay 270) but not
+        // against the published 1000 s (delay 900).
+        models: { [MODEL]: { gaps: [{ seconds: 500, ratio: 0.1 }], turns: [] } },
+      }),
+      profile,
+    );
+    expect(health.survival[0]?.delaySeconds).toBe(900);
+    expect(health.survival[0]?.unwarmedWindows).toBe(0);
+    expect(health.survival[0]?.unwarmedRewrites).toBe(0);
+    expect(health.verdict).toBe("ok");
+  });
+
+  it("renders the missed line only when a window was owed a refresh", () => {
+    const now = Date.parse("2026-10-01T12:00:00.000Z");
+    const missed = renderCacheHealth(
+      assessCacheHealth(
+        scanOf({
+          warm: [nearPureRead()],
+          models: {
+            [MODEL]: {
+              gaps: [
+                { seconds: 300, ratio: 0.2 },
+                { seconds: 280, ratio: 0.95 },
+              ],
+              turns: [],
+            },
+          },
+        }),
+        undefined,
+        now,
+      ),
+      now,
+    );
+    expect(missed).toContain(
+      `missed:   ${MODEL} · 2 idle window(s) ≥ 270 s owed a refresh, none recorded · 1 ended in a re-write`,
+    );
+
+    const clean = renderCacheHealth(
+      assessCacheHealth(
+        scanOf({
+          warm: [nearPureRead()],
+          models: { [MODEL]: { gaps: [{ seconds: 200, ratio: 0.95 }], turns: [] } },
+        }),
+        undefined,
+        now,
+      ),
+      now,
+    );
+    expect(clean).not.toContain("missed:");
+  });
+});
+
 describe("renderCacheHealth", () => {
   it("renders published and default profile states with their evidence", () => {
     const now = Date.parse("2026-10-01T12:00:00.000Z");

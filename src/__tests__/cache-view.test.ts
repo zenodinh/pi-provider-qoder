@@ -11,8 +11,29 @@ function panelData(overrides: Partial<CachePanelData> = {}): CachePanelData {
     scanTruncated: false,
     refreshes: { count: 31, spendUsd: 0.7822, medianCacheReadShare: 1, rewrites: 0 },
     survival: [
-      { modelId: "DeepSeek-Flash", gaps: 1595, medianRatio: 0.99, probableMisses: 28, pricedTurns: 1020 },
-      { modelId: "gmodel", gaps: 25, medianRatio: 0.83, probableMisses: 9, pricedTurns: 0 },
+      {
+        modelId: "DeepSeek-Flash",
+        gaps: 1595,
+        medianRatio: 0.99,
+        probableMisses: 28,
+        pricedTurns: 1020,
+        // Neutral: no window owed a refresh, so the panel renders no `missed:`
+        // line and this fixture's output is unchanged. The renderer's missed
+        // line is pinned in cache-command.test.ts.
+        unwarmedWindows: 0,
+        unwarmedRewrites: 0,
+        delaySeconds: 540,
+      },
+      {
+        modelId: "gmodel",
+        gaps: 25,
+        medianRatio: 0.83,
+        probableMisses: 9,
+        pricedTurns: 0,
+        unwarmedWindows: 0,
+        unwarmedRewrites: 0,
+        delaySeconds: 270,
+      },
     ],
     profiles: [
       {

@@ -278,10 +278,19 @@ export default async function (pi: ExtensionAPI, deps: QoderExtensionDeps = {}) 
     }
   });
 
-  // Cache warming is inert for these models by default: pi prices them at $0
-  // (Qoder bills in Credits, which pi's monetary cost cannot express), so the
-  // "$0.05 expected savings" floor can never be cleared and pi stops every
-  // refresh before sending it. Arming is two-layer (warm-gate.ts): pi's own
+  // Cache warming is inert for these models by default, for two reasons pi
+  // owns — not because pi cannot price them. A model with no published rate
+  // (outside pricing.ts's RATE_TABLE and without a learned rateFit) leaves pi's
+  // `economicsAvailable` false, so it stops on "cache economics unavailable".
+  // A model that does have a rate still loses in pi's idle phase, which scales
+  // the avoided miss by a hardcoded continuation probability
+  // (IDLE_CONTINUATION_PROBABILITY = 0.15), subtracts the certain warm cost,
+  // and requires the result to clear CACHE_WARMING_MINIMUM_EXPECTED_SAVINGS =
+  // 0.05; at a real 115k-token park that yields $0.0095 and pi stops. Neither
+  // constant is configurable, and both misjudge a session that is parked rather
+  // than abandoned — it will continue, so the discount is wrong. pi's own ledger
+  // prices that mistake: a cold miss after >290 s idle costs 25-45 credits on
+  // Qwen3.8-Max. Arming is two-layer (warm-gate.ts): pi's own
   // global `cacheWarming` master switch beside this extension's approval,
   // resolved env QODER_CACHE_WARM > per-machine approval file > off. The env is
   // no longer the only way in, so a process whose shell forgot the export still
