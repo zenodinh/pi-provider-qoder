@@ -846,6 +846,38 @@ describe("streamQoder", () => {
     expect(done.message.content[thinkingDelta?.contentIndex ?? -1]?.type).toBe("thinking");
   });
 
+  it("does not swallow the answer when the thinking opener and closer variants differ", async () => {
+    // Upstream sometimes sends a <think> opener with a </thinking> closer (or
+    // another cross-variant pair), so any closer must end the thinking block.
+    for (const tagged of ["prefix <think>reason</thinking> answer", "prefix <thinking>reason</think> answer"]) {
+      globalThis.fetch = mockFetch(
+        sseEnvelope(chunk({ content: tagged })) + sseEnvelope(finishChunk("stop")) + DONE_SSE,
+      );
+      const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+      const done = events.find((event) => event.type === "done") as { message: AssistantMessage };
+
+      expect(done.message.content, tagged).toEqual([
+        { type: "text", text: "prefix " },
+        { type: "thinking", thinking: "reason" },
+        { type: "text", text: " answer" },
+      ]);
+    }
+  });
+
+  it("keeps an unclosed thinking tag in the answer visible as text", async () => {
+    // Defect seen live: an answer that lists the tag variants ("the `<think>`
+    // opener") used to hide everything after the tag in a thinking block the
+    // user never sees.
+    const answer = "the `<think>` opener needs a closer";
+    const sse = sseEnvelope(chunk({ content: answer })) + sseEnvelope(finishChunk("stop")) + DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+    const done = events.find((event) => event.type === "done") as { message: AssistantMessage };
+
+    expect(done.message.content).toEqual([{ type: "text", text: answer }]);
+  });
+
   it("recovers thinking after content when the upstream switches channels", async () => {
     const sse =
       sseEnvelope(chunk({ reasoning_content: "first thought" })) +
@@ -1154,7 +1186,9 @@ describe("streamQoder", () => {
     expect(done.message.stopReason).toBe("toolUse");
   });
 
-  it("flushes content thinking before a DSML tool call", async () => {
+  it("keeps unclosed content markup as text before a DSML tool call", async () => {
+    // An opener without a closer is ambiguous, so it stays visible text rather
+    // than hiding the segment as reasoning.
     const dsml =
       `<｜DSML｜tool_calls>\n<｜DSML｜invoke name="bash">\n` +
       `<｜DSML｜parameter name="command" string="true">ls</｜DSML｜parameter>\n` +
@@ -1170,7 +1204,7 @@ describe("streamQoder", () => {
     const done = events.find((event) => event.type === "done") as { message: AssistantMessage };
 
     expect(done.message.content).toEqual([
-      { type: "thinking", thinking: "reason<" },
+      { type: "text", text: "<thinking>reason<" },
       { type: "toolCall", id: "dsml_call_0", name: "bash", arguments: { command: "ls" } },
     ]);
   });
