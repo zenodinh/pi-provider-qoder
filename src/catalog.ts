@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { ModelCost, ModelPromptCache, ThinkingLevel, ThinkingLevelMap } from "@earendil-works/pi-ai";
 import { buildAuthHeaders } from "./cosy.js";
+import { refreshGatewayCosyVersion } from "./cosy-version.ts";
 import { debugLog } from "./debug.js";
 import { getHomeDir } from "./home.js";
 import { fetchQoderJson } from "./http.js";
@@ -722,6 +723,15 @@ async function fetchAndCacheModelList(
     };
 
     writeParsedModelCache(mode, cacheData);
+
+    // Signing follows the newest Qoder CLI version, and this successful fetch is
+    // the cheap moment to look for one: it happens at most once per cache TTL,
+    // and the check itself is throttled to one attempt per 24 h inside
+    // cosy-version.ts. It is deliberately not awaited — the catalog result is
+    // already written, and the refresh never rejects (every failure keeps the
+    // current version), so the trailing `catch` only keeps an unexpected throw
+    // off the unhandled-rejection path instead of floating it into the turn.
+    refreshGatewayCosyVersion().catch((error) => debugLog("cosy version refresh failed", error));
   } catch (error) {
     signal?.throwIfAborted();
     debugLog("model catalog refresh failed", error);
