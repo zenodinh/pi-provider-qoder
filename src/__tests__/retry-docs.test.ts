@@ -64,6 +64,17 @@ describe("README retry documentation", () => {
     expect(readme).toContain("stay on with the gate off");
   });
 
+  it("documents resume-once as an extra request, not a replay, with its off switch", () => {
+    // The distinction is the point of the row: a reader who saw "retried" would
+    // expect the same body to be sent again and the same text to reappear. Resume
+    // spends a second request whose tail is the partial answer, so the published
+    // prose says both and names the switch that disables it.
+    expect(readme).toContain("`QODER_RESUME_TIMEOUT`");
+    expect(readme).toContain("finished once from the partial answer");
+    expect(readme).toContain("not a resend of the same body");
+    expect(readme).toContain("spends one extra request");
+  });
+
   it("documents onProviderStreamEvent as v2-only (FR-5's second clause)", () => {
     // The host's per-event observation hook is honored on the v2 transport
     // only: pi-ai's completions stream calls it, the legacy adapter does not.

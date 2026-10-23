@@ -107,6 +107,7 @@ The streamed response is normalized into pi thinking blocks regardless of how th
 | `QODER_API_KEY`, `QODER_PERSONAL_ACCESS_TOKEN`, `QODER_PAT` | Global PAT (first non-empty wins). |
 | `QODERCN_API_KEY`, `QODERCN_PERSONAL_ACCESS_TOKEN`, `QODERCN_PAT` | China PAT (first non-empty wins). |
 | `QODER_STREAM_IDLE_TIMEOUT_MS` | Stream idle timeout override (default `120000` ms). |
+| `QODER_RESUME_TIMEOUT` | Set to `0` to fail a turn that hits the stream idle timeout or the request deadline instead of finishing it (the pre-resume behaviour: the turn ends with that error, no extra request). Any other value, or unset, finishes it once from the partial answer. |
 | `QODER_STREAM_DELTA_INTERVAL_MS` | Minimum gap between streamed text/thinking deltas (default `50` ms). Higher values cut UI CPU on long responses. |
 | `QODER_DEBUG` | Debug mode. When set, all diagnostics go to per-session JSONL files under `~/.pi/agent/logs/qoder-debug/<sessionId>.jsonl` — every chat request (decoded body + redacted headers) and its raw server response, on both transports, plus best-effort failure notes (catalog refresh, PAT exchange fallthrough, userinfo lookup) and per-decision cache-warming verdicts. Nothing is written to the console/TUI. Malformed SSE and token refresh failures are always surfaced as errors regardless of this flag. |
 | `QODER_DEBUG_DIR` | Override the debug capture directory (default `~/.pi/agent/logs/qoder-debug`). |
@@ -145,6 +146,8 @@ Legacy turns now close each text block with a `text_end` event, matching v2's ev
 ### Retry behavior
 
 This provider never retries a chat POST inside its own `fetch` layer. `src/retry.ts` retries non-billable requests only — `fetchWithRetry` forces a single attempt for every non-GET method — so that layer never replays a POST. That GET-only policy is unchanged. Transport remains SSE. (There are two deliberate exceptions to that, both outside the `fetch` layer. The first is the opt-in `QODER_FALLBACK` self-heal, which fires only when the v2 model-server rejects a model key before a generation starts. The second is the queue wait: when the gateway answers that the model is busy — status 403 with code `10605` — the turn waits instead of failing, then re-sends the same conversation with a new request id and a fresh signature. That wait is bounded by `QODER_QUEUE_MAX_WAIT_MS` and three episodes, and `QODER_QUEUE_WAIT=0` turns it off.)
+
+A turn that hits the stream idle timeout or the request deadline with an answer already streaming is not replayed either: it is finished once from the partial answer, which is a NEW request whose tail is that partial answer plus a continuation prompt — not a resend of the same body — so it spends one extra request, and `QODER_RESUME_TIMEOUT=0` turns it off.
 
 Two retry layers sit above it, and they differ:
 

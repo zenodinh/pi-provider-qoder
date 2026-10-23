@@ -87,6 +87,34 @@ const QODER_QUEUE_MAX_WAIT_MS = 3_600_000;
 const QUEUE_WAIT_EXHAUSTED_TEXT = "Qoder gateway kept the request queued past the wait limit";
 
 /**
+ * A timed-out turn is finished from its partial answer, once. Only these two
+ * conditions carry an answer worth continuing: the stream went idle, or the whole
+ * request outlived the host's deadline (`options.timeoutMs`). Matched by exact
+ * text because this module owns both strings — the abort reasons below and the
+ * request timer.
+ */
+const RESUME_TIMEOUT_MESSAGES: ReadonlySet<string> = new Set(["Qoder stream idle timeout", "Qoder request timeout"]);
+
+/**
+ * The user turn that follows the partial answer. It asks for the remainder and
+ * nothing already said: the partial text is already in the history as an
+ * assistant turn, so a model that re-states it bills the repetition a second time.
+ */
+const RESUME_CONTINUATION_PROMPT =
+  "Continue the original task from exactly where the previous response stopped. " +
+  "Do not repeat any reasoning or text already generated; continue and finish the response.";
+
+/**
+ * Marks the nested call a continuation makes, so a second timeout inside it cannot
+ * start another one. A module-private symbol: no caller can forge it onto its own
+ * options and turn one timeout into an unbounded chain, and it never reaches the
+ * wire. This is what caps the feature at one attempt per turn.
+ */
+const RESUME_MARKER = Symbol("qoderResumeContinuation");
+/** The host's options plus the private continuation marker. */
+type ResumeOptions = SimpleStreamOptions & { [RESUME_MARKER]?: boolean };
+
+/**
  * Sleep that ends with the request: the queue wait is cancellable, and the timer
  * is cleared on abort so an abandoned wait cannot hold the process open.
  */
@@ -243,6 +271,126 @@ export function streamQoder(
     if (!requestController.signal.aborted) return;
     const reason = requestController.signal.reason;
     throw reason instanceof Error ? reason : new Error("Qoder request aborted");
+  };
+
+  /**
+   * True when these are the options of the nested call a continuation made.
+   * `in`-narrowing rather than a cast: the options object arrives from the host,
+   * and only a symbol this module owns can be present without being declared.
+   */
+  const isContinuation = (candidate: SimpleStreamOptions | undefined): boolean =>
+    candidate !== undefined && RESUME_MARKER in candidate && candidate[RESUME_MARKER] === true;
+
+  /**
+   * Finish this turn from the partial answer after a timeout, once.
+   *
+   * A timeout is not a reason to discard an answer that is already on the host's
+   * screen, so the turn is re-dispatched as a NEW request whose tail is the
+   * partial answer plus one continuation prompt — not a replay of the same body,
+   * which is why it costs one extra request. `QODER_RESUME_TIMEOUT=0` turns the
+   * whole tail off and reproduces the pre-change failure exactly.
+   *
+   * Returns true when the continuation owned the terminal event (a `done`, or its
+   * own `error`), so the caller only has to end the stream; false leaves the turn
+   * on the ordinary error path.
+   */
+  // shape: none — dispatch object does not apply: one guard cascade over the
+  //   partial message, then one awaited nested dispatch.
+  const resumeAfterTimeout = async (error: unknown): Promise<boolean> => {
+    if (!RESUME_TIMEOUT_MESSAGES.has(error instanceof Error ? error.message : String(error))) return false;
+    // The cache key and the ledger's join key are both derived from the pi session
+    // id, so a continuation without one would not be the same conversation and
+    // would pay a cold prompt.
+    if (!options?.sessionId) return false;
+    if (isContinuation(options)) return false;
+    // One env read per decision, the same shape the queue wait's own switch has.
+    // The boundary is the string comparison: only the exact value "0" disables.
+    if ((options?.env?.QODER_RESUME_TIMEOUT ?? process.env.QODER_RESUME_TIMEOUT) === "0") return false;
+
+    // Text and thinking are complete strings as they stream. A tool call's
+    // arguments are half-written JSON whose remainder would have to be invented,
+    // so a turn that already opened a call fails exactly as it did before.
+    if (output.content.some((block) => block.type === "toolCall")) return false;
+    const streamedBlocks = output.content.slice();
+    const continuable = streamedBlocks.filter((block) => block.type === "text" || block.type === "thinking");
+    if (continuable.length === 0) return false;
+    if (!continuable.some((block) => (block.type === "text" ? block.text : block.thinking) !== "")) return false;
+
+    // The partial answer goes back as history, which means it has to read as a
+    // finished turn: the history repair in protocol/transform.ts drops an
+    // `error`/`aborted` assistant turn outright, and the timeout left its mark on
+    // stopReason and errorMessage.
+    const continuationContext: TranscriptContext = {
+      ...context,
+      messages: [
+        ...context.messages,
+        { ...output, content: [...output.content], stopReason: "stop", errorMessage: undefined },
+        { role: "user", content: RESUME_CONTINUATION_PROMPT, timestamp: Date.now() },
+      ],
+    };
+    // The SAME options — so the same pi session id, the same cache key and the
+    // same abort signal — plus the marker. The same seed too: the plan's wire
+    // session IS the cache identity, and re-planning would advance it.
+    const continuationOptions: ResumeOptions = { ...options, [RESUME_MARKER]: true };
+    const continuation = streamQoder(model, continuationContext, continuationOptions, seed);
+
+    const finishFromContinuation = (event: Extract<QoderStreamEvent, { type: "done" }>): void => {
+      const message = event.message;
+      output.content = [...streamedBlocks, ...message.content];
+      // Both requests were charged, so the message the host records carries what
+      // the two of them generated. Input is not added: the second request's prompt
+      // is its own row, already priced.
+      output.usage.output += message.usage.output;
+      if (message.usage.reasoning !== undefined) {
+        output.usage.reasoning = (output.usage.reasoning ?? 0) + message.usage.reasoning;
+      }
+      output.stopReason = event.reason;
+      output.errorMessage = undefined;
+      pushEvent({ type: "done", reason: event.reason, message: output });
+    };
+
+    try {
+      for await (const event of continuation) {
+        if (event.type === "toolcall_start" || event.type === "toolcall_delta" || event.type === "toolcall_end") {
+          // The continuation was told to finish the answer, not to start work: a
+          // tool call here has no round behind it, so it ends the turn instead.
+          throw new Error("Qoder resume continuation returned a tool call");
+        }
+        if (event.type === "start") continue;
+        if (event.type === "error") {
+          output.stopReason = event.reason;
+          output.errorMessage = event.error.errorMessage ?? "Qoder resume continuation failed";
+          pushEvent({ type: "error", reason: output.stopReason, error: output });
+          return true;
+        }
+        if (event.type === "done") {
+          finishFromContinuation(event);
+          return true;
+        }
+        // A content event: the continuation's blocks follow the ones already
+        // streamed, so its index is remapped into this message and its partial
+        // view is replaced by the message the host already holds. A text and a
+        // thinking block keep their own ids that way, and the done event below
+        // carries the same array it has been growing.
+        output.content = [...streamedBlocks, ...event.partial.content];
+        pushEvent({ ...event, contentIndex: event.contentIndex + streamedBlocks.length, partial: output });
+      }
+    } catch (relayError) {
+      // A throw inside the relay is the continuation's own failure — the tool-call
+      // rejection above, or a stream that broke mid-read. An aborted signal is not
+      // routed here: the continuation reports it as its own `error` event, and the
+      // loop above relays that reason verbatim.
+      output.stopReason = "error";
+      output.errorMessage = relayError instanceof Error ? relayError.message : String(relayError);
+      pushEvent({ type: "error", reason: output.stopReason, error: output });
+      return true;
+    }
+    // The continuation ended without a terminal event of its own: the turn fails
+    // on the ordinary error path rather than reporting an answer it never got.
+    output.stopReason = "error";
+    output.errorMessage = "Qoder resume continuation ended without a terminal event";
+    pushEvent({ type: "error", reason: output.stopReason, error: output });
+    return true;
   };
 
   (async () => {
@@ -1189,9 +1337,13 @@ export function streamQoder(
       });
       stream.end();
     } catch (e: unknown) {
-      output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-      output.errorMessage = e instanceof Error ? e.message : String(e);
-      pushEvent({ type: "error", reason: output.stopReason, error: output });
+      // A timed-out turn with a partial answer finishes itself once, and owns the
+      // terminal event when it does; everything else fails exactly as before.
+      if (!(await resumeAfterTimeout(e))) {
+        output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+        output.errorMessage = e instanceof Error ? e.message : String(e);
+        pushEvent({ type: "error", reason: output.stopReason, error: output });
+      }
       try {
         stream.end();
       } catch {}
