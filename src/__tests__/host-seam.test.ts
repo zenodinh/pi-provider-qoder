@@ -38,6 +38,7 @@ const srcRoot = fileURLToPath(new URL("../", import.meta.url));
 const seamFile = join(srcRoot, "host-seam.ts");
 const seamTestFile = fileURLToPath(import.meta.url);
 const compatSpecifier = "@earendil-works/pi-ai/compat";
+const piAiSpecifier = "@earendil-works/pi-ai";
 
 // ---------------------------------------------------------------------------
 // The scanner
@@ -340,6 +341,7 @@ function importSpecifiers(source: string): string[] {
 
 afterEach(() => {
   vi.doUnmock(compatSpecifier);
+  vi.doUnmock(piAiSpecifier);
   vi.doUnmock("../debug.js");
   vi.resetModules();
 });
@@ -414,6 +416,29 @@ describe("host seam acquisition", () => {
     await expect(seam.registerQoderApiProvider({ api: "qoder-api" }, "provider:qoder")).resolves.toBe(false);
     // The exact string the pre-seam index.ts:78 carried.
     expect(debugLog).toHaveBeenCalledWith("pi-ai/compat registerApiProvider unavailable", expect.any(Error));
+  });
+
+  it("T-01 reads the optional finished-arguments parser off the package entrypoint", async () => {
+    // A property read on the namespace, not a named import: a named import of a
+    // symbol an older published host lacks throws at module link time, before any
+    // capability check can run.
+    const parseToolCallArguments = vi.fn(() => ({ arguments: { command: "ls" } }));
+    vi.doMock(piAiSpecifier, () => ({ parseToolCallArguments }));
+
+    const seam = await import("../host-seam.js");
+    expect(seam.hostParseToolCallArguments()).toBe(parseToolCallArguments);
+    expect(seam.hostParseToolCallArguments()?.('{"command":"ls"}')).toEqual({ arguments: { command: "ls" } });
+  });
+
+  it("T-01 treats an absent finished-arguments parser as a capability, not a seam failure", async () => {
+    // The key is present but undefined: a host predating pi-ai 1.3.0 — unlike the
+    // two compat symbols, `undefined` here is an answer, not a throw. (Vitest's
+    // mock proxy throws on a missing key instead, so a deleted key would test the
+    // harness rather than the host.)
+    vi.doMock(piAiSpecifier, () => ({ parseToolCallArguments: undefined }));
+
+    const seam = await import("../host-seam.js");
+    expect(seam.hostParseToolCallArguments()).toBeUndefined();
   });
 });
 

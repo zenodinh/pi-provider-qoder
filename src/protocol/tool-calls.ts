@@ -1,4 +1,5 @@
 import type { AssistantMessage, AssistantMessageEventStream, JsonObject, ToolCall } from "@earendil-works/pi-ai";
+import { type FinishedArguments, hostParseToolCallArguments, type ParseToolCallArguments } from "../host-seam.ts";
 import { repairJsonEscapes } from "./json-repair.ts";
 
 export type ToolCallStreamEvent = Parameters<AssistantMessageEventStream["push"]>[0];
@@ -36,6 +37,10 @@ export class ToolCallAccumulator {
   constructor(
     private readonly output: AssistantMessage,
     private readonly emitEvent: (event: ToolCallStreamEvent) => void,
+    // `null` pins the pre-`argumentsError` contract — a finished call that is
+    // not a JSON object fails the turn. stream.ts takes the default, which is
+    // the host's parser on a host that has one.
+    private readonly parseFinishedArguments: ParseToolCallArguments | null = hostParseToolCallArguments() ?? null,
   ) {}
 
   processNativeDelta(delta: ToolCallDelta): void {
@@ -74,31 +79,42 @@ export class ToolCallAccumulator {
 
   finalize(): boolean {
     // Validate the entire batch before exposing any completed executable call.
-    const parsed = new Map<ToolCallState, JsonObject>();
+    const parsed = new Map<ToolCallState, FinishedArguments>();
     for (const state of this.ordered) {
       if (!state.emittedStart && !state.arguments) continue;
       if (!state.id || !state.name) throw new Error("Incomplete Qoder tool call identity");
-      parsed.set(state, parseArguments(state.arguments));
+      parsed.set(state, this.finishedArguments(state.arguments));
     }
     for (const state of this.ordered) {
       if (!state.emittedStart || state.emittedEnd) continue;
       state.emittedEnd = true;
-      const args = parsed.get(state) ?? {};
+      const args = parsed.get(state) ?? { arguments: {} };
       const block = this.output.content[state.contentIndex] as ToolCall;
-      block.arguments = args;
+      block.arguments = args.arguments;
+      if (args.argumentsError !== undefined) block.argumentsError = args.argumentsError;
+      const toolCall: ToolCall = { type: "toolCall", id: state.id, name: state.name, arguments: args.arguments };
+      if (args.argumentsError !== undefined) toolCall.argumentsError = args.argumentsError;
       this.emitEvent({
         type: "toolcall_end",
         contentIndex: state.contentIndex,
-        toolCall: {
-          type: "toolCall",
-          id: state.id,
-          name: state.name,
-          arguments: args,
-        },
+        toolCall,
         partial: this.output,
       });
     }
     return this.ordered.some((state) => state.emittedStart);
+  }
+
+  /**
+   * Reduce one finished call's argument text to its executable fields.
+   *
+   * On a host that exports `parseToolCallArguments`, malformed arguments come
+   * back as `argumentsError` and the host's tool validation reports them to the
+   * model, instead of a throw that ended the whole turn. A host without it keeps
+   * the strict parse plus the escape repair, and the same error text as before.
+   */
+  private finishedArguments(value: string): FinishedArguments {
+    if (this.parseFinishedArguments) return this.parseFinishedArguments(value);
+    return { arguments: parseArguments(value) };
   }
 
   private createState(): ToolCallState {

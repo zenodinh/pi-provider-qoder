@@ -33,6 +33,21 @@ import {
 } from "./sse-fixtures.js";
 
 /**
+ * Pin the seam to a host that cannot carry `argumentsError`.
+ *
+ * With the optional `parseToolCallArguments` present, a finished call whose
+ * complete text is not a JSON object is reported on the call instead of throwing
+ * `Invalid or truncated Qoder tool call arguments` — so the text below would no
+ * longer render, and the inventory would lose a row rather than test one. On a
+ * host without the parser the legacy text is still the contract; the
+ * host-carried path is pinned in `tool-calls-host-parse.test.ts`.
+ */
+vi.mock("../host-seam.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../host-seam.ts")>();
+  return { ...actual, hostParseToolCallArguments: () => undefined };
+});
+
+/**
  * AC-03 — the rendered error-text inventory.
  *
  * The host's retry classifier (`isRetryableAssistantError`) is a bare
