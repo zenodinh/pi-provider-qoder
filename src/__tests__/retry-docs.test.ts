@@ -52,16 +52,28 @@ describe("README retry documentation", () => {
     expect(readme).toContain("`--json` output gains one frame per text block on legacy");
   });
 
-  it("documents the transitional core gates in the environment table", () => {
+  it("documents the transitional core gates as opt-out in the environment table", () => {
     // The two QODER_CORE_* gates are the migration's env-flip rollback units; an
-    // undocumented gate cannot be reviewed or deliberately unset. The rows also
-    // state the OD-8 truth: the run-identity fixes are ungated, so flipping
-    // QODER_CORE_PLAN off restores none of them.
+    // undocumented gate cannot be reviewed or deliberately unset. Since the
+    // default flip (owner decision 2026-10-10) the rows are OPT-OUT: the plan
+    // path and the shared stamp are what an ordinary dispatch takes, `0`
+    // restores the pre-migration path, and the switch is kept one release as a
+    // rollback. The rows also state the OD-8 truth: the run-identity fixes are
+    // ungated, so QODER_CORE_PLAN=0 restores none of them.
     expect(readme).toContain("`QODER_CORE_PLAN`");
     expect(readme).toContain("`QODER_CORE_STAMP`");
     expect(readme).toContain("pre-migration dispatch path");
     expect(readme).toContain("assembly-site stamps");
     expect(readme).toContain("stay on with the gate off");
+    // The default is stated for both gates, and the rollback is the `0` value.
+    expect(readme).toContain("On by default: every dispatch routes through the turn-plan producer");
+    expect(readme).toContain("On by default: the legacy tail is wrapped in the shared ordered terminal stamp");
+    expect(readme).toContain("Set to `0` to restore the pre-migration dispatch path");
+    expect(readme).toContain("Set to `0` to restore the pre-migration assembly-site stamps");
+    // An opt-in reading is the old contract, so the inverted phrasing must be
+    // gone rather than merely supplemented by the new sentences.
+    expect(readme).not.toContain("Set to `1` to route every dispatch");
+    expect(readme).not.toContain("Off (default) keeps the pre-migration");
   });
 
   it("documents resume-once as an extra request, not a replay, with its off switch", () => {

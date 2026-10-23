@@ -1150,7 +1150,7 @@ describe("legacy context tier (fs-qoder-legacy-context-length)", () => {
     contextConfig: Record<string, { token_count?: number; is_default?: boolean }> = TIERS,
   ) {
     seedLegacyTieredKey(contextConfig);
-    vi.stubEnv("QODER_CORE_PLAN", gate === "on" ? "1" : "");
+    vi.stubEnv("QODER_CORE_PLAN", gate === "on" ? "1" : "0");
     let init: RequestInit | undefined;
     const fetch = vi.fn(async (_input: unknown, requestInit?: RequestInit) => {
       init = requestInit;

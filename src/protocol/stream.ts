@@ -31,6 +31,7 @@ import { priceTurnCost, type RateSource, rateForUpstreamKey } from "../pricing.j
 import { getQoderChatURL, getQoderRegionConfig } from "../region.js";
 import { yieldToEventLoop } from "../yield.js";
 import { resolveContextLength } from "./context-length.js";
+import { coreStampEnabled } from "./core-gate.ts";
 import { type DsmlParserEvent, DsmlToolCallParser } from "./dsml.js";
 import { qoderEncodeBodyAsync } from "./encoding.js";
 import { PROCESS_FALLBACK_SESSION_ID, planQoderTurn, qoderModeFor, type TurnPlanSeed } from "./plan.js";
@@ -191,11 +192,12 @@ export function streamQoder(
   let pendingDelta: QoderDeltaEvent | null = null;
   let lastDeltaFlushAt = Date.now();
   let deltaTimer: ReturnType<typeof setTimeout> | undefined;
-  // One gate read per request, resolved once rather than per chunk. Off means
-  // the returned stream is the closure's own — the pre-migration tail, whose
-  // rate source and cost are written at the assembly site inside the read loop.
-  // On wraps it in the shared ordered tail without changing an observable.
-  const stampTail = (options?.env?.QODER_CORE_STAMP ?? process.env.QODER_CORE_STAMP) === "1";
+  // One gate read per request, resolved once rather than per chunk. On (the
+  // default) wraps the returned stream in the shared ordered tail without
+  // changing an observable; `QODER_CORE_STAMP=0` leaves it the closure's own —
+  // the pre-migration tail, whose rate source and cost are written at the
+  // assembly site inside the read loop.
+  const stampTail = coreStampEnabled(options);
   const configuredDeltaInterval = Number(
     options?.env?.QODER_STREAM_DELTA_INTERVAL_MS ?? process.env.QODER_STREAM_DELTA_INTERVAL_MS,
   );

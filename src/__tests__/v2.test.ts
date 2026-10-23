@@ -305,7 +305,9 @@ describe("v2 field injector", () => {
    * byte-identical in BOTH gate states, and the omit case must omit both keys.
    */
   it("emits byte-identical context values with QODER_CORE_PLAN on and off (T-04/AC-04, AC-05)", async () => {
-    for (const gate of ["", "1"]) {
+    // `0` is the pre-migration rollback, `1` the plan path the ordinary turn
+    // takes; both positions must emit the same tier bytes.
+    for (const gate of ["0", "1"]) {
       vi.stubEnv("QODER_CORE_PLAN", gate);
       seedCatalogWithTiers();
       clearQoderFallbackCache();

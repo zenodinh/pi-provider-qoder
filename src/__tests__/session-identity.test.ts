@@ -203,9 +203,10 @@ describe("wire session forms (AC-04)", () => {
   });
 
   // T-11 (legacy half): OD-6 inverted today's per-request uuid. The gate is left
-  // unset here on purpose: the unified per-process fallback is what the inline
-  // (pre-migration) derivation produces too, which is what keeps the legacy body
-  // byte-identical across the QODER_CORE_PLAN settings (T-10).
+  // unset here on purpose: the plan path is the default, and the unified
+  // per-process fallback is what the pre-migration (?=0) derivation produces
+  // too, which is what keeps the legacy body byte-identical across the
+  // QODER_CORE_PLAN settings (T-10).
   it("legacy reuses ONE per-process session_id across session-less dispatches", async () => {
     const first = await legacySessionId({ apiKey: "fake" });
     const second = await legacySessionId({ apiKey: "fake" });

@@ -38,7 +38,7 @@ interface V2Route {
   mode: QoderMode;
   modelConfig: QoderModelEntry;
   upstreamKey: string;
-  /** The router's plan seed when QODER_CORE_PLAN is on; absent means the pre-migration inline path. */
+  /** The router's plan seed when QODER_CORE_PLAN is on (the default); absent means the pre-migration inline path. */
   plan?: TurnPlanSeed;
 }
 

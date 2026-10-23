@@ -5,6 +5,7 @@ import type { Api, Model, SimpleStreamOptions, TranscriptContext } from "@earend
 import { debugLog } from "../debug.js";
 import { setDebugSession } from "../debug-log.js";
 import type { QoderMode } from "../region.js";
+import { corePlanEnabled } from "./core-gate.ts";
 import { type PlanRoute, planSyncProjection, qoderModeFor, resolveUpstreamKey, type TurnPlanSeed } from "./plan.js";
 import { getRoutingData, isMarkedLegacyOnly, PROTOCOL, type Protocol } from "./routing.js";
 import { filterSamplingParams } from "./sampling.js";
@@ -18,11 +19,6 @@ export interface RouteDecision {
 
 function envValue(options: SimpleStreamOptions | undefined, name: string): string | undefined {
   return options?.env?.[name] ?? process.env[name];
-}
-
-/** One env knob, one meaning, read once per request: on builds the sync seed, off is the pre-migration path. */
-function corePlanEnabled(options: SimpleStreamOptions | undefined): boolean {
-  return envValue(options, "QODER_CORE_PLAN") === "1";
 }
 
 /**
@@ -90,6 +86,8 @@ export function streamQoderRouter(model: Model<Api>, context: TranscriptContext,
     rejectedSamplingKeys: getRoutingData().rejectedSamplingKeys,
     contextConfig: modelConfig.context_config,
   };
+  // On (the default) builds the sync seed and the one awaited plan; `=0` leaves
+  // both undefined, which is the pre-migration inline path in each adapter.
   const seed: TurnPlanSeed | undefined = corePlanEnabled(options)
     ? { ...route, ...planSyncProjection(model, options, route) }
     : undefined;

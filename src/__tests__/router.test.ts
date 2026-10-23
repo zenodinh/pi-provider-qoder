@@ -278,13 +278,15 @@ describe("the plan seam keeps the registered entry synchronous (T-07/T-08)", () 
   }
 
   it("T-07 returns a stream with a callable .result, never a thenable, on both gates and protocols", async () => {
-    for (const gate of ["", "1"]) {
+    // Both gate positions as they exist after the default flip: unset is the
+    // plan path, `0` is the pre-migration rollback.
+    for (const gate of ["", "0"]) {
       vi.stubEnv("QODER_CORE_PLAN", gate);
       for (const modelId of ["DeepSeek-V4-Flash", "Ultimate"]) {
         const { fetch } = bothProtocols();
         const returned = streamQoderRouter(modelNamed(modelId), context, { apiKey: "fake", fetch });
         // A promise would pass `await` here and only fail on the host's warm path.
-        expect(returned, `${modelId} gate=${gate || "off"} must not be a promise`).not.toBeInstanceOf(Promise);
+        expect(returned, `${modelId} gate=${gate || "default"} must not be a promise`).not.toBeInstanceOf(Promise);
         expect(typeof (returned as { then?: unknown }).then).toBe("undefined");
         expect(typeof returned.result).toBe("function");
         expect((await returned.result()).stopReason).toBe("stop");
@@ -295,7 +297,7 @@ describe("the plan seam keeps the registered entry synchronous (T-07/T-08)", () 
   it("T-08 gate off and gate on produce the same body on both protocols, with the filter still applied", async () => {
     for (const modelId of ["DeepSeek-V4-Flash", "Ultimate"]) {
       const bodies = new Map<string, Record<string, unknown>>();
-      for (const gate of ["", "1"]) {
+      for (const gate of ["0", "1"]) {
         vi.stubEnv("QODER_CORE_PLAN", gate);
         let captured: Record<string, unknown> | undefined;
         const fixtureFetch = bothProtocols().fetch;
@@ -322,11 +324,11 @@ describe("the plan seam keeps the registered entry synchronous (T-07/T-08)", () 
         // AC-09: the rejected key never reaches either wire.
         expect("presence_penalty" in (captured as Record<string, unknown>)).toBe(false);
       }
-      expect(bodies.get("1"), `${modelId}: gate on matches gate off`).toEqual(bodies.get(""));
+      expect(bodies.get("1"), `${modelId}: gate on matches gate off`).toEqual(bodies.get("0"));
     }
   });
 
-  it("T-08 with the gate unset no plan work happens; with it set the seed is produced", async () => {
+  it("T-08 the default produces the plan; QODER_CORE_PLAN=0 is the pre-migration path", async () => {
     // A fresh registry so the counting plan mock reaches every importer in the
     // graph (plan.ts, stream.ts and v2.ts sit in one cycle), plus a resolved
     // identity so neither dispatch needs the network.
@@ -349,17 +351,55 @@ describe("the plan seam keeps the registered entry synchronous (T-07/T-08)", () 
     const { fetch } = bothProtocols();
     const model = modelNamed("DeepSeek-V4-Flash");
 
-    vi.stubEnv("QODER_CORE_PLAN", "");
+    // The rollback is an explicit `0` now, not the absence of a value: unset is
+    // the plan path, so a test that only ever omitted the gate would prove
+    // nothing about the off path.
+    vi.stubEnv("QODER_CORE_PLAN", "0");
     projectionSpy.mockClear();
     planSpy.mockClear();
     await freshRouter(model, context, { apiKey: "fake", fetch }).result();
-    expect(projectionSpy, "no seed is built with the gate off").not.toHaveBeenCalled();
-    expect(planSpy, "no plan is produced with the gate off").not.toHaveBeenCalled();
+    expect(projectionSpy, "no seed is built with QODER_CORE_PLAN=0").not.toHaveBeenCalled();
+    expect(planSpy, "no plan is produced with QODER_CORE_PLAN=0").not.toHaveBeenCalled();
 
-    vi.stubEnv("QODER_CORE_PLAN", "1");
+    // Nothing exported at all: the ordinary dispatch, and the plan path.
+    delete process.env.QODER_CORE_PLAN;
     await freshRouter(model, context, { apiKey: "fake", fetch }).result();
-    expect(projectionSpy, "the sync seed is built with the gate on").toHaveBeenCalledTimes(1);
-    expect(planSpy, "the adapter awaits one plan with the gate on").toHaveBeenCalledTimes(1);
+    expect(projectionSpy, "the sync seed is built with the gate unset").toHaveBeenCalledTimes(1);
+    expect(planSpy, "the adapter awaits one plan with the gate unset").toHaveBeenCalledTimes(1);
+  });
+
+  it("T-08 the host's options.env decides the gate ahead of the process env", async () => {
+    vi.doMock("../auth/oauth.js", () => ({
+      resolveQoderIdentity: vi.fn().mockResolvedValue({
+        access: "fake",
+        refresh: "",
+        expires: 0,
+        userID: "user",
+        name: "Test",
+        email: "test@example.com",
+        machineID: "machine",
+      }),
+    }));
+    vi.resetModules();
+    const planModule = await import("../protocol/plan.js");
+    const { streamQoderRouter: freshRouter } = await import("../protocol/router.js");
+    const planSpy = vi.mocked(planModule.planQoderTurn);
+    const { fetch } = bothProtocols();
+    const model = modelNamed("DeepSeek-V4-Flash");
+
+    // A host that hands the provider its own environment must be able to roll
+    // the plan path back without the shell export winning.
+    vi.stubEnv("QODER_CORE_PLAN", "1");
+    planSpy.mockClear();
+    await freshRouter(model, context, { apiKey: "fake", fetch, env: { QODER_CORE_PLAN: "0" } }).result();
+    expect(planSpy, "options.env=0 beats a process env that says 1").not.toHaveBeenCalled();
+
+    // The same precedence in the other direction: the host's value turns the
+    // plan path back on over a process env that would roll it back.
+    vi.stubEnv("QODER_CORE_PLAN", "0");
+    planSpy.mockClear();
+    await freshRouter(model, context, { apiKey: "fake", fetch, env: { QODER_CORE_PLAN: "1" } }).result();
+    expect(planSpy, "options.env=1 beats a process env that says 0").toHaveBeenCalledTimes(1);
   });
 
   it("T-08 a fail-fast dispatch exits before the sampling filter", async () => {

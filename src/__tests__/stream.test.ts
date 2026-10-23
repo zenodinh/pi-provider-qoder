@@ -1613,7 +1613,9 @@ describe("plan seam on the legacy transport", () => {
 
     for (const sessionId of ["session-gate-parity", undefined]) {
       const bodies: Record<string, unknown>[] = [];
-      for (const gate of ["", "1"]) {
+      // Both positions as they exist after the default flip: `0` is the
+      // pre-migration rollback, `1` the plan path the ordinary turn takes.
+      for (const gate of ["0", "1"]) {
         vi.stubEnv("QODER_CORE_PLAN", gate);
         globalThis.fetch = mockFetch(SUCCESS_SSE);
         await consume(
@@ -1752,8 +1754,8 @@ describe("stamp tail on the legacy transport", () => {
   const toolTurnPrefix = toolTurnSse.slice(0, toolTurnSse.length - DONE_SSE.length);
 
   it("T-04 a tool-use turn's pre-terminal frames carry the priced usage on both gate settings", async () => {
-    for (const gate of ["", "1"]) {
-      const label = `gate=${gate || "(off)"}`;
+    for (const gate of ["0", "1"]) {
+      const label = `gate=${gate}`;
       vi.stubEnv("QODER_CORE_STAMP", gate);
       let controller!: ReadableStreamDefaultController<Uint8Array>;
       const body = new ReadableStream<Uint8Array>({
@@ -1808,9 +1810,11 @@ describe("stamp tail on the legacy transport", () => {
     }
   });
 
-  it("T-05 gate off is the pre-migration tail; gate on adds the wrapper without an observable change", async () => {
-    const off = await toolTurnEvents("");
-    const on = await toolTurnEvents("1");
+  it("T-05 the default adds the wrapper over the pre-migration tail without an observable change", async () => {
+    // `0` is the rollback; nothing exported is the ordinary turn, which is the
+    // wrapped tail.
+    const off = await toolTurnEvents("0");
+    const on = await toolTurnEvents("");
     expect(on.map((event) => event.type)).toEqual(off.map((event) => event.type));
     const terminalOf = (events: AssistantMessageEvent[]) =>
       (events.at(-1) as Extract<AssistantMessageEvent, { type: "done" }>).message.usage;
@@ -1818,11 +1822,11 @@ describe("stamp tail on the legacy transport", () => {
 
     // The same plain fixture under both settings: the ordered event sequence is
     // identical, so the gate is a real off-path, not a behavior fork.
-    vi.stubEnv("QODER_CORE_STAMP", "1");
+    vi.stubEnv("QODER_CORE_STAMP", "");
     globalThis.fetch = mockFetch(SUCCESS_SSE);
     const wrapped = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
     expect(wrapped.at(-1)?.type).toBe("done");
-    vi.stubEnv("QODER_CORE_STAMP", "");
+    vi.stubEnv("QODER_CORE_STAMP", "0");
     globalThis.fetch = mockFetch(SUCCESS_SSE);
     const plain = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
     expect(plain.map((event) => event.type)).toEqual(wrapped.map((event) => event.type));

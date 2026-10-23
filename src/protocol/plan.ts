@@ -68,7 +68,7 @@ export interface TurnPlanSync {
   contextLength: number | undefined;
 }
 
-/** The seed the router hands the adapters when QODER_CORE_PLAN is on: route facts plus their sync projection. */
+/** The seed the router hands the adapters when QODER_CORE_PLAN is on (the default): route facts plus their sync projection. */
 export type TurnPlanSeed = PlanRoute & TurnPlanSync;
 
 /** Every per-turn fact, produced once by planQoderTurn and read by both adapters. */
