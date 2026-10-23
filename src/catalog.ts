@@ -221,6 +221,25 @@ export function toQoderModelId(displayName?: string): string {
 }
 
 /**
+ * The model's human-readable label: its display name, plus the relative Credit
+ * multiplier when the catalog reports one (`price_factor`, stored as
+ * `QoderModelDef.priceFactor`).
+ *
+ * Qoder bills in Credits rather than USD, so the multiplier is metadata beside
+ * the name instead of a factor inside pi's monetary `cost`. `0` is a real
+ * multiplier and renders; an absent or non-finite value leaves the label
+ * untouched. Only the label carries it — the id stays the whitespace-stripped
+ * display name, because `--model qoder/<id>` and every stored config entry name
+ * that id, not the label.
+ *
+ * shape: none — one string transform over two scalars: no discriminator to
+ * dispatch on (#1) and no algorithm passed to a caller (#2).
+ */
+export function toQoderModelLabel(displayName: string, priceFactor?: number): string {
+  return Number.isFinite(priceFactor) ? `${displayName} (×${priceFactor})` : displayName;
+}
+
+/**
  * Compact description of a fallback (static) catalog entry. The pi-visible id
  * is always derived from `name` (whitespace stripped), matching live entries.
  */
@@ -466,7 +485,16 @@ export function getCachedModels(mode: QoderMode): QoderModelDef[] {
       const maxTokens = maxTokensForEntry(config ?? {});
       const display = config?.display_name;
       const staticModel = staticByKey.get(model.id);
-      if (display) return { ...model, maxTokens, id: toQoderModelId(display), name: display };
+      if (display) {
+        // The label is derived here and nowhere else: the cache keeps the plain
+        // display name, so a re-read cannot stack a second multiplier onto it.
+        return {
+          ...model,
+          maxTokens,
+          id: toQoderModelId(display),
+          name: toQoderModelLabel(display, model.priceFactor),
+        };
+      }
       if (staticModel) return { ...model, maxTokens, id: staticModel.id, name: staticModel.name };
       return model.name ? { ...model, maxTokens, id: toQoderModelId(model.name) } : model;
     });

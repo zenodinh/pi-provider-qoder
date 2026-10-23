@@ -6,9 +6,11 @@ import {
   contextWindowFromCatalog,
   DEFAULT_CONTEXT_WINDOW,
   getCachedModelConfig,
+  getCachedModels,
   staticCnModels,
   staticModels,
   toQoderModelId,
+  toQoderModelLabel,
   updateQoderModelsCache,
   ZERO_COST,
 } from "../catalog.js";
@@ -282,6 +284,53 @@ describe("live catalog builder rates (spec T-09)", () => {
       cacheWrite: 1.428571,
     });
     expect(byId["Qwen3.8-Flash"].cost).toEqual(ZERO_COST);
+  });
+});
+
+// ── credit multiplier in the picker label ─────────────────────────────────
+
+/** Stub /model/list with the given chat rows. */
+function stubModelList(chat: Array<Record<string, unknown>>): void {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({ chat }) }));
+}
+
+describe("credit multiplier in the model label", () => {
+  it("appends the relative Credit multiplier and leaves the id a user types alone", async () => {
+    // invented: rows mirror the recorded /model/list chat shape (the price_factor
+    // key matches catalog-cache.test.ts's "exposes the catalog price_factor" case).
+    stubModelList([{ key: "qmodel_preview", enable: true, display_name: "Qwen3.8-Max", price_factor: 0.2 }]);
+
+    await updateQoderModelsCache("access-token", "user-id", "Test User", "test@example.com", "global");
+
+    const model = getCachedModels("global").find((m) => m.id === "Qwen3.8-Max");
+    expect(model?.name).toBe("Qwen3.8-Max (×0.2)");
+    // `--model qoder/Qwen3.8-Max` and every stored config entry name the id, so
+    // the label must stay out of it.
+    expect(model?.id).toBe("Qwen3.8-Max");
+  });
+
+  it("renders a zero multiplier, which is a real price", async () => {
+    stubModelList([{ key: "lite", enable: true, display_name: "Lite", price_factor: 0 }]);
+
+    await updateQoderModelsCache("access-token", "user-id", "Test User", "test@example.com", "global");
+
+    const model = getCachedModels("global").find((m) => m.id === "Lite");
+    expect(model?.name).toBe("Lite (×0)");
+  });
+
+  it("leaves the label as the plain display name when the catalog reports no multiplier", async () => {
+    stubModelList([{ key: "qfmodel", enable: true, display_name: "Qwen3.8-Flash" }]);
+
+    await updateQoderModelsCache("access-token", "user-id", "Test User", "test@example.com", "global");
+
+    const model = getCachedModels("global").find((m) => m.id === "Qwen3.8-Flash");
+    expect(model?.name).toBe("Qwen3.8-Flash");
+  });
+
+  it("returns the display name unchanged for an absent or non-finite multiplier", () => {
+    expect(toQoderModelLabel("Qwen3.8-Max", undefined)).toBe("Qwen3.8-Max");
+    expect(toQoderModelLabel("Qwen3.8-Max", Number.NaN)).toBe("Qwen3.8-Max");
+    expect(toQoderModelLabel("Qwen3.8-Max", Number.POSITIVE_INFINITY)).toBe("Qwen3.8-Max");
   });
 });
 
