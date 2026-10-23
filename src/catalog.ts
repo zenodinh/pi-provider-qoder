@@ -25,8 +25,9 @@ export const ZERO_COST: ModelCost = Object.freeze({ input: 0, output: 0, cacheRe
  * (measured ~2.8e-7 credits/token, ~50x cheaper than the input-rate miss it
  * prevents), whereas over-declaring would refresh after expiry, i.e. pay for
  * a full-price re-write. Declaring a lifetime is what makes the models
- * eligible for pi's cache warming; actually sending refreshes is opt-in
- * (QODER_CACHE_WARM=1 plus pi's `cacheWarming: "idle"`).
+ * eligible for pi's cache warming; whether refreshes are sent is pi's own
+ * decision (its `cacheWarming` setting), which this provider does not
+ * second-guess.
  */
 export const MODEL_PROMPT_CACHE: ModelPromptCache = Object.freeze({ short: 300 });
 

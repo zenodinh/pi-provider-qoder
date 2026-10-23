@@ -89,14 +89,7 @@ function createPanel(deps: PanelDeps) {
 
   const refreshRow = (health: CacheHealth, innerWidth: number): string => {
     if (health.refreshes.count === 0) {
-      return bestFit(
-        [
-          "none recorded — check QODER_CACHE_WARM=1 and pi's cacheWarming setting",
-          "none recorded — QODER_CACHE_WARM=1 enables them",
-          "none recorded",
-        ],
-        innerWidth,
-      );
+      return bestFit(["none recorded — check pi's cacheWarming setting", "none recorded"], innerWidth);
     }
     const { count, spendUsd, medianCacheReadShare, rewrites } = health.refreshes;
     return bestFit(

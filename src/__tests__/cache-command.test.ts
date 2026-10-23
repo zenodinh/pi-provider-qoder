@@ -4,7 +4,6 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { assessCacheHealth, handleCacheCommand, renderCacheHealth } from "../commands/cache.js";
 import type { LedgerScan, LedgerWarmSample, LifetimeProfile } from "../lifetime.js";
-import { resolveWarmGate } from "../warm-gate.js";
 import { assistantEntry, warmEntry } from "./session-fixtures.js";
 
 const MODEL = "DeepSeek-V4-Flash";
@@ -13,7 +12,6 @@ const savedEnv = {
   USERPROFILE: process.env.USERPROFILE,
   PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
   QODER_DEBUG: process.env.QODER_DEBUG,
-  QODER_CACHE_WARM: process.env.QODER_CACHE_WARM,
   QODER_WARM_BUDGET: process.env.QODER_WARM_BUDGET,
 };
 
@@ -290,14 +288,9 @@ function homeWithSession(lines: string[]): string {
   return home;
 }
 
-/**
- * Seed both arming layers in the temp home's agent directory: pi's global
- * settings beside this extension's per-machine approval file.
- */
-function seedGateFiles(home: string, piMode: string, providers: Record<string, boolean>): void {
-  const dir = join(home, ".pi", "agent");
-  writeFileSync(join(dir, "settings.json"), JSON.stringify({ cacheWarming: piMode }), "utf8");
-  writeFileSync(join(dir, "qoder-warm-approval.json"), JSON.stringify({ version: 1, providers }), "utf8");
+/** Point pi's global settings in the temp home at one `cacheWarming` mode. */
+function seedPiMode(home: string, piMode: string): void {
+  writeFileSync(join(home, ".pi", "agent", "settings.json"), JSON.stringify({ cacheWarming: piMode }), "utf8");
 }
 
 describe("/qoder-cache command", () => {
@@ -308,7 +301,6 @@ describe("/qoder-cache command", () => {
       JSON.stringify(assistantEntry(MODEL, start + 200_000, { input: 1000, cacheRead: 9000, output: 100 })),
       JSON.stringify(warmEntry(start + 300_000, { input: 159, cacheRead: 141_568, output: 4 }, 0, 2.8673033579999996)),
     ]);
-    process.env.QODER_CACHE_WARM = "1";
     process.env.QODER_WARM_BUDGET = "0.25";
     const notify = vi.fn();
     const ctx = { mode: "rpc", ui: { notify } } as never;
@@ -318,7 +310,7 @@ describe("/qoder-cache command", () => {
     expect(notify).toHaveBeenCalledTimes(1);
     const [message, kind] = notify.mock.calls[0] as [string, string];
     expect(kind).toBe("info");
-    expect(message).toContain("config: pi streaming · gate qoder=ON(env) qoder-cn=ON(env) · budget 0.25");
+    expect(message).toContain("config: pi streaming · warming on · budget 0.25");
     expect(message).toContain("Qoder cache warming — OK");
     expect(message).toContain("refreshes: 1 · $0.0382 spent");
     expect(message).toContain(`survival: ${MODEL} · median 0.90 across 1 gaps`);
@@ -332,7 +324,6 @@ describe("/qoder-cache command", () => {
       JSON.stringify(assistantEntry(MODEL, start + 200_000, { input: 1000, cacheRead: 9000, output: 100 })),
       JSON.stringify(warmEntry(start + 300_000, { input: 159, cacheRead: 141_568, output: 4 }, 0, 2.8673033579999996)),
     ]);
-    process.env.QODER_CACHE_WARM = "1";
     const notify = vi.fn();
     const theme = { fg: (_kind: string, text: string) => text, bold: (text: string) => text };
     interface CapturedPanel {
@@ -352,7 +343,7 @@ describe("/qoder-cache command", () => {
     expect(notify).not.toHaveBeenCalled();
     const text = panel?.render(80).join("\n") ?? "";
     expect(text).toContain("Qoder cache warming  OK");
-    expect(text).toContain("config: pi streaming · gate qoder=ON(env) qoder-cn=ON(env) · budget 0.5");
+    expect(text).toContain("config: pi streaming · warming on · budget 0.5");
     expect(text).toContain("Refreshes");
     expect(text).toContain("1 · $0.0382 spent");
     expect(text).toContain("esc/q close · r rescan");
@@ -370,128 +361,106 @@ describe("/qoder-cache command", () => {
     lines.push(JSON.stringify(warmEntry(start + 2_000_000, { input: 159, cacheRead: 141_568, output: 4 }, 0, 2.867)));
     const home = homeWithSession(lines);
 
-    delete process.env.QODER_CACHE_WARM;
     const notify = vi.fn();
     await handleCacheCommand("", { mode: "rpc", ui: { notify } } as never);
 
     const [message, kind] = notify.mock.calls[0] as [string, string];
     expect(kind).toBe("warning");
     expect(message).toContain("Qoder cache warming — WARN");
-    expect(message).toContain("config: pi streaming · gate qoder=OFF(off) qoder-cn=OFF(off)");
+    // Nothing set anywhere: pi's streaming default is the only mode there is.
+    expect(message).toContain("config: pi streaming · warming on · budget 0.5");
     expect(message).toContain("probable misses 6");
     rmSync(home, { recursive: true, force: true });
   });
 
   /**
-   * T-07 (SA §7.4, AC-04/AC-06): the screen names pi's layer, each provider's
-   * resolved verdict and the layer that decided it, and agrees with what
-   * `resolveWarmGate` returns for the same state — the disagreement FR-2 names
-   * as its failure condition.
+   * T-07 (SA §7.4, AC-04) as it stands after the retired approval layer: the
+   * line names pi's warming mode — the only switch either side has — and the
+   * budget that governs an approved refresh.
    */
-  it("renders both gate layers per provider, agreeing with resolveWarmGate", async () => {
+  it("renders pi's mode and the budget on the config line", async () => {
     const home = homeWithSession([
       JSON.stringify(warmEntry(Date.UTC(2026, 9, 1), { input: 159, cacheRead: 141_568, output: 4 }, 0, 2.867)),
     ]);
-    // recorded-from: SA §5.2 approval-file example, 2026-10-04 — the divergent
-    // case, where one region is approved and the other explicitly refused.
-    seedGateFiles(home, "idle", { qoder: true, "qoder-cn": false });
-    delete process.env.QODER_CACHE_WARM;
+    seedPiMode(home, "idle");
     process.env.QODER_WARM_BUDGET = "0.25";
     const notify = vi.fn();
 
     await handleCacheCommand("", { mode: "rpc", ui: { notify } } as never);
 
     const [message] = notify.mock.calls[0] as [string, string];
-    const expected = "config: pi idle · gate qoder=ON(file) qoder-cn=OFF(off) · budget 0.25";
-    expect(message).toContain(expected);
-
-    // The screen and the handler read one derivation, so the line must match
-    // what the gate itself resolves for the same fixture state.
-    expect(resolveWarmGate("qoder")).toMatchObject({ armed: true, layer: "file", piMode: "idle" });
-    expect(resolveWarmGate("qoder-cn")).toMatchObject({ armed: false, layer: "off", piMode: "idle" });
-    for (const providerId of ["qoder", "qoder-cn"]) {
-      const verdict = resolveWarmGate(providerId);
-      expect(expected).toContain(`${providerId}=${verdict.armed ? "ON" : "OFF"}(${verdict.layer})`);
-    }
+    expect(message).toContain("config: pi idle · warming on · budget 0.25");
     rmSync(home, { recursive: true, force: true });
   });
 
-  it("shows pi's OFF on the screen even when the extension layer would arm", async () => {
+  it("ignores an approval record an older version left behind", async () => {
+    // The retired layer's durable record, in the shape an old build wrote: an
+    // explicit `false` for both providers, which used to veto warming. Upgrading
+    // leaves that file on disk, so it has to change nothing at all — not the
+    // config line, not the report.
+    const render = async (seed: (dir: string) => void): Promise<string> => {
+      const home = homeWithSession([
+        JSON.stringify(warmEntry(Date.UTC(2026, 9, 1), { input: 159, cacheRead: 141_568, output: 4 }, 0, 2.867)),
+      ]);
+      seed(join(home, ".pi", "agent"));
+      delete process.env.QODER_WARM_BUDGET;
+      const notify = vi.fn();
+      await handleCacheCommand("", { mode: "rpc", ui: { notify } } as never);
+      const [message] = notify.mock.calls[0] as [string, string];
+      rmSync(home, { recursive: true, force: true });
+      return message;
+    };
+
+    // recorded-from: SA §5.2 approval-file example, 2026-10-04. The control arm
+    // seeds nothing at all — a fresh install, which is the only other state.
+    const withRecord = await render((dir) =>
+      writeFileSync(
+        join(dir, "qoder-warm-approval.json"),
+        `{"version":1,"providers":{"qoder":false,"qoder-cn":false}}`,
+        "utf8",
+      ),
+    );
+    const withoutRecord = await render(() => {});
+
+    expect(withRecord).toContain("config: pi streaming · warming on · budget 0.5");
+    // Byte-identical: no rendered field may read the leftover record.
+    expect(withRecord).toBe(withoutRecord);
+  });
+
+  it("reports pi's OFF on the line, and states its own half as on", async () => {
+    // pi is the only switch: OFF is pi's value, and the extension's posture —
+    // it approves whatever pi asks for — does not flip with it.
     const home = homeWithSession([
       JSON.stringify(warmEntry(Date.UTC(2026, 9, 1), { input: 159, cacheRead: 141_568, output: 4 }, 0, 2.867)),
     ]);
-    // invented: SA §5.2's example has qoder-cn:false; this row needs BOTH
-    // regions approved so the only OFF on the line is pi's own layer.
-    seedGateFiles(home, "off", { qoder: true, "qoder-cn": true });
-    delete process.env.QODER_CACHE_WARM;
+    seedPiMode(home, "off");
     const notify = vi.fn();
 
     await handleCacheCommand("", { mode: "rpc", ui: { notify } } as never);
 
     const [message] = notify.mock.calls[0] as [string, string];
-    expect(message).toContain("config: pi off · gate qoder=ON(file) qoder-cn=ON(file)");
+    expect(message).toContain("config: pi off · warming on · budget 0.5");
     rmSync(home, { recursive: true, force: true });
   });
 
-  it("renders the divergent per-provider line untruncated at the panel's width 80", async () => {
+  it("renders the widest config line untruncated at the panel's width 80", async () => {
     const home = homeWithSession([
       JSON.stringify(warmEntry(Date.UTC(2026, 9, 1), { input: 159, cacheRead: 141_568, output: 4 }, 0, 2.867)),
     ]);
-    seedGateFiles(home, "idle", { qoder: true, "qoder-cn": false });
-    delete process.env.QODER_CACHE_WARM;
-    process.env.QODER_WARM_BUDGET = "0.25";
-    const notify = vi.fn();
-    const theme = { fg: (_kind: string, text: string) => text, bold: (text: string) => text };
-    interface CapturedPanel {
-      render(width: number): string[];
-      handleInput(data: string): void;
-    }
-    let panel: CapturedPanel | undefined;
-    const custom = vi.fn((factory: (tui: unknown, theme: unknown, kb: unknown, done: unknown) => CapturedPanel) => {
-      panel = factory({ requestRender: () => {} }, theme, {}, () => {});
-      return Promise.resolve(undefined);
-    });
-
-    await handleCacheCommand("", { mode: "tui", ui: { notify, custom } } as never);
-
-    const text = panel?.render(80).join("\n") ?? "";
-    // The longest the GATE section gets with two regions — both ON(file) and
-    // OFF(off) present — under an ordinary budget label. cache-view.ts:154
-    // renders one bestFit candidate and truncates at innerWidth (width - 2 = 78,
-    // cache-view.ts:194), so this row pins that the gate section plus a normal
-    // budget still fits, and that a third region (about +18 chars) would fail
-    // here rather than silently losing a verdict to truncation. It deliberately
-    // does NOT cover the widest budget label: `budget off (uncapped)` pushes the
-    // line to 84 chars and is expected to truncate, which the next row pins.
-    const expected = "config: pi idle · gate qoder=ON(file) qoder-cn=OFF(off) · budget 0.25";
-    expect(expected.length).toBeLessThanOrEqual(78);
-    expect(text).toContain(expected);
-    expect(notify).not.toHaveBeenCalled();
-    rmSync(home, { recursive: true, force: true });
-  });
-
-  it("degrades by eating the budget half first, keeping the gate verdicts", async () => {
-    const home = homeWithSession([
-      JSON.stringify(warmEntry(Date.UTC(2026, 9, 1), { input: 159, cacheRead: 141_568, output: 4 }, 0, 2.867)),
-    ]);
-    seedGateFiles(home, "streaming", { qoder: true, "qoder-cn": false });
-    delete process.env.QODER_CACHE_WARM;
-    // The widest budget label: beside `pi streaming` it makes the line 84 chars,
-    // which is what actually overflows the panel's 78-char inner width.
+    // `off (uncapped)` is the widest budget label there is. cache-view.ts renders
+    // this line through a single bestFit candidate and truncates at innerWidth
+    // (width - 2 = 78 at width 80), so the whole line has to fit there — a
+    // future per-provider section would push it past the edge and fail here.
     process.env.QODER_WARM_BUDGET = "off";
-    const full = "config: pi streaming · gate qoder=ON(file) qoder-cn=OFF(off) · budget off (uncapped)";
-    expect(full.length).toBeGreaterThan(78);
+    const full = "config: pi streaming · warming on · budget off (uncapped)";
+    expect(full.length).toBeLessThanOrEqual(78);
 
-    // rpc mode notifies the raw string, so nothing truncates and the whole line
-    // reaches the operator intact.
+    // rpc mode notifies the raw string, so nothing truncates.
     const notify = vi.fn();
     await handleCacheCommand("", { mode: "rpc", ui: { notify } } as never);
     const [message] = notify.mock.calls[0] as [string, string];
     expect(message).toContain(full);
 
-    // The TUI panel truncates the same string at innerWidth. Gate sits LEFT of
-    // budget, so the budget label is what gets eaten and the arming truth — pi's
-    // layer and both per-provider verdicts with their deciding layers — survives.
     const theme = { fg: (_kind: string, text: string) => text, bold: (text: string) => text };
     interface CapturedPanel {
       render(width: number): string[];
@@ -505,8 +474,7 @@ describe("/qoder-cache command", () => {
     await handleCacheCommand("", { mode: "tui", ui: { notify, custom } } as never);
 
     const text = panel?.render(80).join("\n") ?? "";
-    expect(text).toContain("config: pi streaming · gate qoder=ON(file) qoder-cn=OFF(off)");
-    expect(text).not.toContain("uncapped");
+    expect(text).toContain(full);
     rmSync(home, { recursive: true, force: true });
   });
 });

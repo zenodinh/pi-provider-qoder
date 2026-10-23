@@ -20,7 +20,7 @@ delete process.env.PI_CODING_AGENT_DIR;
  * Scrub the ambient `QODER_*` family, for the same reason as HOME above.
  *
  * These variables are feature gates the provider reads at request time
- * (`QODER_PROTOCOL`, `QODER_DEBUG`, `QODER_CACHE_WARM`, ...). A developer who
+ * (`QODER_PROTOCOL`, `QODER_DEBUG`, ...). A developer who
  * exports them for daily use — the owner's `~/.zshrc` sets five — hands vitest
  * a different provider than CI does, and the suite reports two verdicts for
  * one commit: 9 red transport rows in that shell, 476 green in CI. Worse, the

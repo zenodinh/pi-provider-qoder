@@ -15,8 +15,7 @@ import {
   scanLedgers,
 } from "../lifetime.js";
 import { CREDITS_PER_USD } from "../pricing.js";
-import { getQoderRegionConfig, QODER_MODES } from "../region.js";
-import { readPiCacheWarmingMode, resolveWarmGate } from "../warm-gate.js";
+import { readPiCacheWarmingMode } from "../warm-gate.js";
 import { type Budget, parseBudgetEnv } from "../warm-guard.js";
 
 /** On-demand scan budget: larger than the learner's 500 ms; files newest-first. */
@@ -196,7 +195,7 @@ export function renderCacheHealth(health: CacheHealth, now: number = Date.now())
   lines.push(`  scanned ${health.filesScanned} session file(s), newest first${truncation}`);
 
   if (health.refreshes.count === 0) {
-    lines.push("  refreshes: none recorded — check QODER_CACHE_WARM=1 and pi's cacheWarming setting");
+    lines.push("  refreshes: none recorded — check pi's cacheWarming setting");
   } else {
     lines.push(
       `  refreshes: ${health.refreshes.count} · $${health.refreshes.spendUsd.toFixed(4)} spent · ` +
@@ -241,39 +240,19 @@ function budgetLabel(budget: Budget): string {
   return budget.kind === "off" ? "off (uncapped)" : `${budget.fraction}`;
 }
 
-// shape: none — straight-line string assembly; one placeholder per gate layer.
+// shape: none — straight-line string assembly; one placeholder per config field.
 /**
- * Both arming layers, and the layer that decided each provider's verdict.
+ * The live config line: pi's warming mode, this provider's posture, the budget.
  *
- * One verdict per provider the extension actually registers, sourced from the
- * same `QODER_MODES` list `registerProviders` iterates — so the screen resolves
- * the gate for exactly the providers the warming handler acts on and cannot
- * drift from it when a region is added. pi's layer is one value for the machine
- * (pi reads global-only), so it is named once; the extension's layer and its
- * deciding layer are per provider, because the approval file is a per-provider
- * map and the two regions genuinely diverge.
- *
- * Ordering is load-bearing: the panel renders this string through a single
- * `bestFit` candidate and truncates it at the inner width (cache-view.ts:154),
- * so the gate verdicts sit LEFT of the budget and a narrow panel eats
- * `budget …` first while the arming truth survives. Do not reorder.
+ * pi owns the caching decision, so pi's mode is the only switch either side
+ * has and the line names that value. `warming on` is this extension's half of
+ * the contract stated the same way — it approves every refresh pi asks for, so
+ * there is no per-provider verdict left to render and nothing here can
+ * disagree with the handler. The budget sits right of the mode because it is
+ * the one field that governs an approved refresh rather than deciding one.
  */
-function gateConfigLine(budget: Budget): string {
-  const resolved = QODER_MODES.map((mode) => {
-    const providerId = getQoderRegionConfig(mode).providerID;
-    return { providerId, verdict: resolveWarmGate(providerId) };
-  });
-  const gates = resolved
-    .map(({ providerId, verdict }) => `${providerId}=${verdict.armed ? "ON" : "OFF"}(${verdict.layer})`)
-    .join(" ");
-  // pi's layer comes off the same verdicts rather than a separate read, so one
-  // derivation feeds both halves of the line and a concurrent settings write
-  // cannot make the pi label disagree with the verdicts beside it. The fallback
-  // is unreachable — QODER_MODES is never empty — and exists only so the
-  // degenerate case still resolves through the gate's own default instead of a
-  // second spelling of it here.
-  const piMode = resolved[0]?.verdict.piMode ?? readPiCacheWarmingMode();
-  return `config: pi ${piMode} · gate ${gates} · budget ${budgetLabel(budget)}`;
+function configLine(budget: Budget): string {
+  return `config: pi ${readPiCacheWarmingMode()} · warming on · budget ${budgetLabel(budget)}`;
 }
 
 /** One scan + profile read + assessment; the panel's initial and refreshed data. */
@@ -281,7 +260,7 @@ function collectCachePanelData(): CachePanelData {
   const budget = parseBudgetEnv(process.env.QODER_WARM_BUDGET);
   const scan = scanLedgers(CACHE_MONITOR_BUDGET_MS);
   return {
-    config: gateConfigLine(budget),
+    config: configLine(budget),
     health: assessCacheHealth(scan, readProfile(), Date.now()),
   };
 }
