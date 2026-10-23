@@ -90,6 +90,13 @@ export interface QoderModelEntry {
   context_config?: Record<string, { token_count?: number; is_default?: boolean }>;
   is_vl?: boolean;
   is_reasoning?: boolean;
+  /**
+   * The account can use this model without a paid entitlement. A quota-exhausted
+   * or free account's `/model/list` can answer with only its `is_free` rows —
+   * the signal `keptCatalogOnFreeOnlyDowngrade` keys on. Absent from every
+   * recorded catalog here, so an ordinary row reads as not free.
+   */
+  is_free?: boolean;
   thinking_config?: {
     disabled?: unknown;
     enabled?: { efforts?: Record<string, { is_default?: boolean }>; is_default?: boolean };
@@ -211,6 +218,43 @@ function writeParsedModelCache(mode: QoderMode, data: ParsedModelCache): void {
   modelCacheMem.set(cachePath, data);
   // The configs changed, so any previously built displayId index is stale.
   configIndexMem.delete(cachePath);
+}
+
+/**
+ * Whether one catalog row is usable without a paid entitlement.
+ *
+ * boundary: `is_free` is a field of the /model/list JSON body, so the `=== true`
+ * comparison is the narrowing — a string or a number never counts as free, and a
+ * row without the field reads as not free.
+ */
+function isFreeCatalogRow(row: QoderModelEntry | undefined): boolean {
+  return row?.is_free === true;
+}
+
+/**
+ * The catalog already on disk when this answer would shrink it to its free tier,
+ * or `null` when the answer is written as usual.
+ *
+ * Qoder's `/model/list` is account-scoped, and a quota-exhausted or free account
+ * can answer with only its `is_free` models (jischeng fork b0d3420, live-verified
+ * as "only Qwen models"). Writing that answer over a full catalog shrank the
+ * model picker for the rest of the cache TTL. Both halves must hold to keep it:
+ * every row of the new answer is free, and the cache already holds a row that is
+ * not. Everything else — no cache, a different account, an empty answer, any
+ * non-free row, a cache row with no catalog row to judge — fails open and writes.
+ */
+function keptCatalogOnFreeOnlyDowngrade(
+  cached: ParsedModelCache | null,
+  userID: string,
+  newModels: readonly QoderModelDef[],
+  configs: Record<string, QoderModelEntry>,
+): ParsedModelCache | null {
+  // Account identity is part of the question: another account's catalog says
+  // nothing about what this one should see.
+  if (!cached || cached.userID !== userID) return null;
+  if (!Array.isArray(cached.models) || cached.models.length === 0) return null;
+  if (!cached.models.some((model) => !isFreeCatalogRow(cached.configs?.[model.id]))) return null;
+  return newModels.every((model) => isFreeCatalogRow(configs[model.id])) ? cached : null;
 }
 
 /**
@@ -715,8 +759,26 @@ async function fetchAndCacheModelList(
 
     if (newModels.length === 0) return;
 
+    const updatedAt = Date.now();
+    const kept = keptCatalogOnFreeOnlyDowngrade(readParsedModelCache(mode), userID, newModels, configs);
+    if (kept) {
+      // Keep the known-good rows, but stamp the fetch so the degraded answer is
+      // not asked for again inside the TTL: the gateway is not hammered while
+      // the account's entitlement is being sorted out.
+      writeParsedModelCache(mode, {
+        updatedAt,
+        userID: kept.userID,
+        models: kept.models,
+        configs: kept.configs,
+      });
+      debugLog(
+        `model catalog answer degraded to ${newModels.length} free row(s); kept ${kept.models?.length ?? 0} cached row(s)`,
+      );
+      return;
+    }
+
     const cacheData = {
-      updatedAt: Date.now(),
+      updatedAt,
       userID,
       models: newModels,
       configs,

@@ -476,6 +476,158 @@ describe("Qoder model cache", () => {
     expect(getCachedModelConfig("lite", "global")).toBeNull();
   });
 
+  it("keeps the cached catalog when the answer degrades to free-only", async () => {
+    // Spec: updateQoderModelsCache /model/list -> the cache file. Input: a cache
+    // holding a mixed catalog, then an answer carrying only `is_free` rows (what a
+    // quota-exhausted or free account returns). Expected: the cached models and
+    // configs stay and `updatedAt` advances, so the degraded answer is not
+    // re-fetched inside the TTL. Error contract: none — the guard never throws.
+    // Fixture: invented — Qoder's account-scoped /model/list degrades to its
+    // `is_free` rows only on an exhausted/free account (jischeng fork b0d3420,
+    // live-verified as "only Qwen models"), an answer no recorded catalog here
+    // covers; the recorded catalogs carry no `is_free` field at all.
+    const staleStamp = Date.now() - 7_200_000;
+    writeFileSync(
+      CACHE_PATHS.global,
+      JSON.stringify({
+        updatedAt: staleStamp,
+        userID: "user-a",
+        models: [
+          { id: "Cantus", name: "Cantus" },
+          { id: "Qwen3.8-Flash", name: "Qwen3.8-Flash" },
+        ],
+        configs: {
+          Cantus: { key: "cmodel", enable: true, display_name: "Cantus", is_free: false },
+          "Qwen3.8-Flash": { key: "qfmodel", enable: true, display_name: "Qwen3.8-Flash", is_free: true },
+        },
+      }),
+      "utf8",
+    );
+    clearQoderModelsMemCache();
+
+    const degraded = { chat: [{ key: "qfmodel", enable: true, display_name: "Qwen3.8-Flash", is_free: true }] };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(degraded), { status: 200 })));
+
+    await updateQoderModelsCache("access-token", "user-a", "A", "a@example.com", "global");
+
+    const cache = JSON.parse(readFileSync(CACHE_PATHS.global, "utf8"));
+    expect(cache.models.map((model: { id: string }) => model.id)).toEqual(["Cantus", "Qwen3.8-Flash"]);
+    expect(cache.configs.Cantus.key).toBe("cmodel");
+    expect(cache.userID).toBe("user-a");
+    expect(cache.updatedAt).toBeGreaterThan(staleStamp);
+    // The read path serves the same known-good rows.
+    expect(getCachedModels("global").map((model) => model.id)).toEqual(["Cantus", "Qwen3.8-Flash"]);
+  });
+
+  it("replaces the catalog when the answer still carries a non-free model", async () => {
+    // Spec: updateQoderModelsCache /model/list -> the cache file. Input: a cache
+    // holding a mixed catalog, then a smaller answer containing a non-free row.
+    // Expected: the answer is written — a smaller paid catalog is a real answer,
+    // not a degraded one. Fixture: invented, as in the free-only case above.
+    const staleStamp = Date.now() - 7_200_000;
+    writeFileSync(
+      CACHE_PATHS.global,
+      JSON.stringify({
+        updatedAt: staleStamp,
+        userID: "user-a",
+        models: [
+          { id: "Cantus", name: "Cantus" },
+          { id: "Qwen3.8-Flash", name: "Qwen3.8-Flash" },
+        ],
+        configs: {
+          Cantus: { key: "cmodel", enable: true, display_name: "Cantus", is_free: false },
+          "Qwen3.8-Flash": { key: "qfmodel", enable: true, display_name: "Qwen3.8-Flash", is_free: true },
+        },
+      }),
+      "utf8",
+    );
+    clearQoderModelsMemCache();
+
+    const smaller = { chat: [{ key: "gm51model", enable: true, display_name: "GLM 5.2", is_free: false }] };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(smaller), { status: 200 })));
+
+    await updateQoderModelsCache("access-token", "user-a", "A", "a@example.com", "global");
+
+    const cache = JSON.parse(readFileSync(CACHE_PATHS.global, "utf8"));
+    expect(cache.models.map((model: { id: string }) => model.id)).toEqual(["GLM5.2"]);
+    expect(cache.configs.Cantus).toBeUndefined();
+    expect(cache.updatedAt).toBeGreaterThan(staleStamp);
+  });
+
+  it("replaces the catalog when the answer is the same mixed list", async () => {
+    // Spec: updateQoderModelsCache /model/list -> the cache file. Input: a cache
+    // holding a mixed catalog, then the same mixed list with one row's payload
+    // changed. Expected: the answer is written, so the changed payload lands and
+    // the guard cannot hold the old catalog. Fixture: invented, as above.
+    const staleStamp = Date.now() - 7_200_000;
+    writeFileSync(
+      CACHE_PATHS.global,
+      JSON.stringify({
+        updatedAt: staleStamp,
+        userID: "user-a",
+        models: [
+          { id: "Cantus", name: "Cantus" },
+          { id: "Qwen3.8-Flash", name: "Qwen3.8-Flash" },
+        ],
+        configs: {
+          Cantus: { key: "cmodel", enable: true, display_name: "Cantus", is_free: false, price_factor: 3.2 },
+          "Qwen3.8-Flash": { key: "qfmodel", enable: true, display_name: "Qwen3.8-Flash", is_free: true },
+        },
+      }),
+      "utf8",
+    );
+    clearQoderModelsMemCache();
+
+    const sameList = {
+      chat: [
+        { key: "cmodel", enable: true, display_name: "Cantus", is_free: false, price_factor: 2.5 },
+        { key: "qfmodel", enable: true, display_name: "Qwen3.8-Flash", is_free: true },
+      ],
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(sameList), { status: 200 })));
+
+    await updateQoderModelsCache("access-token", "user-a", "A", "a@example.com", "global");
+
+    const cache = JSON.parse(readFileSync(CACHE_PATHS.global, "utf8"));
+    expect(cache.models.map((model: { id: string }) => model.id)).toEqual(["Cantus", "Qwen3.8-Flash"]);
+    expect(cache.configs.Cantus.price_factor).toBe(2.5);
+    expect(cache.updatedAt).toBeGreaterThan(staleStamp);
+  });
+
+  it("writes a free-only answer when the cache belongs to another account", async () => {
+    // Spec: updateQoderModelsCache /model/list -> the cache file. Input: a cache
+    // written for user-a, then user-b's free-only answer. Expected: written — the
+    // guard never reuses another account's entitlements. Fixture: invented, as
+    // above.
+    writeFileSync(
+      CACHE_PATHS.global,
+      JSON.stringify({
+        updatedAt: Date.now() - 7_200_000,
+        userID: "user-a",
+        models: [
+          { id: "Cantus", name: "Cantus" },
+          { id: "Qwen3.8-Flash", name: "Qwen3.8-Flash" },
+        ],
+        configs: {
+          Cantus: { key: "cmodel", enable: true, display_name: "Cantus", is_free: false },
+          "Qwen3.8-Flash": { key: "qfmodel", enable: true, display_name: "Qwen3.8-Flash", is_free: true },
+        },
+      }),
+      "utf8",
+    );
+    clearQoderModelsMemCache();
+
+    const degraded = { chat: [{ key: "qfmodel", enable: true, display_name: "Qwen3.8-Flash", is_free: true }] };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(degraded), { status: 200 })));
+
+    await updateQoderModelsCache("access-token", "user-b", "B", "b@example.com", "global");
+
+    const cache = JSON.parse(readFileSync(CACHE_PATHS.global, "utf8"));
+    expect(cache.userID).toBe("user-b");
+    expect(cache.models.map((model: { id: string }) => model.id)).toEqual(["Qwen3.8-Flash"]);
+    expect(cache.configs.Cantus).toBeUndefined();
+  });
+
   it("coalesces concurrent model-list refreshes into a single request", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
