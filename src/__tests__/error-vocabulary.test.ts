@@ -87,6 +87,12 @@ vi.mock("../host-seam.ts", async (importOriginal) => {
  * `Qoder stream ended before a terminal response event (stamp tail)` — the
  * same EOF class, so it deliberately carries the host pattern and classifies
  * as RETRYABLE; `stamp.test.ts` pins the exact rendered instance.
+ *
+ * A twenty-sixth text renders from the queue wait bound:
+ * `QUEUE_WAIT_EXHAUSTED_TEXT` is what a queued turn reports once its wait budget
+ * or its episode cap runs out. It matches no host pattern on purpose — the turn
+ * already spent its queue wait, so an automatic re-dispatch would begin the wait
+ * again rather than retry a transient failure.
  */
 
 function makeModel(provider: "qoder" | "qoder-cn" = "qoder", id = "Lite"): Model<Api> {
@@ -151,6 +157,18 @@ function stallingFetch(): typeof globalThis.fetch {
   });
   return vi.fn(async () => stalled) as unknown as typeof globalThis.fetch;
 }
+
+/**
+ * The queue notice: status 403, code 10605, the record nested through one
+ * JSON-string layer inside the envelope's own JSON-string body.
+ * invented: no live recording of a queue notice exists in this repo; the shape
+ * follows the evidence cited at the top of src/protocol/queue.ts.
+ */
+const QUEUE_NOTICE_SSE = sseEnvelope(
+  JSON.stringify({ code: 10605, message: "queued", data: JSON.stringify({ isQueued: true, retry_after_ms: 60_000 }) }),
+  403,
+  "Forbidden",
+);
 
 const IDENTITY = {
   access: "fake",
@@ -360,6 +378,21 @@ const BOUNDED_SITES: BoundedSite[] = [
             DONE_SSE,
         ),
       }),
+  },
+  {
+    site: "stream.ts QUEUE_WAIT_EXHAUSTED_TEXT",
+    text: "Qoder gateway kept the request queued past the wait limit",
+    // The queue wait is bounded twice — QUEUE_EPISODES_MAX and
+    // QODER_QUEUE_MAX_WAIT_MS — and both bounds end the turn with this one text.
+    // This row renders the budget arm: the notice's hint is a minute, the budget
+    // one millisecond, so the wait is cut to the budget and then ends the turn
+    // instead of resending.
+    render: () =>
+      renderedError({
+        apiKey: "fake",
+        env: { QODER_QUEUE_MAX_WAIT_MS: "1" },
+        fetch: mockFetch(QUEUE_NOTICE_SSE),
+      } as SimpleStreamOptions),
   },
   {
     site: "dsml.ts:65 via DsmlToolCallParser.processChunk",
@@ -619,6 +652,11 @@ const CLASSIFIER_VERDICTS: Array<{ text: string; retryable: boolean; note?: stri
   { text: "Qoder finished with tool_calls but returned no tool calls", retryable: false },
   { text: "Qoder request timeout", retryable: true, note: 'matches "timeout"' },
   { text: "Qoder stream idle timeout", retryable: true, note: 'matches "timeout" and "timed? out"' },
+  {
+    text: "Qoder gateway kept the request queued past the wait limit",
+    retryable: false,
+    note: "no host pattern matches, deliberately: the queue wait is already spent, so a re-dispatch would restart it",
+  },
   { text: "Incomplete Qoder tool call identity", retryable: false },
   { text: "Invalid or truncated Qoder tool call arguments", retryable: false },
   { text: "Qoder DSML buffer exceeded 8388608 characters", retryable: false },

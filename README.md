@@ -122,6 +122,8 @@ The streamed response is normalized into pi thinking blocks regardless of how th
 | `QODER_WARM_BUDGET` | Fraction of the protected cache miss an idle window may spend on refreshes (default `0.5`); `off` disables the cap. Invalid values fall back to `0.5` with one debug entry. |
 | `QODER_LEGACY_AFFINITY` | Set to `off` to suppress every legacy cache-affinity placement (the probe-gated `prompt_cache_key` body field and the unsigned header trio) at request time, no rebuild — the rollback path for a promoted placement. |
 | `QODER_LEGACY_CONTEXT_LENGTH` | Set to `off` to remove `context_length` from the legacy request body at request time, no rebuild — the rollback path for the promoted top-level-number placement. |
+| `QODER_QUEUE_WAIT` | Set to `0` to fail a queued turn immediately instead of waiting for it (the pre-queue behaviour: the gateway's status 403 with code `10605` becomes an error, no polling, no replay). Any other value, or unset, waits. |
+| `QODER_QUEUE_MAX_WAIT_MS` | How long one turn may spend waiting in a busy model's queue before it fails (default `3600000` ms). While queued, the provider polls the queue-status endpoint and re-sends the same conversation with a fresh request id when the gateway says its turn has come, for at most three episodes per turn. |
 
 ## How it works (protocol notes)
 
@@ -142,7 +144,7 @@ Legacy turns now close each text block with a `text_end` event, matching v2's ev
 
 ### Retry behavior
 
-This provider never retries a chat POST inside its own `fetch` layer. `src/retry.ts` retries non-billable requests only — `fetchWithRetry` forces a single attempt for every non-GET method — so that layer never replays a POST. That GET-only policy is unchanged. Transport remains SSE. (The one repo-side re-dispatch is the opt-in `QODER_FALLBACK` self-heal, which fires only when the v2 model-server rejects a model key before a generation starts.)
+This provider never retries a chat POST inside its own `fetch` layer. `src/retry.ts` retries non-billable requests only — `fetchWithRetry` forces a single attempt for every non-GET method — so that layer never replays a POST. That GET-only policy is unchanged. Transport remains SSE. (There are two deliberate exceptions to that, both outside the `fetch` layer. The first is the opt-in `QODER_FALLBACK` self-heal, which fires only when the v2 model-server rejects a model key before a generation starts. The second is the queue wait: when the gateway answers that the model is busy — status 403 with code `10605` — the turn waits instead of failing, then re-sends the same conversation with a new request id and a fresh signature. That wait is bounded by `QODER_QUEUE_MAX_WAIT_MS` and three episodes, and `QODER_QUEUE_WAIT=0` turns it off.)
 
 Two retry layers sit above it, and they differ:
 

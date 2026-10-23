@@ -35,6 +35,7 @@ import { type DsmlParserEvent, DsmlToolCallParser } from "./dsml.js";
 import { qoderEncodeBodyAsync } from "./encoding.js";
 import { PROCESS_FALLBACK_SESSION_ID, planQoderTurn, qoderModeFor, type TurnPlanSeed } from "./plan.js";
 import { extendPrefixChain, prefixStampFields } from "./prefix-chain.js";
+import { parseQueueNotice, parseQueueStatus, type QueueInfo, queueStatusUrl, queueWaitDecision } from "./queue.ts";
 import { mergeQoderHeaders } from "./request.js";
 import { PROTOCOL } from "./routing.js";
 import { classifyTurnKind, resolveRunIdentity } from "./run-identity.js";
@@ -70,6 +71,43 @@ type QoderDeltaEvent = Extract<QoderStreamEvent, { type: "text_delta" | "thinkin
 
 const QODER_STREAM_IDLE_TIMEOUT_MS = 120_000;
 export const MAX_SSE_BUFFER_LENGTH = 8 * 1024 * 1024;
+
+/**
+ * A queued answer is waited out, not failed. A busy model answers with an
+ * envelope whose status is 403 and whose body carries the queue notice
+ * (`protocol/queue.ts` owns that vocabulary). Episodes are capped because each
+ * one is a re-POST of the same billable turn, and the wait is capped by wall
+ * clock because a turn that silently waits longer than an hour is worse than a
+ * clear error. `QODER_QUEUE_WAIT=0` restores the pre-queue behaviour exactly:
+ * the 403 throw, no polling, no replay.
+ */
+const QUEUE_EPISODES_MAX = 3;
+const QUEUE_POLL_FAILURES_MAX = 3;
+const QODER_QUEUE_MAX_WAIT_MS = 3_600_000;
+const QUEUE_WAIT_EXHAUSTED_TEXT = "Qoder gateway kept the request queued past the wait limit";
+
+/**
+ * Sleep that ends with the request: the queue wait is cancellable, and the timer
+ * is cleared on abort so an abandoned wait cannot hold the process open.
+ */
+function sleepWithAbort(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason ?? new Error("Qoder request aborted"));
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onAbort = (): void => {
+      if (timer) clearTimeout(timer);
+      reject(signal.reason ?? new Error("Qoder request aborted"));
+    };
+    timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 type QoderFinishReason = { stopReason: "stop" | "length" | "toolUse" } | { stopReason: "error"; diagnostic: string };
 
@@ -430,141 +468,11 @@ export function streamQoder(
         product: "cli",
         turnKind: classifyTurnKind(options?.maxTokens),
       });
-      const requestID = crypto.randomUUID();
-
-      const reqBody: Record<string, unknown> = {
-        // request_id / chat_record_id are per-request (qodercli sets
-        // chat_record_id = request_id); request_set_id is the run-scoped id.
-        request_id: requestID,
-        request_set_id: requestSetId,
-        chat_record_id: requestID,
-        session_id: sessionID,
-        // v2/qodercli carry the session identity twice (source_session_id in
-        // metadata.context equals session_id); a receiver keys on field
-        // presence, so legacy sends the same pair instead of omitting one.
-        source_session_id: sessionID,
-        stream: true,
-        chat_task: "FREE_INPUT",
-        is_reply: true,
-        is_retry: false,
-        source: 1,
-        version: "3",
-        session_type: "qodercli",
-        agent_id: "agent_common",
-        task_id: "common",
-        code_language: "",
-        chat_prompt: "",
-        image_urls: null,
-        aliyun_user_type: "",
-        // Qoder's server ignores the top-level `system` field (verified: the
-        // model never sees it). Inject the system prompt as a leading
-        // role:system message instead, which the server does honor.
-        system: "",
-        messages: systemText
-          ? [{ role: WIRE_ROLE.system.wire, content: systemText }, ...normalizedMessages]
-          : normalizedMessages,
-        tools: toolsRaw || [],
-        parameters,
-        chat_context: {
-          chatPrompt: "",
-          imageUrls: null,
-          extra: {
-            context: [],
-            modelConfig: {
-              key: qoderModel,
-              is_reasoning: isReasoning,
-            },
-            originalContent: lastUserText,
-          },
-          features: [],
-          text: lastUserText,
-        },
-        model_config: modelConfig,
-        // Stable per run: same id/name/begin_at across the run's requests;
-        // stage advances init -> start -> processing like qodercli's lifecycle.
-        business,
-      };
-
-      // Hooks see the logical JSON payload, not Qoder's encoded wire bytes.
-      // Sign only after replacement/mutation so COSY hashes describe the actual body.
-      const replacement = options?.onPayload
-        ? await withAbort(Promise.resolve(options.onPayload(reqBody, model)), requestController.signal)
-        : undefined;
-      const payload = replacement === undefined ? reqBody : replacement;
-      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-        throw new Error("Qoder onPayload must return a JSON object or undefined");
-      }
-      // Legacy cache affinity (SA §3.1 FR-7 / fs-qoder-legacy-affinity): the
-      // placement set comes from the plan's affinity tier when the router
-      // produced one and from the frozen table otherwise — the same data, so
-      // a probe verdict promoting a carrier is a one-string table edit that
-      // reaches both paths with no adapter change. QODER_LEGACY_AFFINITY=off
-      // (§6.3) empties the set at request time: one environment change stops
-      // every legacy affinity field on the next dispatch of a running process.
-      const affinityKillSwitch = options?.env?.QODER_LEGACY_AFFINITY ?? process.env.QODER_LEGACY_AFFINITY;
-      const legacyAffinity =
-        affinityKillSwitch === "off" ? [] : (plan?.affinity.placements.legacy ?? affinityPlacements("legacy"));
-      // v2 gates the body key and the header trio on cacheRetention separately
-      // (openai-completions.js:542 and :576-579); legacy mirrors both gates so
-      // a retention-none turn leaves neither half of the surface on the wire.
-      const affinityRetentionNone = options?.cacheRetention === "none";
-      if (!affinityRetentionNone && legacyAffinity.includes("prompt_cache_key")) {
-        // Written onto the resolved payload, never reqBody: a host hook that
-        // returns a replacement object discards fields written to the original.
-        (payload as Record<string, unknown>).prompt_cache_key = sessionID;
-      }
-      // Legacy context tier (SA §3.3 OB-10 / fs-qoder-legacy-context-length):
-      // the plan owns the resolution and the adapter resolves nothing itself —
-      // the gate-off arm calls the same shared resolver over the same catalog
-      // entry, so the tier is identical with QODER_CORE_PLAN on or off. The
-      // policy row is data: legacy emits while `legacy:top-level-number` sits
-      // in the live row, and moving the string into the gated row stops
-      // emission with no adapter edit. QODER_LEGACY_CONTEXT_LENGTH=off (§6.3)
-      // suppresses the member at request time, the same rollback posture as
-      // the affinity switch above.
-      const contextLengthKillSwitch =
-        options?.env?.QODER_LEGACY_CONTEXT_LENGTH ?? process.env.QODER_LEGACY_CONTEXT_LENGTH;
-      const contextTier =
-        contextLengthKillSwitch === "off"
-          ? undefined
-          : (plan?.contextLength ?? resolveContextLength(modelConfig.context_config, model.contextWindow));
-      if (
-        carrierValue(QODER_WIRE_COMPAT.contextLengthEmission, "legacy") === "top-level-number" &&
-        contextTier !== undefined
-      ) {
-        // Written onto the resolved payload, never reqBody: a host hook that
-        // returns a replacement object discards fields written to the original.
-        (payload as Record<string, unknown>).context_length = contextTier;
-      }
-      const bodyBytes = Buffer.from(JSON.stringify(payload));
-      throwIfAborted();
-      await yieldToEventLoop();
-      // qoderEncodeBodyAsync writes the transformed body straight into a
-      // preallocated Buffer, yielding to the event loop on large requests.
-      const encodedBytes = await qoderEncodeBodyAsync(bodyBytes, requestController.signal);
-      throwIfAborted();
-
+      // Everything a re-POST reuses: the chat URL and the idle-timeout policy are
+      // per-request values rather than per-attempt ones, and the read-side parsers
+      // live across attempts so the attempt a queue notice interrupts, and the one
+      // that follows it, continue the same assistant message.
       const chatURL = getQoderChatURL(providerMode, model.baseUrl);
-
-      const headers = buildAuthHeaders(encodedBytes, chatURL, {
-        userID,
-        authToken: accessToken,
-        name,
-        email,
-        machineID,
-      });
-
-      const outgoingConfig = (payload as { model_config?: { key?: string; source?: string } }).model_config;
-      const modelSource = outgoingConfig?.source || modelConfig.source || "system";
-      // The unsigned affinity trio (SA §3.1 FR-7): COSY signs the encoded body
-      // bytes and never the headers, so these cannot invalidate a signature.
-      // All three carry the body's own session value — the gateway must see
-      // one identity, not two — and later merge sources (model, caller) still
-      // override them, per mergeQoderHeaders' source order.
-      const affinityHeaderEntries: Record<string, string> =
-        !affinityRetentionNone && legacyAffinity.includes("header-x-session-id")
-          ? { session_id: sessionID, "x-client-request-id": sessionID, "x-session-affinity": sessionID }
-          : {};
       // Resolve the (optional) idle-timeout override once per request instead of
       // re-reading process.env on every streamed chunk.
       const configuredIdleTimeout = Number(
@@ -581,107 +489,6 @@ export function streamQoder(
         }, idleTimeoutMs);
       };
       resetIdleTimer();
-
-      const finalHeaders = mergeQoderHeaders(
-        {
-          "Content-Type": "application/json",
-          Accept: "text/event-stream",
-          "Cache-Control": "no-cache",
-          "Accept-Encoding": "identity",
-          "X-Model-Key": outgoingConfig?.key || qoderModel,
-          "X-Model-Source": modelSource,
-          ...affinityHeaderEntries,
-          ...headers,
-        },
-        model.headers,
-        options?.headers,
-      );
-      if (debugEnabled()) {
-        // Logical payload before COSY encoding — the wire bytes are opaque
-        // base64, so the request record is written here rather than in the
-        // fetch wrapper (whose debug half is request-meta only; response
-        // capture rides the consumer-side read loop below). Records are
-        // keyed by the PI session id (the ledger join key), with the hashed
-        // wire session id carried as a field — legacy and v2 must land in the
-        // same per-session file.
-        const capped = capText(JSON.stringify(payload));
-        writeDebugRecord(options?.sessionId, {
-          type: "request",
-          protocol: "legacy",
-          session: options?.sessionId,
-          wireSessionId: plan?.capture.wireSessionId ?? sessionID,
-          model: model.id,
-          upstreamKey: qoderModel,
-          url: chatURL,
-          method: "POST",
-          headers: redactHeadersForDebug(finalHeaders),
-          body: capped.text,
-          bodyTruncated: capped.truncated,
-        });
-      }
-      const debugMeta: DebugFetchMeta = {
-        protocol: "legacy",
-        session: options?.sessionId,
-        model: model.id,
-        upstreamKey: qoderModel,
-        logRequest: false,
-      };
-      const debugFetch = createDebugFetch(options?.fetch ?? fetch, debugMeta);
-
-      const fetchPromise = debugFetch(chatURL, {
-        method: "POST",
-        headers: finalHeaders,
-        // Buffer is a valid Uint8Array at runtime but not in DOM's BodyInit union.
-        body: encodedBytes as unknown as BodyInit,
-        signal: requestController.signal,
-      }).then((received) => {
-        if (requestController.signal.aborted) {
-          void received.body?.cancel().catch(() => {});
-          throwIfAborted();
-        }
-        return received;
-      });
-      response = await withAbort(fetchPromise, requestController.signal);
-      resetIdleTimer();
-      if (options?.onResponse) {
-        await withAbort(
-          Promise.resolve(
-            options.onResponse(
-              {
-                status: response.status,
-                headers: Object.fromEntries(response.headers.entries()),
-              },
-              model,
-            ),
-          ),
-          requestController.signal,
-        );
-      }
-      throwIfAborted();
-
-      if (!response.ok) {
-        const errText = await readResponseText(response, requestController.signal);
-        // readResponseText is this path's consumer-side read — the loop below never
-        // runs — so an HTTP error body is recorded here or not at all. Gated on
-        // response.body to hold the one-record-per-response partition: a body-less
-        // response is already recorded by createDebugFetch, which is the module
-        // that owns that case on both protocols.
-        if (response.body) {
-          capture = createResponseCapture(debugMeta, chatURL, response.status);
-          capture?.push(errText);
-          capture?.finish();
-        }
-        throw new Error(`Qoder API request failed: ${response.status} ${response.statusText}. Response: ${errText}`);
-      }
-
-      reader = response.body?.getReader();
-      if (!reader) throw new Error("No response body");
-      const decoder = new TextDecoder();
-      let buffer = "";
-      // Response capture rides this loop: the decoder below already traverses
-      // every byte in order to parse it, so observing here adds no wrapper,
-      // cannot reorder events, and records exactly what the transport processed.
-      capture = createResponseCapture(debugMeta, chatURL, response.status);
 
       let thinkingBlockIndex = -1;
       const toolCalls = new ToolCallAccumulator(output, pushEvent);
@@ -757,196 +564,589 @@ export function streamQoder(
         for (const event of dsmlParser.processChunk(content)) processDsmlEvent(event, fromReasoning);
       };
 
-      pushEvent({ type: "start", partial: output });
+      // Queue waiting is on unless QODER_QUEUE_WAIT=0, which restores the pre-queue
+      // behaviour exactly: the 403 throw, no polling, no replay.
+      const queueWaitEnabled = (options?.env?.QODER_QUEUE_WAIT ?? process.env.QODER_QUEUE_WAIT) !== "0";
+      const configuredQueueMaxWait = Number(
+        options?.env?.QODER_QUEUE_MAX_WAIT_MS ?? process.env.QODER_QUEUE_MAX_WAIT_MS,
+      );
+      const queueMaxWaitMs =
+        Number.isFinite(configuredQueueMaxWait) && configuredQueueMaxWait > 0
+          ? configuredQueueMaxWait
+          : QODER_QUEUE_MAX_WAIT_MS;
+      let started = false;
+      let queueEpisodes = 0;
+      /** Wall-clock end of this turn's queue waiting, fixed by the first notice. */
+      let queueDeadline = 0;
 
-      // `data: [DONE]` is the end of the response. Break the read loop too, not
-      // just the line loop: Qoder's gateway keeps the HTTP body open after the
-      // sentinel, so waiting for `done` from reader.read() hung until the
-      // server or the OS eventually closed the socket. The full reply had
-      // already been streamed by then, so the agent looked stuck with no error.
-      let sawDone = false;
-      let linesSinceYield = 0;
+      const queueWaitExhausted = (): Error => new Error(QUEUE_WAIT_EXHAUSTED_TEXT);
 
-      while (!sawDone) {
-        const { done, value } = await withAbort(reader.read(), requestController.signal);
+      /**
+       * Sleep, but never past this turn's queue budget. The cap is wall-clock time:
+       * a hint longer than what is left is cut to it, and the turn ends there rather
+       * than starting a wait it cannot afford.
+       */
+      const waitWithinQueueBudget = async (ms: number): Promise<void> => {
+        if (!queueDeadline) queueDeadline = Date.now() + queueMaxWaitMs;
+        const remaining = queueDeadline - Date.now();
+        if (remaining <= 0) throw queueWaitExhausted();
+        await sleepWithAbort(Math.min(ms, remaining), requestController.signal);
+        if (Date.now() >= queueDeadline) throw queueWaitExhausted();
+      };
+
+      /** Ask the queue-status endpoint where this request stands. Null on any failure. */
+      const pollQueueStatus = async (notice: QueueInfo): Promise<QueueInfo | null> => {
+        const statusURL = queueStatusUrl(chatURL, {
+          requestSetId: notice.requestSetId ?? requestSetId,
+          modelKey: notice.modelKey ?? qoderModel,
+          queueType: notice.queueType,
+        });
+        // Signed for the status URL: COSY's signature covers the path, so the chat
+        // request's headers cannot be replayed on it.
+        const statusHeaders = buildAuthHeaders(null, statusURL, {
+          userID,
+          authToken: accessToken,
+          name,
+          email,
+          machineID,
+        });
+        // A hung poll is an idle upstream, so the stream's own idle timer bounds it.
+        resetIdleTimer();
+        try {
+          const polled = await withAbort(
+            (options?.fetch ?? fetch)(statusURL, {
+              method: "GET",
+              headers: statusHeaders,
+              signal: requestController.signal,
+            }),
+            requestController.signal,
+          );
+          const text = await readResponseText(polled, requestController.signal);
+          return polled.ok ? parseQueueStatus(text) : null;
+        } catch (error) {
+          // An abort ends the turn; a failed poll is data for the wait loop, which
+          // degrades to the resend path after three failures in a row.
+          if (requestController.signal.aborted) throw error;
+          return null;
+        } finally {
+          if (idleTimer) {
+            clearTimeout(idleTimer);
+            idleTimer = undefined;
+          }
+        }
+      };
+
+      /**
+       * Wait out the queue, then return so the caller re-POSTs. The record decides
+       * (poll vs resend), `waitWithinQueueBudget` bounds, and the abort signal
+       * cancels — this function holds no policy of its own.
+       */
+      const waitOutQueue = async (notice: QueueInfo): Promise<void> => {
+        let current = notice;
+        let pollFailures = 0;
+        for (;;) {
+          const decision = queueWaitDecision(current);
+          await waitWithinQueueBudget(decision.waitMs);
+          if (decision.action === "resend") return;
+          const status = await pollQueueStatus(current);
+          if (status) {
+            pollFailures = 0;
+            current = status;
+            continue;
+          }
+          pollFailures++;
+          if (pollFailures < QUEUE_POLL_FAILURES_MAX) continue;
+          // Three failed polls is the queue endpoint being unusable this turn: take
+          // the resend the record's own hints describe instead of polling a status
+          // we cannot read.
+          await waitWithinQueueBudget(
+            queueWaitDecision({ ...current, isQueued: false, serviceAvailable: true }).waitMs,
+          );
+          return;
+        }
+      };
+
+      // A queued turn is waited out, not failed. Each pass is one attempt: build,
+      // sign, send, read. A queue notice ends the pass early and the next one
+      // re-POSTs the same conversation with a new request_id/chat_record_id pair,
+      // the same request_set_id/session_id, and a fresh COSY signature — a
+      // signature covers the body, so the previous attempt's encoded bytes cannot
+      // be resent with a stale one.
+      for (;;) {
+        const requestID = crypto.randomUUID();
+
+        const reqBody: Record<string, unknown> = {
+          // request_id / chat_record_id are per-request (qodercli sets
+          // chat_record_id = request_id); request_set_id is the run-scoped id.
+          request_id: requestID,
+          request_set_id: requestSetId,
+          chat_record_id: requestID,
+          session_id: sessionID,
+          // v2/qodercli carry the session identity twice (source_session_id in
+          // metadata.context equals session_id); a receiver keys on field
+          // presence, so legacy sends the same pair instead of omitting one.
+          source_session_id: sessionID,
+          stream: true,
+          chat_task: "FREE_INPUT",
+          is_reply: true,
+          is_retry: false,
+          source: 1,
+          version: "3",
+          session_type: "qodercli",
+          agent_id: "agent_common",
+          task_id: "common",
+          code_language: "",
+          chat_prompt: "",
+          image_urls: null,
+          aliyun_user_type: "",
+          // Qoder's server ignores the top-level `system` field (verified: the
+          // model never sees it). Inject the system prompt as a leading
+          // role:system message instead, which the server does honor.
+          system: "",
+          messages: systemText
+            ? [{ role: WIRE_ROLE.system.wire, content: systemText }, ...normalizedMessages]
+            : normalizedMessages,
+          tools: toolsRaw || [],
+          parameters,
+          chat_context: {
+            chatPrompt: "",
+            imageUrls: null,
+            extra: {
+              context: [],
+              modelConfig: {
+                key: qoderModel,
+                is_reasoning: isReasoning,
+              },
+              originalContent: lastUserText,
+            },
+            features: [],
+            text: lastUserText,
+          },
+          model_config: modelConfig,
+          // Stable per run: same id/name/begin_at across the run's requests;
+          // stage advances init -> start -> processing like qodercli's lifecycle.
+          business,
+        };
+
+        // Hooks see the logical JSON payload, not Qoder's encoded wire bytes.
+        // Sign only after replacement/mutation so COSY hashes describe the actual body.
+        const replacement = options?.onPayload
+          ? await withAbort(Promise.resolve(options.onPayload(reqBody, model)), requestController.signal)
+          : undefined;
+        const payload = replacement === undefined ? reqBody : replacement;
+        if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+          throw new Error("Qoder onPayload must return a JSON object or undefined");
+        }
+        // Legacy cache affinity (SA §3.1 FR-7 / fs-qoder-legacy-affinity): the
+        // placement set comes from the plan's affinity tier when the router
+        // produced one and from the frozen table otherwise — the same data, so
+        // a probe verdict promoting a carrier is a one-string table edit that
+        // reaches both paths with no adapter change. QODER_LEGACY_AFFINITY=off
+        // (§6.3) empties the set at request time: one environment change stops
+        // every legacy affinity field on the next dispatch of a running process.
+        const affinityKillSwitch = options?.env?.QODER_LEGACY_AFFINITY ?? process.env.QODER_LEGACY_AFFINITY;
+        const legacyAffinity =
+          affinityKillSwitch === "off" ? [] : (plan?.affinity.placements.legacy ?? affinityPlacements("legacy"));
+        // v2 gates the body key and the header trio on cacheRetention separately
+        // (openai-completions.js:542 and :576-579); legacy mirrors both gates so
+        // a retention-none turn leaves neither half of the surface on the wire.
+        const affinityRetentionNone = options?.cacheRetention === "none";
+        if (!affinityRetentionNone && legacyAffinity.includes("prompt_cache_key")) {
+          // Written onto the resolved payload, never reqBody: a host hook that
+          // returns a replacement object discards fields written to the original.
+          (payload as Record<string, unknown>).prompt_cache_key = sessionID;
+        }
+        // Legacy context tier (SA §3.3 OB-10 / fs-qoder-legacy-context-length):
+        // the plan owns the resolution and the adapter resolves nothing itself —
+        // the gate-off arm calls the same shared resolver over the same catalog
+        // entry, so the tier is identical with QODER_CORE_PLAN on or off. The
+        // policy row is data: legacy emits while `legacy:top-level-number` sits
+        // in the live row, and moving the string into the gated row stops
+        // emission with no adapter edit. QODER_LEGACY_CONTEXT_LENGTH=off (§6.3)
+        // suppresses the member at request time, the same rollback posture as
+        // the affinity switch above.
+        const contextLengthKillSwitch =
+          options?.env?.QODER_LEGACY_CONTEXT_LENGTH ?? process.env.QODER_LEGACY_CONTEXT_LENGTH;
+        const contextTier =
+          contextLengthKillSwitch === "off"
+            ? undefined
+            : (plan?.contextLength ?? resolveContextLength(modelConfig.context_config, model.contextWindow));
+        if (
+          carrierValue(QODER_WIRE_COMPAT.contextLengthEmission, "legacy") === "top-level-number" &&
+          contextTier !== undefined
+        ) {
+          // Written onto the resolved payload, never reqBody: a host hook that
+          // returns a replacement object discards fields written to the original.
+          (payload as Record<string, unknown>).context_length = contextTier;
+        }
+        const bodyBytes = Buffer.from(JSON.stringify(payload));
         throwIfAborted();
-        if (!done) resetIdleTimer();
+        await yieldToEventLoop();
+        // qoderEncodeBodyAsync writes the transformed body straight into a
+        // preallocated Buffer, yielding to the event loop on large requests.
+        const encodedBytes = await qoderEncodeBodyAsync(bodyBytes, requestController.signal);
+        throwIfAborted();
 
-        const decoded = done ? decoder.decode() : decoder.decode(value, { stream: true });
-        capture?.push(decoded);
-        buffer += decoded;
-        if (buffer.length > MAX_SSE_BUFFER_LENGTH && !buffer.includes("\n")) {
-          throw new Error(`Qoder SSE buffer exceeded ${MAX_SSE_BUFFER_LENGTH} characters without a complete line`);
+        const headers = buildAuthHeaders(encodedBytes, chatURL, {
+          userID,
+          authToken: accessToken,
+          name,
+          email,
+          machineID,
+        });
+
+        const outgoingConfig = (payload as { model_config?: { key?: string; source?: string } }).model_config;
+        const modelSource = outgoingConfig?.source || modelConfig.source || "system";
+        // The unsigned affinity trio (SA §3.1 FR-7): COSY signs the encoded body
+        // bytes and never the headers, so these cannot invalidate a signature.
+        // All three carry the body's own session value — the gateway must see
+        // one identity, not two — and later merge sources (model, caller) still
+        // override them, per mergeQoderHeaders' source order.
+        const affinityHeaderEntries: Record<string, string> =
+          !affinityRetentionNone && legacyAffinity.includes("header-x-session-id")
+            ? { session_id: sessionID, "x-client-request-id": sessionID, "x-session-affinity": sessionID }
+            : {};
+
+        const finalHeaders = mergeQoderHeaders(
+          {
+            "Content-Type": "application/json",
+            Accept: "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Accept-Encoding": "identity",
+            "X-Model-Key": outgoingConfig?.key || qoderModel,
+            "X-Model-Source": modelSource,
+            ...affinityHeaderEntries,
+            ...headers,
+          },
+          model.headers,
+          options?.headers,
+        );
+        if (debugEnabled()) {
+          // Logical payload before COSY encoding — the wire bytes are opaque
+          // base64, so the request record is written here rather than in the
+          // fetch wrapper (whose debug half is request-meta only; response
+          // capture rides the consumer-side read loop below). Records are
+          // keyed by the PI session id (the ledger join key), with the hashed
+          // wire session id carried as a field — legacy and v2 must land in the
+          // same per-session file.
+          const capped = capText(JSON.stringify(payload));
+          writeDebugRecord(options?.sessionId, {
+            type: "request",
+            protocol: "legacy",
+            session: options?.sessionId,
+            wireSessionId: plan?.capture.wireSessionId ?? sessionID,
+            model: model.id,
+            upstreamKey: qoderModel,
+            url: chatURL,
+            method: "POST",
+            headers: redactHeadersForDebug(finalHeaders),
+            body: capped.text,
+            bodyTruncated: capped.truncated,
+          });
         }
+        const debugMeta: DebugFetchMeta = {
+          protocol: "legacy",
+          session: options?.sessionId,
+          model: model.id,
+          upstreamKey: qoderModel,
+          logRequest: false,
+        };
+        const debugFetch = createDebugFetch(options?.fetch ?? fetch, debugMeta);
 
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-        // A final data line need not end with a newline. Decode it before EOF validation.
-        if (done && buffer) {
-          lines.push(buffer);
-          buffer = "";
-        }
-        if (buffer.length > MAX_SSE_BUFFER_LENGTH) {
-          throw new Error(`Qoder SSE buffer exceeded ${MAX_SSE_BUFFER_LENGTH} characters without a complete line`);
-        }
-
-        for (const rawLine of lines) {
-          const line = rawLine.trim();
-
-          // Yield every N lines to keep the event loop responsive. The flush
-          // inside is throttled by DELTA_FLUSH_INTERVAL_MS, so a fast stream
-          // coalesces deltas instead of re-rendering once per SSE line.
-          if (++linesSinceYield >= SSE_LINES_PER_YIELD) {
-            linesSinceYield = 0;
-            flushPendingDelta();
-            await yieldToEventLoop();
+        const fetchPromise = debugFetch(chatURL, {
+          method: "POST",
+          headers: finalHeaders,
+          // Buffer is a valid Uint8Array at runtime but not in DOM's BodyInit union.
+          body: encodedBytes as unknown as BodyInit,
+          signal: requestController.signal,
+        }).then((received) => {
+          if (requestController.signal.aborted) {
+            void received.body?.cancel().catch(() => {});
             throwIfAborted();
           }
+          return received;
+        });
+        response = await withAbort(fetchPromise, requestController.signal);
+        resetIdleTimer();
+        if (options?.onResponse) {
+          await withAbort(
+            Promise.resolve(
+              options.onResponse(
+                {
+                  status: response.status,
+                  headers: Object.fromEntries(response.headers.entries()),
+                },
+                model,
+              ),
+            ),
+            requestController.signal,
+          );
+        }
+        throwIfAborted();
 
-          if (!line.startsWith("data:")) continue;
+        if (!response.ok) {
+          const errText = await readResponseText(response, requestController.signal);
+          // readResponseText is this path's consumer-side read — the loop below never
+          // runs — so an HTTP error body is recorded here or not at all. Gated on
+          // response.body to hold the one-record-per-response partition: a body-less
+          // response is already recorded by createDebugFetch, which is the module
+          // that owns that case on both protocols.
+          if (response.body) {
+            capture = createResponseCapture(debugMeta, chatURL, response.status);
+            capture?.push(errText);
+            capture?.finish();
+          }
+          throw new Error(`Qoder API request failed: ${response.status} ${response.statusText}. Response: ${errText}`);
+        }
 
-          const dataStr = line.substring(5).trim();
-          if (dataStr === "[DONE]") {
-            sawDone = true;
-            break;
+        reader = response.body?.getReader();
+        if (!reader) throw new Error("No response body");
+        const decoder = new TextDecoder();
+        let buffer = "";
+        // Response capture rides this loop: the decoder below already traverses
+        // every byte in order to parse it, so observing here adds no wrapper,
+        // cannot reorder events, and records exactly what the transport processed.
+        capture = createResponseCapture(debugMeta, chatURL, response.status);
+
+        // The message begins once, on the first attempt: a re-POST after a queue
+        // notice continues the same assistant message, so it must not open a
+        // second one.
+        if (!started) {
+          started = true;
+          pushEvent({ type: "start", partial: output });
+        }
+
+        // `data: [DONE]` is the end of the response. Break the read loop too, not
+        // just the line loop: Qoder's gateway keeps the HTTP body open after the
+        // sentinel, so waiting for `done` from reader.read() hung until the
+        // server or the OS eventually closed the socket. The full reply had
+        // already been streamed by then, so the agent looked stuck with no error.
+        let sawDone = false;
+        let queuedNotice: QueueInfo | undefined;
+        let linesSinceYield = 0;
+
+        while (!sawDone && !queuedNotice) {
+          const { done, value } = await withAbort(reader.read(), requestController.signal);
+          throwIfAborted();
+          if (!done) resetIdleTimer();
+
+          const decoded = done ? decoder.decode() : decoder.decode(value, { stream: true });
+          capture?.push(decoded);
+          buffer += decoded;
+          if (buffer.length > MAX_SSE_BUFFER_LENGTH && !buffer.includes("\n")) {
+            throw new Error(`Qoder SSE buffer exceeded ${MAX_SSE_BUFFER_LENGTH} characters without a complete line`);
           }
 
-          try {
-            const envelope = JSON.parse(dataStr);
-            if (envelope.statusCodeValue && envelope.statusCodeValue !== 200) {
-              throw new Error(`Upstream status ${envelope.statusCodeValue}: ${envelope.body}`);
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+          // A final data line need not end with a newline. Decode it before EOF validation.
+          if (done && buffer) {
+            lines.push(buffer);
+            buffer = "";
+          }
+          if (buffer.length > MAX_SSE_BUFFER_LENGTH) {
+            throw new Error(`Qoder SSE buffer exceeded ${MAX_SSE_BUFFER_LENGTH} characters without a complete line`);
+          }
+
+          for (const rawLine of lines) {
+            const line = rawLine.trim();
+
+            // Yield every N lines to keep the event loop responsive. The flush
+            // inside is throttled by DELTA_FLUSH_INTERVAL_MS, so a fast stream
+            // coalesces deltas instead of re-rendering once per SSE line.
+            if (++linesSinceYield >= SSE_LINES_PER_YIELD) {
+              linesSinceYield = 0;
+              flushPendingDelta();
+              await yieldToEventLoop();
+              throwIfAborted();
             }
 
-            const innerStr = envelope.body;
-            // The gateway sends the sentinel wrapped in an envelope
-            // (`body: "[DONE]"`) as well as bare, and both mean the reply is
-            // over, so both have to end the read loop.
-            if (innerStr === "[DONE]") {
+            if (!line.startsWith("data:")) continue;
+
+            const dataStr = line.substring(5).trim();
+            if (dataStr === "[DONE]") {
               sawDone = true;
               break;
             }
-            if (!innerStr) continue;
 
-            const inner = JSON.parse(innerStr);
-            if (inner.error || (inner.code && inner.message && !inner.choices)) {
-              const error = inner.error ?? inner;
-              throw new Error(`Qoder upstream error: ${typeof error === "string" ? error : JSON.stringify(error)}`);
-            }
-            if (inner.id) output.responseId = inner.id as string;
-            // No `responseModel` copy here: the gateway's `model` echo is one
-            // constant for every requested model, so copying it would key every
-            // row by that constant instead of the request (pi resolves
-            // `responseModel ?? model`); `output.model` is already the friendly id.
-            if (inner.usage) {
-              const u = inner.usage as {
-                prompt_tokens?: number;
-                completion_tokens?: number;
-                total_tokens?: number;
-                completion_tokens_details?: { reasoning_tokens?: number };
-                prompt_tokens_details?: {
-                  cacheable_tokens?: number;
-                  cached_tokens?: number;
-                  cache_write_tokens?: number;
+            try {
+              const envelope = JSON.parse(dataStr);
+              if (envelope.statusCodeValue && envelope.statusCodeValue !== 200) {
+                // A busy model does not fail the turn: it answers 403 with the queue
+                // notice (code 10605, nested through JSON-string layers) instead. Read
+                // the record before throwing, and leave the whole read loop — the wait
+                // and the re-POST happen after it, where the reader can be cancelled
+                // and the next attempt can sign a fresh body. An attempt that has
+                // already streamed content is not replayed: its text is on the host's
+                // side and a resend would duplicate it.
+                const notice =
+                  queueWaitEnabled && output.stopReason === "pending" && output.content.length === 0
+                    ? parseQueueNotice(String(envelope.body))
+                    : null;
+                if (notice) {
+                  queuedNotice = notice;
+                  break;
+                }
+                throw new Error(`Upstream status ${envelope.statusCodeValue}: ${envelope.body}`);
+              }
+
+              const innerStr = envelope.body;
+              // The gateway sends the sentinel wrapped in an envelope
+              // (`body: "[DONE]"`) as well as bare, and both mean the reply is
+              // over, so both have to end the read loop.
+              if (innerStr === "[DONE]") {
+                sawDone = true;
+                break;
+              }
+              if (!innerStr) continue;
+
+              const inner = JSON.parse(innerStr);
+              if (inner.error || (inner.code && inner.message && !inner.choices)) {
+                const error = inner.error ?? inner;
+                throw new Error(`Qoder upstream error: ${typeof error === "string" ? error : JSON.stringify(error)}`);
+              }
+              if (inner.id) output.responseId = inner.id as string;
+              // No `responseModel` copy here: the gateway's `model` echo is one
+              // constant for every requested model, so copying it would key every
+              // row by that constant instead of the request (pi resolves
+              // `responseModel ?? model`); `output.model` is already the friendly id.
+              if (inner.usage) {
+                const u = inner.usage as {
+                  prompt_tokens?: number;
+                  completion_tokens?: number;
+                  total_tokens?: number;
+                  completion_tokens_details?: { reasoning_tokens?: number };
+                  prompt_tokens_details?: {
+                    cacheable_tokens?: number;
+                    cached_tokens?: number;
+                    cache_write_tokens?: number;
+                  };
                 };
-              };
-              // pi-core computes `promptTokens = input + cacheRead + cacheWrite`
-              // (Anthropic convention: `input` EXCLUDES cached/written tokens).
-              // Qoder follows OpenAI semantics where `prompt_tokens` INCLUDES
-              // `cached_tokens`, so subtract cacheRead (and cache_write_tokens
-              // when reported) to match the contract pi-ai's own OpenAI
-              // provider uses. `cacheable_tokens` is a capacity metric, not a
-              // write count (it is 0 even on first-turn writes), so it is NOT
-              // mapped to cacheWrite.
-              const promptTokens = u.prompt_tokens ?? 0;
-              const cacheReadTokens = u.prompt_tokens_details?.cached_tokens ?? 0;
-              const cacheWriteTokens = u.prompt_tokens_details?.cache_write_tokens ?? 0;
-              output.usage.input = Math.max(0, promptTokens - cacheReadTokens - cacheWriteTokens);
-              output.usage.output = u.completion_tokens ?? 0;
-              output.usage.totalTokens = u.total_tokens ?? promptTokens + output.usage.output;
-              output.usage.cacheRead = cacheReadTokens;
-              output.usage.cacheWrite = cacheWriteTokens;
-              if (typeof u.completion_tokens_details?.reasoning_tokens === "number") {
-                output.usage.reasoning = u.completion_tokens_details.reasoning_tokens;
+                // pi-core computes `promptTokens = input + cacheRead + cacheWrite`
+                // (Anthropic convention: `input` EXCLUDES cached/written tokens).
+                // Qoder follows OpenAI semantics where `prompt_tokens` INCLUDES
+                // `cached_tokens`, so subtract cacheRead (and cache_write_tokens
+                // when reported) to match the contract pi-ai's own OpenAI
+                // provider uses. `cacheable_tokens` is a capacity metric, not a
+                // write count (it is 0 even on first-turn writes), so it is NOT
+                // mapped to cacheWrite.
+                const promptTokens = u.prompt_tokens ?? 0;
+                const cacheReadTokens = u.prompt_tokens_details?.cached_tokens ?? 0;
+                const cacheWriteTokens = u.prompt_tokens_details?.cache_write_tokens ?? 0;
+                output.usage.input = Math.max(0, promptTokens - cacheReadTokens - cacheWriteTokens);
+                output.usage.output = u.completion_tokens ?? 0;
+                output.usage.totalTokens = u.total_tokens ?? promptTokens + output.usage.output;
+                output.usage.cacheRead = cacheReadTokens;
+                output.usage.cacheWrite = cacheWriteTokens;
+                if (typeof u.completion_tokens_details?.reasoning_tokens === "number") {
+                  output.usage.reasoning = u.completion_tokens_details.reasoning_tokens;
+                }
+
+                // Qoder Credits are metadata, not USD: preserve the official
+                // optional names on the runtime usage object, with missing
+                // fields absent (never zero). The derived USD cost is written
+                // separately below — pi reads usage.cost as money.
+                const qoderUsage = output.usage as QoderAssistantUsage;
+                Object.assign(qoderUsage, parseQoderCreditsUsage(inner.usage));
+
+                // Price the turn once, at the shared assembly: charged Credits
+                // win; without them a measured upstream key prices from the
+                // rate table; anything else stays zero with a fallback marker.
+                // pi's HTML export sums the four buckets, so the split — not
+                // just the total — must carry the cost.
+                const priced = priceTurnCost(
+                  qoderUsage.credits,
+                  {
+                    input: qoderUsage.input,
+                    output: qoderUsage.output,
+                    cacheRead: qoderUsage.cacheRead,
+                    cacheWrite: qoderUsage.cacheWrite,
+                  },
+                  rateForUpstreamKey(qoderModel),
+                );
+                qoderUsage.cost = priced.cost;
+                qoderUsage.rateSource = priced.rateSource;
               }
+              if (inner.choices && inner.choices.length > 0) {
+                const choice = inner.choices[0];
+                const delta = choice.delta;
 
-              // Qoder Credits are metadata, not USD: preserve the official
-              // optional names on the runtime usage object, with missing
-              // fields absent (never zero). The derived USD cost is written
-              // separately below — pi reads usage.cost as money.
-              const qoderUsage = output.usage as QoderAssistantUsage;
-              Object.assign(qoderUsage, parseQoderCreditsUsage(inner.usage));
+                if (delta) {
+                  // 1. Process reasoning/thinking content (API reasoning). DSML
+                  // tool calls are also sometimes leaked through this channel, so
+                  // route it through the DSML parser too: non-DSML reasoning text
+                  // becomes a thinking block, while any embedded tool call is
+                  // extracted and replayed as a real tool call instead of showing
+                  // up as literal tags inside the thinking.
+                  if (delta.reasoning_content) {
+                    processDsmlChunk(delta.reasoning_content, true);
+                  }
 
-              // Price the turn once, at the shared assembly: charged Credits
-              // win; without them a measured upstream key prices from the
-              // rate table; anything else stays zero with a fallback marker.
-              // pi's HTML export sums the four buckets, so the split — not
-              // just the total — must carry the cost.
-              const priced = priceTurnCost(
-                qoderUsage.credits,
-                {
-                  input: qoderUsage.input,
-                  output: qoderUsage.output,
-                  cacheRead: qoderUsage.cacheRead,
-                  cacheWrite: qoderUsage.cacheWrite,
-                },
-                rateForUpstreamKey(qoderModel),
-              );
-              qoderUsage.cost = priced.cost;
-              qoderUsage.rateSource = priced.rateSource;
+                  // 2. Process text content. DSML tool calls may be embedded in
+                  // delta.content when the gateway fails to expose tool_calls.
+                  if (delta.content) {
+                    // End API thinking block if active before switching to text or
+                    // a tool call embedded in the content stream.
+                    endApiThinking();
+                    processDsmlChunk(delta.content, false);
+                  }
+                  // 3. Process native structured tool calls.
+                  if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
+                    for (const tc of delta.tool_calls) toolCalls.processNativeDelta(tc);
+                  }
+                }
+
+                if (choice.finish_reason) {
+                  output.rawStopReason = String(choice.finish_reason);
+                  const mapped = mapFinishReason(output.rawStopReason);
+                  output.stopReason = mapped.stopReason;
+                  // An unknown reason reports through the terminal guard after the
+                  // stream is finalised, so the reply keeps what it already streamed.
+                  if (mapped.stopReason === "error") output.errorMessage = mapped.diagnostic;
+                }
+              }
+            } catch (e) {
+              // Skipping a broken data event could silently corrupt text or tool JSON.
+              if (e instanceof SyntaxError) throw new Error("Malformed Qoder SSE data");
+              throw e;
             }
-            if (inner.choices && inner.choices.length > 0) {
-              const choice = inner.choices[0];
-              const delta = choice.delta;
-
-              if (delta) {
-                // 1. Process reasoning/thinking content (API reasoning). DSML
-                // tool calls are also sometimes leaked through this channel, so
-                // route it through the DSML parser too: non-DSML reasoning text
-                // becomes a thinking block, while any embedded tool call is
-                // extracted and replayed as a real tool call instead of showing
-                // up as literal tags inside the thinking.
-                if (delta.reasoning_content) {
-                  processDsmlChunk(delta.reasoning_content, true);
-                }
-
-                // 2. Process text content. DSML tool calls may be embedded in
-                // delta.content when the gateway fails to expose tool_calls.
-                if (delta.content) {
-                  // End API thinking block if active before switching to text or
-                  // a tool call embedded in the content stream.
-                  endApiThinking();
-                  processDsmlChunk(delta.content, false);
-                }
-                // 3. Process native structured tool calls.
-                if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
-                  for (const tc of delta.tool_calls) toolCalls.processNativeDelta(tc);
-                }
-              }
-
-              if (choice.finish_reason) {
-                output.rawStopReason = String(choice.finish_reason);
-                const mapped = mapFinishReason(output.rawStopReason);
-                output.stopReason = mapped.stopReason;
-                // An unknown reason reports through the terminal guard after the
-                // stream is finalised, so the reply keeps what it already streamed.
-                if (mapped.stopReason === "error") output.errorMessage = mapped.diagnostic;
-              }
-            }
-          } catch (e) {
-            // Skipping a broken data event could silently corrupt text or tool JSON.
-            if (e instanceof SyntaxError) throw new Error("Malformed Qoder SSE data");
-            throw e;
           }
+          if (done) break;
         }
-        if (done) break;
+
+        if (queuedNotice) {
+          // The body is spent, so cancel it before waiting: leaving a cancelled read
+          // to undici would surface the notice as a transport `terminated` failure
+          // instead of a wait, and it would hold the connection open meanwhile.
+          void reader.cancel().catch(() => {});
+          reader = undefined;
+          capture?.finish();
+          if (queueEpisodes >= QUEUE_EPISODES_MAX) throw queueWaitExhausted();
+          queueEpisodes++;
+          if (idleTimer) {
+            // The wait is not an idle stream: the gateway owes us no bytes until the
+            // turn comes, so the stream's idle timer must not abort it.
+            clearTimeout(idleTimer);
+            idleTimer = undefined;
+          }
+          throwIfAborted();
+          await waitOutQueue(queuedNotice);
+          // The wait cleared the idle timer, and the re-POST that follows is a fresh
+          // upstream round trip: arm it again so a hung resend fetch is bounded the
+          // same way the first attempt was.
+          resetIdleTimer();
+          continue;
+        }
+
+        throwIfAborted();
+        if (output.stopReason === "pending") {
+          if (!sawDone) throw new Error("Qoder stream ended before a terminal response event (unexpected EOF)");
+          // Some gateway variants send only [DONE], without a finish_reason.
+          output.stopReason = "stop";
+        }
+        break;
       }
 
-      throwIfAborted();
-      if (output.stopReason === "pending") {
-        if (!sawDone) throw new Error("Qoder stream ended before a terminal response event (unexpected EOF)");
-        // Some gateway variants send only [DONE], without a finish_reason.
-        output.stopReason = "stop";
-      }
       if (output.stopReason === "length" && output.content.some((block) => block.type === "toolCall")) {
         throw new Error("Qoder tool call was truncated by the output token limit");
       }
