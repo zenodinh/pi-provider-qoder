@@ -77,6 +77,147 @@ inside it — `src/__tests__/package.test.ts` pins both facts. There is no build
 step: pi loads TypeScript through jiti, so `src/` *is* the published artifact and
 `dist/` is never shipped.
 
+## Wire protocol and request behaviour
+
+The [README](./README.md) is the user guide — install, log in, pick a model, run a
+command. The detail below is what a person *changing the transport* needs, so it
+lives here rather than in the published text.
+
+- **Request signing.** The provider rebuilds Qoder's COSY authorization: an
+  AES-encrypted user blob + RSA-wrapped key, an MD5 signature over path/body, and
+  machine-bound `Cosy-*` headers (client type, OS, machine id/token). The machine
+  id is read from `~/.qoder/.auth/machine_id` or, if absent,
+  `~/.pi/agent/qoder-machine-id` (created if missing).
+- **SSE gateway.** Chat streams from the Qoder `/algo/.../agent_chat_generation`
+  endpoint. Qoder wraps events in an outer envelope with a JSON-string `body`, and
+  can send the `[DONE]` sentinel both bare and wrapped — both are handled, plus a
+  body that stays open after the sentinel.
+- **Agentic "runs".** Qoder groups billing/records per agentic run. The provider
+  infers run boundaries from the message tail and reuses a run-scoped
+  `request_set_id` + `business` (stable id/name, advancing `init` → `start` →
+  `processing`) across tool rounds, so the Credit ledger shows one aggregated
+  entry per user prompt instead of many tiny ones. The run-identity fixes are
+  ungated; see `QODER_CORE_PLAN` below.
+- **Tool calls.** Native structured `tool_calls` and DSML tool markup embedded in
+  the text stream are both parsed into pi tool calls. Images returned by tools
+  (e.g. screenshots, `read`) are forwarded to the model as data-URL image parts.
+- **Prompt cache.** A stable session id derived from your user id + model keeps
+  prompt-cache affinity across consecutive requests in a session: the legacy
+  envelope carries it as `session_id`, and v2 carries it both in
+  `metadata.context.session_id` and — matching qodercli's OpenAI-protocol
+  convention — as `prompt_cache_key` plus `session_id` / `x-client-request-id` /
+  `x-session-affinity` headers. Recorded traffic shows the server-side lifetime is
+  minutes (no large re-bill was observed at a 1-5 minute idle gap; the first
+  deaths appear at ~6 minutes), so the provider declares `promptCache.short` =
+  300 s.
+- **History repair.** Before sending, orphaned tool results, dropped
+  (error/aborted) assistant turns, and placeholderless tool-call messages are
+  repaired so Qoder never rejects a request with "tool must follow a message with
+  tool_calls". `src/protocol/transform.ts` owns this, not pi.
+- **Credential storage.** Credentials are managed by the host (pi uses
+  `~/.pi/agent/`, or `PI_CODING_AGENT_DIR`; OMP uses its own store). Identity
+  lookups are cached only in memory and never overwrite credentials;
+  `auth.json` holds the exchanged credentials per provider plus the resolved user
+  identity (`userID`/`email`/`name`/`machineID`).
+- **Cache warming (opt-in).** With pi's `cacheWarming` setting **and** this
+  extension's approval (`QODER_CACHE_WARM=1`, or `qoder-warm-approval.json` —
+  env over file over off, re-evaluated at every decision), pi re-sends the last
+  request with a one-token output cap before the declared lifetime expires, for
+  up to 30 minutes of idle. Each opportunity is budget-governed: spend since the
+  last real turn (USD, from Qoder's own Credits or priced v2 rows) must stay
+  under `QODER_WARM_BUDGET` × the protected miss, and models with a published
+  learned rate are capped by it. At session start the provider learns per-model
+  lifetimes and rate fits from the session ledger, writes them atomically to
+  `~/.pi/agent/qoder-cache-lifetime.json`, and re-registers the learned values.
+  Rolling warming back takes **both** deleting the approval file and unsetting
+  the env — either alone leaves the other armed. Code: `src/warm-gate.ts`,
+  `src/warm-guard.ts`, `src/lifetime.ts`; per-decision detail is a
+  `QODER_DEBUG=1` metric, and `/qoder-cache` reads the always-on ledger.
+
+### Host request compatibility
+
+The custom stream supports pi's `onPayload` (before encoding/signing),
+`onResponse` (before reading the body, including HTTP errors), injected `fetch`
+(chat and identity lookup), `headers`, `env`, `timeoutMs`, `temperature`, and
+model/request `maxTokens`. Header overrides are case-insensitive; `null` removes a
+default. Overriding COSY authentication headers can invalidate signatures. A
+model `baseUrl` override must point to a Qoder-compatible gateway, not a generic
+OpenAI endpoint. `onProviderStreamEvent` is honored on the v2 transport only:
+pi-ai's completions stream invokes the host hook for each parsed event before
+normalization, while the legacy transport does not call it.
+
+### `text_end` frames
+
+Legacy turns now close each text block with a `text_end` event, matching v2's
+event vocabulary. The host maps every `text_end` to a `message_update` frame, so
+`--json` output gains one frame per text block on legacy. A `--json` consumer
+that counted frames before this change sees one more per text block.
+
+### Protocol choice
+
+Legacy is the default for every key (owner decision 2026-10-09). v2 is the
+BYOK-oriented transport — Qoder exposes it to bring-your-own-key usage, some
+accounts cannot reach an upstream through it at all, and its model server has
+refused instruction roles and cap values the legacy gateway accepts — so opting
+in needs an explicit `QODER_PROTOCOL=v2` **and** a key the bundled routing table
+lists as v2-eligible (`~/.pi/agent/qoder-routing.json` overrides the table).
+`QODER_PROTOCOL=legacy` forces the legacy path, `QODER_MODEL_SERVER_HOST`
+overrides the v2 model-server base URL (for example to reach a v2 host from the
+China region), and `QODER_FALLBACK=1` retries a turn once on the legacy transport
+when the v2 model-server rejects a model key, caching the correction for the
+session. `src/protocol/router.ts` is the resolver.
+
+### Retry behavior
+
+This provider never retries a chat POST inside its own `fetch` layer. `src/retry.ts` retries non-billable requests only — `fetchWithRetry` forces a single attempt for every non-GET method — so that layer never replays a POST. That GET-only policy is unchanged. Transport remains SSE. (There are two deliberate exceptions to that, both outside the `fetch` layer. The first is the opt-in `QODER_FALLBACK` self-heal, which fires only when the v2 model-server rejects a model key before a generation starts. The second is the queue wait: when the gateway answers that the model is busy — status 403 with code `10605` — the turn waits instead of failing, then re-sends the same conversation with a new request id and a fresh signature. That wait is bounded by `QODER_QUEUE_MAX_WAIT_MS` and three episodes, and `QODER_QUEUE_WAIT=0` turns it off.)
+
+A turn that hits the stream idle timeout or the request deadline with an answer already streaming is not replayed either: it is finished once from the partial answer, which is a NEW request whose tail is that partial answer plus a continuation prompt — not a resend of the same body — so it spends one extra request, and `QODER_RESUME_TIMEOUT=0` turns it off.
+
+Two retry layers sit above it, and they differ:
+
+- **Agent-level retry (pi; both protocols).** pi's agent loop retries a failed
+  assistant turn by matching the rendered error text against
+  `isRetryableAssistantError`. It is armed by default in pi (`settings.retry.enabled`),
+  covers both the legacy COSY transport and v2, and re-dispatches the turn with
+  bounded exponential backoff. This provider writes its error text to match that
+  classifier, so a stream that ends without a terminal response event is retried
+  where it previously was not.
+- **Provider-level HTTP retry (pi-ai; v2's model-server calls).** pi-ai can retry
+  the HTTP request itself, but it is disarmed unless you set
+  `settings.retry.provider.maxRetries`. Arming it silently retries v2's billable
+  chat POSTs, which can duplicate billing and spend — it changes spend with no
+  code change and no test. This is the tripwire: leave it unset unless you have
+  measured the cost. The owner's settings leave it unset.
+
+## Environment reference
+
+Every knob, including the rollout gates and debug switches the published README
+leaves out.
+
+| Variable | Purpose |
+| --- | --- |
+| `QODER_API_KEY`, `QODER_PERSONAL_ACCESS_TOKEN`, `QODER_PAT` | Global PAT (first non-empty wins); an exported PAT is authoritative and re-exchanged on every startup, so an old cached token never shadows it. |
+| `QODERCN_API_KEY`, `QODERCN_PERSONAL_ACCESS_TOKEN`, `QODERCN_PAT` | China PAT (first non-empty wins), same rules. |
+| `QODER_STREAM_IDLE_TIMEOUT_MS` | Stream idle timeout override (default `120000` ms). |
+| `QODER_RESUME_TIMEOUT` | Set to `0` to fail a turn that hits the stream idle timeout or the request deadline instead of finishing it (the pre-resume behaviour: the turn ends with that error, no extra request). Any other value, or unset, finishes it once from the partial answer. |
+| `QODER_QUEUE_WAIT` | Set to `0` to fail a queued turn immediately instead of waiting for it (the pre-queue behaviour: the gateway's status 403 with code `10605` becomes an error, no polling, no replay). Any other value, or unset, waits. |
+| `QODER_QUEUE_MAX_WAIT_MS` | How long one turn may spend waiting in a busy model's queue before it fails (default `3600000` ms). While queued, the provider polls the queue-status endpoint and re-sends the same conversation with a fresh request id when the gateway says its turn has come, for at most three episodes per turn. |
+| `QODER_STREAM_DELTA_INTERVAL_MS` | Minimum gap between streamed text/thinking deltas (default `50` ms). Higher values cut UI CPU on long responses. |
+| `QODER_PROTOCOL` | Force `v2` or `legacy` for every request, overriding the routing table. |
+| `QODER_MODEL_SERVER_HOST` | Override the v2 model-server base URL (for example to reach a v2 host from the China region). |
+| `QODER_FALLBACK` | Set to `1` to retry a turn once on the legacy transport when the v2 model-server rejects a model key (stale routing); the correction is cached for the session. Off by default. |
+| `QODER_CORE_PLAN` | Set to `1` to route every dispatch through the turn-plan producer (one awaited plan feeding both adapters the session forms, affinity placements, thinking inputs and capture metadata). Off (default) keeps the pre-migration dispatch path — an env-flip rollback kept for one release. The run-identity fixes are ungated and stay on with the gate off. |
+| `QODER_CORE_STAMP` | Set to `1` to wrap the legacy tail in the shared ordered terminal stamp (terminal-before-end guarantee, priced-only rate-source stamps). Off (default) keeps the pre-migration assembly-site stamps. Transitional, kept one release. |
+| `QODER_LEGACY_AFFINITY` | Set to `off` to suppress every legacy cache-affinity placement (the probe-gated `prompt_cache_key` body field and the unsigned header trio) at request time, no rebuild — the rollback path for a promoted placement. |
+| `QODER_LEGACY_CONTEXT_LENGTH` | Set to `off` to remove `context_length` from the legacy request body at request time, no rebuild — the rollback path for the promoted top-level-number placement. |
+| `QODER_CACHE_WARM` | Set to `1` to approve pi's cache-warming refreshes on every provider, or `0` to veto them even where the approval file arms one (still requires pi's `cacheWarming` setting; refreshes spend Credits). Either value overrides `qoder-warm-approval.json`. With the gate on, refreshes are budget-governed per opportunity (`QODER_WARM_BUDGET`). |
+| `QODER_WARM_BUDGET` | Fraction of the protected cache miss an idle window may spend on refreshes (default `0.5`); `off` disables the cap. Invalid values fall back to `0.5` with one debug entry. |
+| `QODER_DEBUG` | Capture diagnostics to per-session JSONL files under `~/.pi/agent/logs/qoder-debug/<sessionId>.jsonl` — every chat request (decoded body + redacted headers) and its raw server response, on both transports, plus best-effort failure notes (catalog refresh, PAT exchange fallthrough, userinfo lookup) and per-decision cache-warming verdicts. Nothing is written to the console/TUI. Malformed SSE and token refresh failures are always surfaced as errors regardless of this flag. |
+| `QODER_DEBUG_DIR` | Override the debug capture directory (default `~/.pi/agent/logs/qoder-debug`). |
+| `QODER_DEBUG_KEEP` | Session files retained before oldest-first pruning (default `50`). |
+| `QODER_DEBUG_HEADERS` | Set to `1` to include auth-bearing headers verbatim; by default `Authorization`/`Cosy-*`/token-shaped headers are redacted to their length. |
+| `QODER_DEBUG_MAX_BYTES` | Per-record cap for request bodies and response SSE text (default `2000000`; longer values are truncated and flagged). |
+
 ## CI gates
 
 Every pull request runs two gates on top of lint, types and the test suite. Both
@@ -240,7 +381,9 @@ version bump. Re-check:
   `src/__tests__/package.test.ts`. Move a pinned sentence out of the README and
   the suite fails — update the pin in the same change, as this file's
   [Releasing](#releasing) and [Contracts to re-check](#contracts-to-re-check-after-upgrading-pi)
-  sections do.
+  sections do. The retry, protocol and `text_end` facts below are pinned in the
+  AGENTS.md block of that test, because the detail moved here and the README now
+  carries the guide instead.
 - **This file is not published.** `files` ships `src/` and `README.md` only, so
   repo rules stay out of the user's install.
 - **Conventional commits**, one logical change per commit, pull requests only —
