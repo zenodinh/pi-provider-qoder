@@ -143,6 +143,74 @@ describe("ThinkingTagParser", () => {
     ]);
   });
 
+  it("keeps a complete matching pair as one thinking block", () => {
+    const parser = new ThinkingTagParser(output, stream);
+    parser.processChunk("<thought>only reasoning</thought>");
+    parser.finalize();
+
+    expect(output.content).toEqual([{ type: "thinking", thinking: "only reasoning" }]);
+    const eventTypes = collectEvents(pushMock).map((event) => event.type);
+    expect(eventTypes).toContain("thinking_start");
+    expect(eventTypes).not.toContain("text_start");
+  });
+
+  // Upstream sometimes pairs an opener of one variant with a closer of another
+  // (`<think>` … `</thinking>`). Closing only on the opener's own variant left
+  // the block open and appended the rest of the visible answer to it.
+  it.each([
+    ["<think>h</thinking>", "<think> opener, </thinking> closer"],
+    ["<thinking>h</think>", "<thinking> opener, </think> closer"],
+    ["<reasoning>h</summary>", "<reasoning> opener, </summary> closer"],
+    ["<thought>h</reasoning>", "<thought> opener, </reasoning> closer"],
+  ])("closes on any variant's closer: %s (%s)", (tagged) => {
+    const parser = new ThinkingTagParser(output, stream);
+    parser.processChunk(`BEFORE ${tagged} AFTER`);
+    parser.finalize();
+
+    expect(output.content).toEqual([
+      { type: "text", text: "BEFORE " },
+      { type: "thinking", thinking: "h" },
+      { type: "text", text: " AFTER" },
+    ]);
+  });
+
+  it("closes on a mismatched closer split across chunks", () => {
+    // The closer is a partial prefix in the chunk that ends the thinking text, so
+    // the parser must hold it instead of leaking `</reason` into the block.
+    const parser = new ThinkingTagParser(output, stream);
+    parser.processChunk("BEFORE <thin");
+    parser.processChunk("k>hidden</reason");
+    parser.processChunk("ing> AFTER");
+    parser.finalize();
+
+    expect(output.content).toEqual([
+      { type: "text", text: "BEFORE " },
+      { type: "thinking", thinking: "hidden" },
+      { type: "text", text: " AFTER" },
+    ]);
+  });
+
+  // invented: reproduces the session 01a102d3 leak, where the assistant listed
+  // these very tag variants in prose and the literal `<think>` was taken as an
+  // opener with no closer, hiding the rest of the answer.
+  it("keeps an unclosed tag in ordinary prose as visible text", () => {
+    const parser = new ThinkingTagParser(output, stream);
+    const prose = "标签变体（`<think>`/`<reasoning>`/`<thought>`/`<summary>`）都有测试覆盖。";
+    parser.processChunk(prose);
+    parser.finalize();
+
+    expect(output.content).toEqual([{ type: "text", text: prose }]);
+  });
+
+  it("holds a prose opener across chunks and flushes it as text at finalize", () => {
+    const parser = new ThinkingTagParser(output, stream);
+    parser.processChunk("写法是 `<think>` ");
+    parser.processChunk("而不是别的写法");
+    parser.finalize();
+
+    expect(output.content).toEqual([{ type: "text", text: "写法是 `<think>` 而不是别的写法" }]);
+  });
+
   // ── Chunked streaming ─────────────────────────────────────────────────
 
   it("handles thinking content split across multiple chunks", () => {
@@ -292,16 +360,17 @@ describe("ThinkingTagParser", () => {
     expect(output.content[thinkingDelta?.contentIndex ?? -1]?.type).toBe("thinking");
   });
 
-  it("finalize flushes remaining thinking when in thinking mode", () => {
+  it("flushes an unclosed opener as text at finalize", () => {
+    // A tag that never closes is ambiguous, so it stays visible text rather than
+    // hiding a possibly-long answer inside a thinking block.
     const parser = new ThinkingTagParser(output, stream);
     parser.processChunk("<thinking>unfinished");
     parser.finalize();
 
-    expect(output.content).toHaveLength(1);
-    expect(output.content[0]).toMatchObject({ type: "thinking", thinking: "unfinished" });
+    expect(output.content).toEqual([{ type: "text", text: "<thinking>unfinished" }]);
   });
 
-  it("flushes pending thinking at a tool boundary without ending the parser", () => {
+  it("flushes an unclosed opener as text at a tool boundary without ending the parser", () => {
     const parser = new ThinkingTagParser(output, stream);
     parser.processChunk("<thinking>reason<");
     parser.flushAtBoundary();
@@ -309,11 +378,11 @@ describe("ThinkingTagParser", () => {
     parser.finalize();
 
     expect(output.content).toEqual([
-      { type: "thinking", thinking: "reason<" },
+      { type: "text", text: "<thinking>reason<" },
       { type: "text", text: "after" },
     ]);
     const eventTypes = pushMock.mock.calls.map((call) => call[0].type);
-    expect(eventTypes.indexOf("thinking_end")).toBeLessThan(eventTypes.indexOf("text_start"));
+    expect(eventTypes.filter((type) => type.startsWith("thinking"))).toEqual([]);
   });
 
   // ── Orphan closing tags (opener arrived via reasoning_content) ─────────
@@ -480,9 +549,9 @@ describe("ThinkingTagParser", () => {
     expect(pushMock.mock.calls.length).toBe(emitted);
   });
 
-  it("T-04 finalize mid-thinking emits thinking_end and no text_end", () => {
+  it("T-04 finalize after a complete pair emits thinking_end and no text_end", () => {
     const parser = new ThinkingTagParser(output, stream);
-    parser.processChunk("<thinking>unfinished</thin");
+    parser.processChunk("<thinking>finished</thinking>");
     parser.finalize();
 
     const types = collectEvents(pushMock).map((event) => event.type);

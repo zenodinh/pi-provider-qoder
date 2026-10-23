@@ -20,6 +20,9 @@ export const THINKING_TAG_VARIANTS: Array<{ open: string; close: string }> = [
 /** Every opener/closer string that can appear in the text channel. */
 const ALL_TAG_STRINGS: readonly string[] = THINKING_TAG_VARIANTS.flatMap((variant) => [variant.open, variant.close]);
 
+/** Every closer, in the order the variants are declared. */
+const CLOSE_TAGS: readonly string[] = THINKING_TAG_VARIANTS.map((variant) => variant.close);
+
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -79,6 +82,29 @@ function findEarliestTag(text: string): FoundTag | null {
   return best;
 }
 
+interface CloseTag {
+  /** Index of the closer inside the scanned text. */
+  index: number;
+  /** The closer string that matched. */
+  tag: string;
+}
+
+/**
+ * Earliest closer of *any* variant in `text`, if any. Both the thinking phase and
+ * the decision to enter it use this: upstream pairs tags across variants
+ * (`<think>` … `</thinking>`, `<reasoning>` … `</summary>`), so a search limited to
+ * the opener's own variant would never close the block and would append the rest
+ * of the visible answer to it.
+ */
+function findEarliestCloseTag(text: string): CloseTag | null {
+  let best: CloseTag | null = null;
+  for (const tag of CLOSE_TAGS) {
+    const index = text.indexOf(tag);
+    if (index !== -1 && (best === null || index < best.index)) best = { index, tag };
+  }
+  return best;
+}
+
 /** Drop a single leading newline pair, or a lone newline, after a tag. */
 function stripFollowingNewline(text: string): string {
   if (text.startsWith("\n\n")) return text.slice(2);
@@ -126,7 +152,6 @@ export interface ThinkingTagParserOptions {
 export class ThinkingTagParser {
   private buffer = "";
   private phase: Phase = "text";
-  private activeEndTag: string = THINKING_TAG_VARIANTS[0].close;
   // Set once at least one thinking block has been completed. Used only to end
   // the current text block before a *later* thinking block starts, so the
   // thinking block does not reuse that block's index.
@@ -159,8 +184,9 @@ export class ThinkingTagParser {
   /**
    * Flush content before an out-of-band tool-call boundary. Unlike finalize(),
    * this keeps the parser reusable for text that arrives after the tool call.
-   * Any unclosed thinking text (including a held partial tag) is emitted as
-   * thinking content before the block is closed.
+   * A held opener — a tag whose closer has not arrived — flushes as text; the
+   * thinking-phase branch below is the flush path for a block left open, which
+   * the opener guard in scan() prevents today.
    */
   flushAtBoundary(): void {
     // Plain-text mode never holds a buffer or enters a thinking phase, so a
@@ -206,18 +232,25 @@ export class ThinkingTagParser {
       if (this.phase === "text") {
         const tag = findEarliestTag(this.buffer);
 
-        // A real thinking block starts here: hand the preceding text over,
-        // then switch into thinking mode.
+        // A thinking block only starts here once its closer is already in the
+        // buffer. An opener that never closes — the model writing `<thinking>`
+        // while explaining these very tags in ordinary prose, for instance — must
+        // stay visible text instead of swallowing the rest of the answer; a held
+        // opener is flushed as text by finalize()/flushAtBoundary().
         if (tag?.kind === "open") {
-          if (tag.index > 0) this.emitText(this.buffer.slice(0, tag.index));
-          this.buffer = this.buffer.slice(tag.index + tag.variant.open.length);
+          if (tag.index > 0) {
+            this.emitText(this.buffer.slice(0, tag.index));
+            this.buffer = this.buffer.slice(tag.index);
+          }
+          const afterOpener = this.buffer.slice(tag.variant.open.length);
+          if (!findEarliestCloseTag(afterOpener)) break;
           // Never insert a thinking block in front of text that has already
           // emitted events: end text tracking so the thinking block gets its
           // own fresh index.
           if (this.sawThinkingBlock && this.textBlockIndex !== null) {
             this.closeText();
           }
-          this.activeEndTag = tag.variant.close;
+          this.buffer = afterOpener;
           this.phase = "thinking";
           continue;
         }
@@ -244,17 +277,19 @@ export class ThinkingTagParser {
         continue;
       }
 
-      // Thinking phase: look for the closer of the active variant.
-      const end = this.buffer.indexOf(this.activeEndTag);
-      if (end !== -1) {
-        if (end > 0) this.emitThinking(this.buffer.slice(0, end));
-        this.buffer = this.buffer.slice(end + this.activeEndTag.length);
+      // Thinking phase: close on the earliest closer of ANY variant, not just
+      // the opener's own. A mismatched pair then still terminates the block
+      // instead of pulling the rest of the answer into it.
+      const close = findEarliestCloseTag(this.buffer);
+      if (close) {
+        if (close.index > 0) this.emitThinking(this.buffer.slice(0, close.index));
+        this.buffer = this.buffer.slice(close.index + close.tag.length);
         // Models often follow the closer with a blank line; drop it.
         if (this.buffer.startsWith("\n\n")) this.buffer = this.buffer.slice(2);
         this.closeThinking(false);
         continue;
       }
-      const hold = partialTagSuffixLength(this.buffer, [this.activeEndTag]);
+      const hold = partialTagSuffixLength(this.buffer, CLOSE_TAGS);
       const safeLength = this.buffer.length - hold;
       if (safeLength <= 0) break;
       this.emitThinking(this.buffer.slice(0, safeLength));
