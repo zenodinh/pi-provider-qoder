@@ -14,15 +14,20 @@ import { ToolCallAccumulator } from "../protocol/tool-calls.ts";
  * The error contract is unchanged: repair never completes structure, so a call
  * cut off by the output limit still throws
  * "Invalid or truncated Qoder tool call arguments".
+ *
+ * Both the repair and that text live on the host-less path — `null` for the
+ * finished-arguments parser. A host that exports `parseToolCallArguments`
+ * reports malformed arguments as `argumentsError` instead; that path is pinned
+ * in `tool-calls-host-parse.test.ts`.
  */
 function decode(value: string): unknown {
   return JSON.parse(repairJsonEscapes(value));
 }
 
-/** Drive one native tool call through the accumulator the way stream.ts does. */
+/** Drive one native tool call through the accumulator the way a legacy host does. */
 function finishNativeCall(argumentsValue: unknown): ToolCall {
   const output = { content: [] } as unknown as AssistantMessage;
-  const accumulator = new ToolCallAccumulator(output, () => {});
+  const accumulator = new ToolCallAccumulator(output, () => {}, null);
   accumulator.processNativeDelta({ index: 0, id: "call_1", function: { name: "bash", arguments: argumentsValue } });
   accumulator.finalize();
   return output.content[0] as ToolCall;

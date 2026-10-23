@@ -1,6 +1,7 @@
 // shape: adapter — the host's compat facade does not match the local need for a
 //   guaranteed-present, named-failure acquisition, so the conversion happens
 //   here once instead of at every use site.
+import * as piAi from "@earendil-works/pi-ai";
 import * as qoderCompat from "@earendil-works/pi-ai/compat";
 import { debugLog } from "./debug.js";
 
@@ -18,6 +19,11 @@ import { debugLog } from "./debug.js";
  * `exports` map. So `@earendil-works/pi-ai/api/openai-completions` (or any other
  * `/api/*` path) passes local `tsc` and then fails at host load.
  * `host-seam.test.ts` enforces this over the `src` tree.
+ *
+ * The seam also reads one OPTIONAL symbol off the package root,
+ * `parseToolCallArguments`, which hosts older than pi-ai 1.3.0 do not export.
+ * That one is a capability, not a contract: an absent export is `undefined`,
+ * never a seam throw, because the caller has a correct fallback without it.
  *
  * Re-check after every pi upgrade (OB-2): this module, the wire/error parity
  * suites, the host's retry-classifier prose, and the history-repair dependency
@@ -57,6 +63,33 @@ export function openAICompletionsApi(): ReturnType<typeof qoderCompat.openAIComp
     throw missingCompatibility("openAICompletionsApi().streamSimple");
   }
   return api;
+}
+
+/**
+ * What a finished tool call's argument text reduces to on the host: the parsed
+ * object, or `argumentsError` describing why there is none. The host carries
+ * that diagnostic on the call so tool validation reports it to the model,
+ * instead of the turn failing at the provider.
+ */
+export type FinishedArguments = Pick<piAi.ToolCall, "arguments" | "argumentsError">;
+
+/** The host's parser for one finished tool call's complete argument text. */
+export type ParseToolCallArguments = (json: string | undefined) => FinishedArguments;
+
+/**
+ * The host's `parseToolCallArguments`, or `undefined` on a host that does not
+ * export it yet. Optional by design — the accumulator keeps its own strict
+ * parse plus the escape repair when this returns `undefined`.
+ *
+ * A property read, not a named import: a named import of a symbol an older
+ * published host lacks throws at module link time, taking the whole extension
+ * down before any capability check could run.
+ */
+export function hostParseToolCallArguments(): ParseToolCallArguments | undefined {
+  // boundary: the host module is JavaScript this repo does not check at
+  // runtime, so the export is narrowed by `typeof` before it is called.
+  const parse: unknown = (piAi as Record<string, unknown>).parseToolCallArguments;
+  return typeof parse === "function" ? (parse as ParseToolCallArguments) : undefined;
 }
 
 /**

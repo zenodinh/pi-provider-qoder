@@ -395,16 +395,24 @@ describe("streamQoder", () => {
     });
   });
 
-  it.each(["tool_calls", "length"])("never executes truncated tool arguments on %s", async (reason) => {
+  it("never executes a tool call cut off by the output token limit", async () => {
+    // A `tool_calls` finish carrying the same bytes is no longer a failure: on a
+    // host that exports `parseToolCallArguments` the finished call carries
+    // `argumentsError` and tool validation reports it to the model
+    // (`tool-calls-host-parse.test.ts`). Only `length` — the output cap — is a
+    // terminal failure, and that guard runs before finalisation.
     globalThis.fetch = mockFetch(
       sseEnvelope(
         chunk({ tool_calls: [{ index: 0, id: "call", function: { name: "bash", arguments: '{"command":' } }] }),
       ) +
-        sseEnvelope(finishChunk(reason)) +
+        sseEnvelope(finishChunk("length")) +
         DONE_SSE,
     );
     const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
-    expect(events.at(-1)?.type).toBe("error");
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      error: { errorMessage: "Qoder tool call was truncated by the output token limit" },
+    });
     expect(events.some((event) => event.type === "toolcall_end")).toBe(false);
   });
 
