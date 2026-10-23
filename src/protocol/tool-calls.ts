@@ -1,4 +1,5 @@
 import type { AssistantMessage, AssistantMessageEventStream, JsonObject, ToolCall } from "@earendil-works/pi-ai";
+import { repairJsonEscapes } from "./json-repair.ts";
 
 export type ToolCallStreamEvent = Parameters<AssistantMessageEventStream["push"]>[0];
 
@@ -7,7 +8,9 @@ type ToolCallDelta = {
   id?: string;
   function?: {
     name?: string;
-    arguments?: string;
+    // A string fragment on every documented transport, but the gateway also
+    // sends an already-parsed object; see `argumentText`.
+    arguments?: unknown;
   };
 };
 
@@ -52,9 +55,8 @@ export class ToolCallAccumulator {
       block.name = state.name;
     }
 
-    if (delta.function?.arguments) {
-      this.appendArguments(state, delta.function.arguments);
-    }
+    const argumentsDelta = argumentText(delta.function?.arguments);
+    if (argumentsDelta) this.appendArguments(state, argumentsDelta);
   }
 
   startDsmlCall(id: string, name: string): void {
@@ -148,12 +150,50 @@ export class ToolCallAccumulator {
   }
 }
 
+/**
+ * Normalize a streamed argument fragment to text.
+ *
+ * `function.arguments` is documented as a string fragment, but the gateway
+ * sometimes delivers an already-parsed object. String-concatenating that
+ * accumulated "[object Object]" and the call then failed with the same
+ * "Invalid or truncated Qoder tool call arguments" as a genuine cut-off.
+ */
+function argumentText(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (value && typeof value === "object") return JSON.stringify(value);
+  return undefined;
+}
+
+/**
+ * Parse finished argument text as an object.
+ *
+ * A model copying a source file into an `edit` argument can emit a complete call
+ * whose string literals are not legal JSON (a raw control character, or a
+ * backslash that starts no escape), so illegal bytes inside string literals are
+ * re-escaped once and the call parsed again. Structure is never repaired: a call
+ * cut off by the output limit still fails here.
+ */
 function parseArguments(value: string): JsonObject {
+  const parsed = parseJsonObject(value);
+  if (parsed) return parsed;
+
+  // Only pay for a second parse when the repair actually changed the bytes.
+  const repaired = repairJsonEscapes(value);
+  if (repaired !== value) {
+    const repairedObject = parseJsonObject(repaired);
+    if (repairedObject) return repairedObject;
+  }
+
+  throw new Error("Invalid or truncated Qoder tool call arguments");
+}
+
+/** Parse argument text as a JSON object, or return null when it is not one. */
+function parseJsonObject(value: string): JsonObject | null {
   try {
     const parsed: unknown = JSON.parse(value || "{}");
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
       return parsed as JsonObject;
     }
   } catch {}
-  throw new Error("Invalid or truncated Qoder tool call arguments");
+  return null;
 }

@@ -817,6 +817,43 @@ describe("streamQoder", () => {
     ]);
   });
 
+  it("repairs escape damage in a finished edit call instead of failing the turn", async () => {
+    // A model writing kernel/C sources copies the file's bytes into an `edit`
+    // argument, so the streamed JSON carries raw newlines inside a string
+    // literal. JSON.parse rejected the whole call and the turn died with
+    // "Invalid or truncated Qoder tool call arguments" although the arguments
+    // were complete — so the edit never ran.
+    const argumentsText =
+      '{"path":"/tmp/main.c","old_text":"int main(void) {","new_text":"int main(void) {\n  return 0;\n}"}';
+    // The bytes above are a real newline, so the argument text is not legal JSON
+    // until the repair re-escapes them.
+    expect(() => JSON.parse(argumentsText)).toThrow();
+    const sse =
+      sseEnvelope(
+        chunk({ tool_calls: [{ index: 0, id: "call_edit", function: { name: "edit", arguments: argumentsText } }] }),
+      ) +
+      sseEnvelope(finishChunk("tool_calls")) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+    const done = events.at(-1) as { message: AssistantMessage };
+    const toolCall = done.message.content.find((block): block is ToolCall => block.type === "toolCall");
+
+    expect(done).toMatchObject({ type: "done" });
+    expect(toolCall).toEqual({
+      type: "toolCall",
+      id: "call_edit",
+      name: "edit",
+      arguments: {
+        path: "/tmp/main.c",
+        old_text: "int main(void) {",
+        new_text: "int main(void) {\n  return 0;\n}",
+      },
+    });
+    expect(done.message.stopReason).toBe("toolUse");
+  });
+
   it("keeps tagged thinking event indexes stable after streamed text", async () => {
     const sse =
       sseEnvelope(chunk({ content: "prefix <thinking>reason</thinking> answer" })) +
