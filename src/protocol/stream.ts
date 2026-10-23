@@ -959,6 +959,15 @@ export function streamQoder(
       } else if (output.stopReason === "toolUse") {
         throw new Error("Qoder finished with tool_calls but returned no tool calls");
       }
+      // A gateway that folds a hit cap into `finish_reason: "stop"` would report a
+      // truncated answer as a complete one. When this request owned a cap, that
+      // cap is ground truth: usage at or past it means the model ran out of room,
+      // whatever the gateway called the terminal. Without an owned cap there is
+      // nothing to compare against, so the gateway's word stands. A warm turn's
+      // one-token cap goes through the same arithmetic.
+      if (maxTokens !== undefined && output.usage.output >= maxTokens && output.stopReason === "stop") {
+        output.stopReason = "length";
+      }
       if (output.stopReason === "error" || output.stopReason === "aborted") {
         throw new Error(output.errorMessage || "Qoder generation failed");
       }

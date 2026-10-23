@@ -693,6 +693,78 @@ describe("streamQoder", () => {
     expect((done as { reason: string }).reason).toBe("length");
   });
 
+  // The four cases below pin one rule: when this provider put `max_tokens` on
+  // the wire, an answer whose usage reached that cap is truncated even if the
+  // gateway closed the stream with `finish_reason: "stop"`. Without an owned
+  // cap there is no ground truth, so the gateway's word stands.
+  // invented: a minimal cap-shaped turn — one text delta, one usage-bearing
+  // finish chunk — because no recording exercises a hit cap; the numbers are
+  // the rule's boundary (100 of 100, 40 of 100), not a charge that gets priced.
+  it("reports length when the owned output cap was reached on a stop finish", async () => {
+    const sse =
+      sseEnvelope(chunk({ content: "partial", role: "assistant" })) +
+      sseEnvelope(finishChunk("stop", { usage: { prompt_tokens: 10, completion_tokens: 100, total_tokens: 110 } })) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake", maxTokens: 100 }));
+
+    const done = events.find((e) => e.type === "done");
+    expect(done, "expected a done event").toBeDefined();
+    expect((done as { reason: string }).reason).toBe("length");
+    expect((done as { message: AssistantMessage }).message.stopReason).toBe("length");
+  });
+
+  it("keeps stop when the answer stayed under the owned output cap", async () => {
+    const sse =
+      sseEnvelope(chunk({ content: "complete", role: "assistant" })) +
+      sseEnvelope(finishChunk("stop", { usage: { prompt_tokens: 10, completion_tokens: 40, total_tokens: 50 } })) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake", maxTokens: 100 }));
+
+    const done = events.find((e) => e.type === "done");
+    expect(done, "expected a done event").toBeDefined();
+    expect((done as { reason: string }).reason).toBe("stop");
+    expect((done as { message: AssistantMessage }).message.stopReason).toBe("stop");
+  });
+
+  it("keeps stop when this provider owned no output cap", async () => {
+    // Neither the catalog nor the caller capped this turn, so `max_tokens` never
+    // reached the wire (pinned in wire-vocabulary.test.ts) and the local count
+    // matching nothing is not evidence of truncation.
+    const sse =
+      sseEnvelope(chunk({ content: "complete", role: "assistant" })) +
+      sseEnvelope(finishChunk("stop", { usage: { prompt_tokens: 10, completion_tokens: 40, total_tokens: 50 } })) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    const done = events.find((e) => e.type === "done");
+    expect(done, "expected a done event").toBeDefined();
+    expect((done as { reason: string }).reason).toBe("stop");
+    expect((done as { message: AssistantMessage }).message.stopReason).toBe("stop");
+  });
+
+  it("leaves the toolUse terminal alone on a capped turn that ended in tool_calls", async () => {
+    const sse =
+      sseEnvelope(
+        chunk({
+          tool_calls: [{ index: 0, id: "call_1", function: { name: "bash", arguments: '{"command":"ls"}' } }],
+        }),
+      ) +
+      sseEnvelope(
+        finishChunk("tool_calls", { usage: { prompt_tokens: 10, completion_tokens: 100, total_tokens: 110 } }),
+      ) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake", maxTokens: 100 }));
+
+    const done = events.find((e) => e.type === "done");
+    expect(done, "expected a done event").toBeDefined();
+    expect((done as { reason: string }).reason).toBe("toolUse");
+    expect((done as { message: AssistantMessage }).message.stopReason).toBe("toolUse");
+  });
+
   it("reports a tool_use stop reason when the stream emits tool calls", async () => {
     const sse =
       sseEnvelope(
