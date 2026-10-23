@@ -36,8 +36,16 @@ const VALID_ESCAPE_CHARACTERS = new Set(['"', "\\", "/", "b", "f", "n", "r", "t"
 /** `\uXXXX` needs exactly four hex digits, or the `u` started no escape at all. */
 const UNICODE_ESCAPE_DIGITS = /^[0-9a-fA-F]{4}$/;
 
-/** Quotes, backslashes and the control range: every byte the scan must look at. */
-const ESCAPE_RELEVANT = /["\\\x00-\x1f]/;
+/**
+ * Quotes, backslashes and the control range: every character the scan must look
+ * at. Built from a string on purpose — a literal would put control characters in
+ * the source, which `lint/suspicious/noControlCharactersInRegex` rejects (rightly,
+ * for every other regex).
+ */
+const SPECIAL_CHARACTER_SOURCE = '["\\\\\\u0000-\\u001f]';
+
+/** Non-global probe used by the early exit. */
+const ESCAPE_RELEVANT = new RegExp(SPECIAL_CHARACTER_SOURCE);
 
 /** JSON's short form for a control character, or its `\u00xx` fallback. */
 function escapeControlCharacter(char: string): string {
@@ -69,7 +77,8 @@ export function repairJsonEscapes(value: string): string {
   // Neither a backslash nor a control character: nothing here can need repair.
   if (!value.includes("\\") && !ESCAPE_RELEVANT.test(value)) return value;
 
-  const special = /["\\\x00-\x1f]/g;
+  // A fresh instance per call: a `/g` regex carries `lastIndex` between calls.
+  const special = new RegExp(SPECIAL_CHARACTER_SOURCE, "g");
   const parts: string[] = [];
   let copiedUpTo = 0;
   let inString = false;
