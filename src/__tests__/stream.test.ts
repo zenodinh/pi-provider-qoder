@@ -12,6 +12,7 @@ import type {
 import { normalizeContext } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearPrefixChainRegistry } from "../protocol/prefix-chain.js";
+import { parseQueueNotice, parseQueueStatus, queueStatusUrl, queueWaitDecision } from "../protocol/queue.ts";
 import { clearQoderRunRegistry } from "../protocol/run-identity.js";
 import { streamQoder } from "../protocol/stream.js";
 import { streamQoderV2 } from "../protocol/v2.js";
@@ -2222,5 +2223,396 @@ describe("prefix stamp on the legacy transport (spec CU-03)", () => {
       expect(usage[key], `the priced terminal still carries ${key}`).toBeDefined();
     }
     expect(usage.prefixStable, "the same transcript again, so the chain held").toBe(true);
+  });
+});
+
+/**
+ * Queue waiting — a busy model's 403 must become a wait, not a failed turn.
+ *
+ * Fixture provenance: every queue body below is INVENTED. No live recording of a
+ * queue notice exists in this repo (re-recording needs the gateway actually
+ * queueing a request), so the shape follows the evidence cited at the top of
+ * `src/protocol/queue.ts`: status 403, code 10605, the record nested through two
+ * or three JSON-string layers.
+ */
+describe("queue notice vocabulary", () => {
+  /** invented: no live queue-notice recording exists; shape per src/protocol/queue.ts. */
+  const RECORD = {
+    isQueued: true,
+    serviceAvailable: false,
+    modelKey: "lite",
+    queueType: 1,
+    queueCount: 2,
+    retryAfterSeconds: 1,
+    waitTime: 3,
+  };
+
+  /** Nest `record` through `layers` JSON-string parses, every level carrying code 10605. */
+  function nestedBody(record: object, layers: number): string {
+    let text = JSON.stringify(record);
+    for (let i = 1; i < layers; i++) text = JSON.stringify({ code: 10605, message: "queued", data: text });
+    return text;
+  }
+
+  it("reads the record out of a two-layer notice", () => {
+    expect(parseQueueNotice(nestedBody(RECORD, 2))).toEqual({
+      isQueued: true,
+      serviceAvailable: false,
+      modelKey: "lite",
+      queueType: 1,
+      queueCount: 2,
+      retryAfterSeconds: 1,
+      waitTimeSeconds: 3,
+    });
+  });
+
+  it("reads the record out of a three-layer notice", () => {
+    expect(parseQueueNotice(nestedBody({ isQueued: false, serviceAvailable: true }, 3))).toEqual({
+      isQueued: false,
+      serviceAvailable: true,
+    });
+  });
+
+  it("stops at the third JSON-string layer", () => {
+    // A record four parses deep is not the shape the gateway sends; reading it
+    // would be guessing, so the notice is simply not recognised.
+    expect(parseQueueNotice(nestedBody(RECORD, 4))).toBeNull();
+  });
+
+  it("reads a body that is itself a JSON string", () => {
+    // A double-encoded envelope body: the first parse yields the notice's own
+    // JSON text rather than an object, which is one layer of the same nest.
+    expect(parseQueueNotice(JSON.stringify(nestedBody({ isQueued: true }, 2)))).toEqual({ isQueued: true });
+  });
+
+  it("requires the queue code, so a non-queue status is not a notice", () => {
+    const statusReply = JSON.stringify({ code: 0, data: { isQueued: true } });
+    // The same bytes: a notice needs code 10605, a status reply does not.
+    expect(parseQueueNotice(statusReply)).toBeNull();
+    expect(parseQueueStatus(statusReply)).toEqual({ isQueued: true });
+    expect(parseQueueNotice(JSON.stringify({ code: 406, message: "Session blocked" }))).toBeNull();
+    expect(parseQueueNotice("not json at all")).toBeNull();
+  });
+
+  it("keeps a digit-string retryAfterSeconds as a number", () => {
+    const info = parseQueueNotice(nestedBody({ isQueued: true, retryAfterSeconds: "12", waitTime: "5" }, 2));
+    expect(info).toEqual({ isQueued: true, retryAfterSeconds: 12, waitTimeSeconds: 5 });
+  });
+
+  it("leaves serviceAvailable undefined when the record omits it", () => {
+    const info = parseQueueNotice(nestedBody({ isQueued: false }, 2));
+    expect(info).toEqual({ isQueued: false });
+    expect(info?.serviceAvailable).toBeUndefined();
+  });
+
+  it("normalises nothing it cannot read", () => {
+    const reply = {
+      data: {
+        isQueued: "yes",
+        serviceAvailable: 1,
+        queueCount: "",
+        queueType: 7,
+        modelKey: "  ",
+        retryAfterSeconds: "soon",
+      },
+    };
+    expect(parseQueueStatus(JSON.stringify(reply))).toEqual({ queueType: 7 });
+    expect(parseQueueStatus("[]")).toBeNull();
+    expect(parseQueueStatus("broken")).toBeNull();
+  });
+
+  it("stops collecting records instead of walking a pathological body", () => {
+    const wide: Record<string, unknown> = { code: 10605 };
+    for (let i = 0; i < 70; i++) wide[`field${i}`] = "{}";
+    // The record sits past the collection cap, so the walk ends before it: the
+    // bound is what keeps a hostile body from being traversed exhaustively.
+    wide.data = JSON.stringify({ isQueued: true });
+    expect(parseQueueNotice(JSON.stringify(wide))).toBeNull();
+  });
+
+  it.each([
+    ["data", { code: 0, data: { isQueued: true, modelKey: "lite" } }],
+    ["result", { code: 0, result: { isQueued: false, serviceAvailable: true } }],
+    ["message", { message: { isQueued: true, waitTime: "4" } }],
+    ["body", { body: JSON.stringify({ isQueued: true, queueCount: "2" }) }],
+  ])("reads the queue-status reply through %s", (_key, reply) => {
+    expect(parseQueueStatus(JSON.stringify(reply))).toMatchObject({ isQueued: expect.any(Boolean) });
+  });
+
+  it("builds the status URL on the chat gateway's own origin", () => {
+    expect(
+      queueStatusUrl("https://api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation?Encode=1", {
+        requestSetId: "run-1",
+        modelKey: "lite",
+        queueType: 3,
+      }),
+    ).toBe("https://api3.qoder.sh/algo/api/v2/service/ask/queue/status?requestSetId=run-1&modelKey=lite&queueType=3");
+    expect(queueStatusUrl("https://gateway.qoder.com.cn/base", {})).toBe(
+      "https://gateway.qoder.com.cn/algo/api/v2/service/ask/queue/status",
+    );
+  });
+});
+
+describe("queue wait decision", () => {
+  it("authorises a resend only on isQueued:false with serviceAvailable:true", () => {
+    expect(queueWaitDecision({ isQueued: false, serviceAvailable: true, retryAfterSeconds: 2 })).toEqual({
+      action: "resend",
+      waitMs: 2000,
+    });
+    // Neither half alone is permission to send a second billable request.
+    expect(queueWaitDecision({ isQueued: false }).action).toBe("poll");
+    expect(queueWaitDecision({ isQueued: false, serviceAvailable: false }).action).toBe("poll");
+    expect(queueWaitDecision({ serviceAvailable: true }).action).toBe("poll");
+  });
+
+  it("polls while the record says the turn has not come", () => {
+    expect(queueWaitDecision({ isQueued: true, retryAfterSeconds: 1 })).toEqual({ action: "poll", waitMs: 1000 });
+  });
+
+  it("clamps a poll interval into [500, 30000] ms and converts the seconds form", () => {
+    expect(queueWaitDecision({ isQueued: true, retryAfterMs: 10 })).toEqual({ action: "poll", waitMs: 500 });
+    expect(queueWaitDecision({ isQueued: true, retryAfterMs: 600_000 })).toEqual({ action: "poll", waitMs: 30_000 });
+    expect(queueWaitDecision({ isQueued: true, retryAfterSeconds: 45 })).toEqual({ action: "poll", waitMs: 30_000 });
+    expect(queueWaitDecision({ isQueued: true, waitTimeSeconds: 4 })).toEqual({ action: "poll", waitMs: 4000 });
+  });
+
+  it("falls back to one second when the record carries no hint", () => {
+    expect(queueWaitDecision({ isQueued: true })).toEqual({ action: "poll", waitMs: 1000 });
+    expect(queueWaitDecision({ isQueued: false, serviceAvailable: true })).toEqual({ action: "resend", waitMs: 1000 });
+  });
+});
+
+describe("queue wait on the legacy transport", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  /** invented: see the block comment above — 403 + code 10605, nested through `layers` parses. */
+  function queueNoticeSse(record: object, layers = 2): string {
+    return noticeEnvelope(nestedNotice(record, layers));
+  }
+
+  function nestedNotice(record: object, layers: number): string {
+    let text = JSON.stringify(record);
+    for (let i = 1; i < layers; i++) text = JSON.stringify({ code: 10605, message: "queued", data: text });
+    return text;
+  }
+
+  /** A 403 envelope whose `body` is already the nested JSON string, as the notice arrives. */
+  function noticeEnvelope(body: string): string {
+    return (
+      "data:" +
+      JSON.stringify({
+        headers: { "Content-Type": ["application/json"] },
+        body,
+        statusCodeValue: 403,
+        statusCode: "Forbidden",
+      }) +
+      "\n\n"
+    );
+  }
+
+  /** A 200 JSON reply, the queue-status endpoint's own content type. */
+  function jsonResponse(payload: unknown): Response {
+    return new Response(JSON.stringify(payload), { status: 200, headers: { "content-type": "application/json" } });
+  }
+
+  /**
+   * Serve the chat script in order (its last entry repeats) and answer every
+   * queue-status GET from `status`; an `Error` entry is thrown by the transport.
+   */
+  function queueFetch(script: { chat: string[]; status?: Array<Response | Error> }) {
+    let chatIndex = 0;
+    let statusIndex = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/service/ask/queue/status")) {
+        const next = script.status?.[statusIndex++] ?? new Error("status endpoint down");
+        if (next instanceof Error) throw next;
+        return next;
+      }
+      const body = script.chat[Math.min(chatIndex++, script.chat.length - 1)];
+      return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+    });
+    return fetchMock as unknown as typeof globalThis.fetch & { mock: { calls: Array<[string, RequestInit]> } };
+  }
+
+  const chatCalls = (fetchMock: { mock: { calls: Array<[string, RequestInit]> } }): number =>
+    fetchMock.mock.calls.filter(([url]) => !url.includes("/queue/status")).length;
+  const statusCalls = (fetchMock: { mock: { calls: Array<[string, RequestInit]> } }): number =>
+    fetchMock.mock.calls.filter(([url]) => url.includes("/queue/status")).length;
+
+  function captureBodies(bodies: Record<string, unknown>[]) {
+    return (payload: unknown) => {
+      bodies.push(payload as Record<string, unknown>);
+      return undefined;
+    };
+  }
+
+  const answerText = (events: AssistantMessageEvent[]): string => {
+    const done = events.find((event) => event.type === "done");
+    if (!done) throw new Error(`no done event: ${JSON.stringify(events.at(-1))}`);
+    const text = (done as { message: AssistantMessage }).message.content.find((block) => block.type === "text");
+    return text && "text" in text ? text.text : "";
+  };
+
+  const errorTextOf = (events: AssistantMessageEvent[]): string => {
+    const last = events.at(-1);
+    if (last?.type !== "error") throw new Error(`no error event: ${JSON.stringify(last)}`);
+    return last.error.errorMessage ?? "";
+  };
+
+  it("re-POSTs the same conversation with a new request id when the record authorises a resend", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const fetchMock = queueFetch({
+      chat: [
+        queueNoticeSse({ isQueued: false, serviceAvailable: true, modelKey: "lite", retry_after_ms: 0 }),
+        SUCCESS_SSE,
+      ],
+    });
+    globalThis.fetch = fetchMock;
+
+    const events = await consume(
+      streamQoder(makeModel(), makeContext(), {
+        apiKey: "fake",
+        sessionId: "queue-resend",
+        onPayload: captureBodies(bodies),
+      }),
+    );
+
+    expect(bodies, "the queued attempt plus exactly one re-POST").toHaveLength(2);
+    const [queued, resent] = bodies;
+    expect(resent.request_id, "a new request id for the re-POST").not.toBe(queued.request_id);
+    expect(resent.chat_record_id, "chat_record_id follows request_id").toBe(resent.request_id);
+    expect(resent.request_set_id, "the same run").toBe(queued.request_set_id);
+    expect(resent.session_id, "the same session, so the prompt cache still hits").toBe(queued.session_id);
+    expect(chatCalls(fetchMock)).toBe(2);
+    expect(statusCalls(fetchMock), "a resend needs no polling").toBe(0);
+    expect(answerText(events)).toBe("OK");
+  });
+
+  it("keeps today's 403 throw and sends nothing more with QODER_QUEUE_WAIT=0", async () => {
+    const notice = nestedNotice({ isQueued: false, serviceAvailable: true, retry_after_ms: 0 }, 2);
+    const fetchMock = queueFetch({
+      chat: [queueNoticeSse({ isQueued: false, serviceAvailable: true, retry_after_ms: 0 })],
+    });
+    globalThis.fetch = fetchMock;
+
+    const events = await consume(
+      streamQoder(makeModel(), makeContext(), { apiKey: "fake", env: { QODER_QUEUE_WAIT: "0" } }),
+    );
+
+    expect(events.at(-1)).toMatchObject({ type: "error", error: { stopReason: "error" } });
+    expect(events.find((event) => event.type === "done")).toBeUndefined();
+    expect(errorTextOf(events)).toBe(`Upstream status 403: ${notice}`);
+    expect(chatCalls(fetchMock), "the off switch sends nothing extra").toBe(1);
+  });
+
+  it("polls the status endpoint, signing it for its own URL", async () => {
+    const fetchMock = queueFetch({
+      chat: [
+        queueNoticeSse({ isQueued: true, modelKey: "lite", queueType: 2, requestSetId: "run-9", retry_after_ms: 0 }),
+        SUCCESS_SSE,
+      ],
+      status: [jsonResponse({ code: 0, data: { isQueued: false, serviceAvailable: true, retry_after_ms: 0 } })],
+    });
+    globalThis.fetch = fetchMock;
+
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    expect(statusCalls(fetchMock)).toBe(1);
+    const statusCall = fetchMock.mock.calls.find(([url]) => url.includes("/queue/status"));
+    if (!statusCall) throw new Error("expected one queue-status request");
+    const [statusURL, statusInit] = statusCall;
+    expect(statusURL).toContain("requestSetId=run-9&modelKey=lite&queueType=2");
+    expect(statusInit.method).toBe("GET");
+    // COSY's signature covers the path, so the status request carries its own.
+    expect(statusInit.headers as Record<string, string>).toMatchObject({
+      "Cosy-Sigpath": "/api/v2/service/ask/queue/status",
+    });
+    expect(answerText(events)).toBe("OK");
+    expect(chatCalls(fetchMock)).toBe(2);
+  });
+
+  it("does not let the stream idle timeout abort a queue wait", async () => {
+    // A queue wait is not an idle stream: the gateway owes no bytes until the turn
+    // comes, so the idle timer must be off for the duration of the wait and armed
+    // again for the resend it leads to.
+    const fetchMock = queueFetch({
+      chat: [queueNoticeSse({ isQueued: false, serviceAvailable: true, retry_after_ms: 80 }), SUCCESS_SSE],
+    });
+    globalThis.fetch = fetchMock;
+
+    const events = await consume(
+      streamQoder(makeModel(), makeContext(), { apiKey: "fake", env: { QODER_STREAM_IDLE_TIMEOUT_MS: "20" } }),
+    );
+
+    expect(answerText(events), "the 80 ms wait outlived the 20 ms idle timeout").toBe("OK");
+    expect(chatCalls(fetchMock)).toBe(2);
+  });
+
+  it("ends the turn aborted and sends no re-POST when the signal aborts during the wait", async () => {
+    const fetchMock = queueFetch({ chat: [queueNoticeSse({ isQueued: true, retryAfterSeconds: 1 })] });
+    globalThis.fetch = fetchMock;
+
+    const controller = new AbortController();
+    const consuming = consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake", signal: controller.signal }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    controller.abort();
+    const events = await consuming;
+
+    expect(events.at(-1)).toMatchObject({ type: "error", error: { stopReason: "aborted" } });
+    expect(chatCalls(fetchMock), "an aborted wait is not a re-POST").toBe(1);
+    expect(statusCalls(fetchMock), "and not a poll either").toBe(0);
+  });
+
+  it("falls back to the resend path after three consecutive poll failures", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const down = () => new Error("status endpoint down");
+    const fetchMock = queueFetch({
+      chat: [queueNoticeSse({ isQueued: true, retry_after_ms: 0 }), SUCCESS_SSE],
+      status: [down(), down(), down()],
+    });
+    globalThis.fetch = fetchMock;
+
+    const events = await consume(
+      streamQoder(makeModel(), makeContext(), { apiKey: "fake", onPayload: captureBodies(bodies) }),
+    );
+
+    expect(statusCalls(fetchMock), "three tries, then the transport stops asking").toBe(3);
+    expect(chatCalls(fetchMock)).toBe(2);
+    expect(bodies).toHaveLength(2);
+    expect(answerText(events)).toBe("OK");
+  });
+
+  it("renders the queue-wait error when the wait budget is exhausted", async () => {
+    const fetchMock = queueFetch({ chat: [queueNoticeSse({ isQueued: true, retry_after_ms: 60_000 })] });
+    globalThis.fetch = fetchMock;
+
+    const events = await consume(
+      streamQoder(makeModel(), makeContext(), { apiKey: "fake", env: { QODER_QUEUE_MAX_WAIT_MS: "5" } }),
+    );
+
+    expect(errorTextOf(events)).toBe("Qoder gateway kept the request queued past the wait limit");
+    expect(chatCalls(fetchMock), "the budget ends the turn instead of resending").toBe(1);
+  });
+
+  it("caps the turn at three queue episodes", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const fetchMock = queueFetch({
+      chat: [queueNoticeSse({ isQueued: false, serviceAvailable: true, retry_after_ms: 0 })],
+    });
+    globalThis.fetch = fetchMock;
+
+    const events = await consume(
+      streamQoder(makeModel(), makeContext(), { apiKey: "fake", onPayload: captureBodies(bodies) }),
+    );
+
+    expect(chatCalls(fetchMock), "three re-POSTs, and the fourth notice ends the turn").toBe(4);
+    expect(bodies.map((body) => body.request_set_id)).toEqual(Array(4).fill(bodies[0].request_set_id));
+    expect(errorTextOf(events)).toBe("Qoder gateway kept the request queued past the wait limit");
   });
 });
