@@ -327,6 +327,59 @@ describe("streamQoder", () => {
     },
   );
 
+  it("degrades an unknown finish_reason to an error without dropping the streamed text", async () => {
+    // The defect this pins: an unknown reason used to throw inside the SSE read
+    // loop, so finalisation never ran and the turn lost its text_end even though
+    // the deltas had already been streamed. The diagnostic is the raw reason, and
+    // the turn still ends as an error rather than a silent stop.
+    globalThis.fetch = mockFetch(
+      sseEnvelope(chunk({ content: "partial answer" })) + sseEnvelope(finishChunk("content_filter")) + DONE_SSE,
+    );
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    const textEnd = events.find((event) => event.type === "text_end");
+    expect(textEnd, "expected finalisation to close the streamed text block").toBeDefined();
+    expect((textEnd as Extract<AssistantMessageEvent, { type: "text_end" }>).content).toBe("partial answer");
+
+    const terminal = events.at(-1) as Extract<AssistantMessageEvent, { type: "error" }>;
+    expect(terminal.type).toBe("error");
+    expect(terminal.reason).toBe("error");
+    expect(terminal.error.stopReason).toBe("error");
+    expect(terminal.error.errorMessage).toBe("Qoder generation ended with content_filter");
+    expect(terminal.error.rawStopReason).toBe("content_filter");
+    // The already-streamed text survives in the emitted message.
+    expect(terminal.error.content).toEqual([{ type: "text", text: "partial answer" }]);
+    expect(events.some((event) => event.type === "done")).toBe(false);
+  });
+
+  it("leaves a known finish_reason 'stop' on its own stop reason", async () => {
+    globalThis.fetch = mockFetch(
+      sseEnvelope(chunk({ content: "answer" })) + sseEnvelope(finishChunk("stop")) + DONE_SSE,
+    );
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+    expect(events.at(-1)).toMatchObject({
+      type: "done",
+      reason: "stop",
+      message: { stopReason: "stop", rawStopReason: "stop" },
+    });
+  });
+
+  it("leaves a known finish_reason 'tool_calls' on toolUse when the calls are present", async () => {
+    globalThis.fetch = mockFetch(
+      sseEnvelope(
+        chunk({ tool_calls: [{ index: 0, id: "c1", function: { name: "read", arguments: '{"path":"a"}' } }] }),
+      ) +
+        sseEnvelope(finishChunk("tool_calls")) +
+        DONE_SSE,
+    );
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+    expect(events.at(-1)).toMatchObject({
+      type: "done",
+      reason: "toolUse",
+      message: { stopReason: "toolUse", rawStopReason: "tool_calls" },
+    });
+  });
+
   it("rejects malformed data even when followed by DONE", async () => {
     globalThis.fetch = mockFetch(`data: {broken\n\n${DONE_SSE}`);
     const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));

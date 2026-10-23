@@ -71,17 +71,28 @@ type QoderDeltaEvent = Extract<QoderStreamEvent, { type: "text_delta" | "thinkin
 const QODER_STREAM_IDLE_TIMEOUT_MS = 120_000;
 export const MAX_SSE_BUFFER_LENGTH = 8 * 1024 * 1024;
 
-function mapFinishReason(reason: string): "stop" | "length" | "toolUse" {
+type QoderFinishReason = { stopReason: "stop" | "length" | "toolUse" } | { stopReason: "error"; diagnostic: string };
+
+/**
+ * Map one upstream `finish_reason` to the stop reason pi understands.
+ *
+ * An unknown value is data, not a parse failure. Throwing it from here escaped
+ * the SSE read loop, so finalisation never ran and a turn that had already
+ * streamed text lost its `text_end`/`thinking_end` events. Returning the reason
+ * as a diagnostic instead lets the caller record it on the message and lets the
+ * terminal guard report the turn as an error after the stream is finalised.
+ */
+function mapFinishReason(reason: string): QoderFinishReason {
   switch (reason) {
     case "stop":
-      return "stop";
+      return { stopReason: "stop" };
     case "length":
-      return "length";
+      return { stopReason: "length" };
     case "tool_calls":
     case "function_call":
-      return "toolUse";
+      return { stopReason: "toolUse" };
     default:
-      throw new Error(`Qoder generation ended with ${reason}`);
+      return { stopReason: "error", diagnostic: `Qoder generation ended with ${reason}` };
   }
 }
 
@@ -914,7 +925,11 @@ export function streamQoder(
 
               if (choice.finish_reason) {
                 output.rawStopReason = String(choice.finish_reason);
-                output.stopReason = mapFinishReason(output.rawStopReason);
+                const mapped = mapFinishReason(output.rawStopReason);
+                output.stopReason = mapped.stopReason;
+                // An unknown reason reports through the terminal guard after the
+                // stream is finalised, so the reply keeps what it already streamed.
+                if (mapped.stopReason === "error") output.errorMessage = mapped.diagnostic;
               }
             }
           } catch (e) {
@@ -959,6 +974,11 @@ export function streamQoder(
       } else if (output.stopReason === "toolUse") {
         throw new Error("Qoder finished with tool_calls but returned no tool calls");
       }
+      // Reports the diagnostic assigned by an unknown upstream finish_reason, or
+      // an abort. Known limitation: the `hasToolCalls` arm above wins first, so an
+      // unknown reason that also carries tool calls ends as `toolUse` and its
+      // diagnostic is not surfaced — the same precedence `stop` + tool_calls has
+      // always had, left alone rather than widened here.
       if (output.stopReason === "error" || output.stopReason === "aborted") {
         throw new Error(output.errorMessage || "Qoder generation failed");
       }

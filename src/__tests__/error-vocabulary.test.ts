@@ -43,13 +43,18 @@ import {
  *
  * Two census facts this file records rather than papers over:
  *
- * 1. `stream.ts:786` (`Qoder generation failed`) is UNREACHABLE. `output.stopReason`
- *    at the `:785` guard can only be `stop`, `length` or `toolUse`: `mapFinishReason`
- *    returns exactly those three, `:756` assigns `stop`, `:781` assigns `toolUse`, and
- *    the only `error`/`aborted` assignment is `:795` inside the catch that this throw
- *    would have to precede. The repo's own coverage report agrees — `stream.ts:785`
- *    carries `missing-if-branch`, "if path not taken". So it is documented here, not
- *    pinned with a fabricated scenario.
+ * 1. `stream.ts:985` (`Qoder generation failed`) is UNREACHABLE — but the guard that
+ *    owns it is not, and the two are separate facts. `output.stopReason` at that
+ *    guard can be `stop`, `length`, `toolUse` or `error`: the three known reasons come
+ *    from `mapFinishReason`, `:975` assigns `toolUse`, and an UNKNOWN upstream
+ *    `finish_reason` maps to `error` with a diagnostic that `:934` writes into
+ *    `output.errorMessage`, so `:984` re-throws that diagnostic after the stream is
+ *    finalised and the already-streamed content survives. The FALLBACK LITERAL still
+ *    never renders: the single assignment that puts `error` at the guard is the one
+ *    that writes `errorMessage` first, and the other `error`/`aborted` assignment
+ *    (`:994`) sits in the catch this throw precedes. So the literal stays documented
+ *    here rather than pinned with a fabricated scenario, and the now-reachable path is
+ *    pinned by its own row below ("unknown finish_reason renders on the guard path").
  *
  * 2. `cosy.ts:130` and `cosy.ts:133` are reachable inside the `:185-793` try but not
  *    through `streamQoder`'s inputs: `userID` is `ident.userID || "qoder-user"` (`:208`)
@@ -430,6 +435,37 @@ describe("rendered error inventory — vendor-interpolating templates", () => {
   });
 });
 
+describe("rendered error inventory — unknown finish_reason renders on the guard path", () => {
+  /**
+   * The one census row pinned by a PATH rather than by a new string: the text is
+   * the template the vendor rows above already own, rendered the way the fix made
+   * it render — as a diagnostic assigned at `stream.ts:934` and thrown by the
+   * guard at `:984`, after finalisation instead of from inside the read loop.
+   *
+   * The fact this row adds is the order: an unknown `finish_reason` used to escape
+   * as a parse failure that skipped finalisation, so the turn reported the same
+   * text but lost its `text_end` and the streamed content's close. The verdict is
+   * re-measured here, not inferred from the row above.
+   */
+  it("stream.ts:934 renders the diagnostic exactly, after the streamed text is finalised", async () => {
+    const events = await consume(
+      streamQoder(makeModel(), makeContext(), {
+        apiKey: "fake",
+        fetch: mockFetch(
+          sseEnvelope(chunk({ content: "partial answer" })) + sseEnvelope(finishChunk("content_filter")) + DONE_SSE,
+        ),
+      }),
+    );
+
+    const terminal = events.at(-1) as Extract<AssistantMessageEvent, { type: "error" }>;
+    expect(terminal.type).toBe("error");
+    expect(terminal.error.errorMessage).toBe("Qoder generation ended with content_filter");
+    expect(terminal.error.content).toEqual([{ type: "text", text: "partial answer" }]);
+    expect(events.some((event) => event.type === "text_end")).toBe(true);
+    expect(isRetryableAssistantError(terminal.error)).toBe(false);
+  });
+});
+
 describe("rendered error inventory — sites streamQoder cannot reach", () => {
   const creds = { userID: "user", authToken: "token", name: "Test", email: "test@example.com", machineID: "machine" };
   const url = "https://api.qoder.com/chat";
@@ -445,16 +481,16 @@ describe("rendered error inventory — sites streamQoder cannot reach", () => {
   });
 
   it("keeps stream.ts:786 unreachable, so a refactor that revives it fails here", async () => {
-    // Structural, not behavioural: no scenario can render this text, so the
-    // invariant is pinned instead. The guard at :785 needs stopReason
-    // "error"/"aborted", but every assignment upstream of it yields
-    // stop/length/toolUse, and the only error/aborted assignment sits in the
-    // catch this throw precedes. The repo's own coverage report agrees —
-    // :785 carries `missing-if-branch`, "if path not taken".
+    // Structural, not behavioural: the guard's own branch is now reachable — an
+    // unknown finish_reason reaches it with a diagnostic assigned at :934 — but the
+    // FALLBACK LITERAL below it still renders for no scenario: the assignment that
+    // puts `error` at the guard writes `errorMessage` first, and the catch's own
+    // error/aborted assignment sits after this throw. The pinned path is the row
+    // below, in "unknown finish_reason renders on the guard path".
     //
     // This reads the source ordering directly, so the row goes red the moment a
-    // refactor moves that assignment above the guard and a 23rd rendered text
-    // becomes host-visible.
+    // refactor moves that assignment above the guard and the literal becomes
+    // host-visible.
     const source = readFileSync(new URL("../protocol/stream.ts", import.meta.url), "utf8");
     const guardAt = source.indexOf('if (output.stopReason === "error" || output.stopReason === "aborted")');
     const catchAssignmentAt = source.indexOf('output.stopReason = options?.signal?.aborted ? "aborted" : "error"');
