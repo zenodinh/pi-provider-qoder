@@ -148,9 +148,7 @@ describe("showCachePanel", () => {
       },
     });
     const inactivePanel = await openPanel({ data: inactive });
-    expect(inactivePanel.component.render(100).join("\n")).toContain(
-      "none recorded — check QODER_CACHE_WARM=1 and pi's cacheWarming setting",
-    );
+    expect(inactivePanel.component.render(100).join("\n")).toContain("none recorded — check pi's cacheWarming setting");
   });
 
   it("rescans on r and closes on esc/q", async () => {

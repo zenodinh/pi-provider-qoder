@@ -75,6 +75,21 @@ describe("README retry documentation", () => {
     expect(readme).toContain("spends one extra request");
   });
 
+  it("documents pi's cacheWarming setting as warming's only switch", () => {
+    // The owner's decision deleted this extension's approval layer, so the
+    // published prose must not name a switch that no longer exists: a reader who
+    // exported `QODER_CACHE_WARM=0` and expected a veto would be spending
+    // Credits they thought they had turned off. The retired file is named once,
+    // only to say it is safe to delete.
+    expect(readme).toContain("Cache warming (on by default)");
+    expect(readme).toContain("pi owns the decision");
+    expect(readme).toContain("the setting is the only switch");
+    expect(readme).not.toContain("QODER_CACHE_WARM");
+    expect(readme).toContain("A `qoder-warm-approval.json` left in `~/.pi/agent` by an older version");
+    expect(readme).toContain("no refreshes recorded — check pi's `cacheWarming` setting");
+    expect(readme).toContain("`QODER_WARM_BUDGET`");
+  });
+
   it("documents onProviderStreamEvent as v2-only (FR-5's second clause)", () => {
     // The host's per-event observation hook is honored on the v2 transport
     // only: pi-ai's completions stream calls it, the legacy adapter does not.

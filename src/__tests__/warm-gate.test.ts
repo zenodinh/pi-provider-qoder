@@ -2,25 +2,19 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { readPiCacheWarmingMode, readWarmApproval, resolveWarmGate } from "../warm-gate.js";
+import { readPiCacheWarmingMode } from "../warm-gate.js";
 import { debugMessages } from "./debug-sink.js";
 
-// spec (fs-qoder-warm-arming CU-01/CU-02/CU-03, SA §7.4):
+// spec (fs-qoder-warm-arming CU-01, SA §7.4 — the read that survives):
 //   readPiCacheWarmingMode(dir) -> the file's value when it is one of
 //     off|streaming|idle; "streaming" when the file is absent, unreadable, not
 //     a JSON object, has no cacheWarming key, or carries a value outside the
 //     three. Never throws, never undefined. One debugLog per rejection branch,
 //     none on the absent-file branch.
-//   readWarmApproval(dir) -> the record when well-formed; undefined when absent
-//     (silent); undefined + exactly one debugLog when malformed, non-object,
-//     non-number version, or a providers map holding any non-boolean.
-//   resolveWarmGate(provider, env, dir) -> env "1" arms / env "0" disarms, both
-//     layer "env"; any other exported value logs once and falls through to the
-//     file; an approval of true arms with layer "file"; anything else is
-//     armed:false layer:"off". piMode reported in every verdict.
-
-/** recorded-from: SA §5.2 approval-file example, 2026-10-04. */
-const APPROVAL_BOTH = `{"version":1,"providers":{"qoder":true,"qoder-cn":false}}`;
+//
+// This is the whole module now: pi owns the caching decision, so the provider
+// keeps no approval layer of its own and nothing else here decides anything.
+// What remains feeds `/qoder-cache`'s `config:` line.
 
 const temps: string[] = [];
 const originalHome = process.env.HOME;
@@ -150,171 +144,5 @@ describe("readPiCacheWarmingMode rejection branches (T-02/AC-01,AC-05)", () => {
     write(dir, "settings.json", JSON.stringify({ cacheWarming: 5 }));
     expect(readPiCacheWarmingMode(dir)).toBe("streaming");
     expect(debugMessages(sink)).toHaveLength(1);
-  });
-});
-
-describe("readWarmApproval (T-03/AC-02)", () => {
-  it("treats absence as off and silently, and presence as the record as written", () => {
-    const sink = debugSink();
-    expect(readWarmApproval(agentDir())).toBeUndefined();
-    expect(debugMessages(sink)).toEqual([]);
-
-    const dir = agentDir();
-    write(dir, "qoder-warm-approval.json", APPROVAL_BOTH);
-    expect(readWarmApproval(dir)).toEqual({ version: 1, providers: { qoder: true, "qoder-cn": false } });
-
-    // The default parameter resolves through the real getPiAgentDir().
-    const viaEnvDir = defaultAgentDir();
-    write(viaEnvDir, "qoder-warm-approval.json", `{"version":1,"providers":{"qoder":true}}`);
-    expect(readWarmApproval()).toEqual({ version: 1, providers: { qoder: true } });
-  });
-});
-
-describe("readWarmApproval rejection branches (T-04/AC-02,AC-05)", () => {
-  it("rejects the whole file wholesale with exactly one debug entry per branch", () => {
-    const rejected = (contents: string, fragment: string): void => {
-      const sink = debugSink();
-      const dir = agentDir();
-      write(dir, "qoder-warm-approval.json", contents);
-      expect(readWarmApproval(dir)).toBeUndefined();
-      const messages = debugMessages(sink);
-      expect(messages, `contents=${contents}`).toHaveLength(1);
-      expect(messages[0], `contents=${contents}`).toContain(fragment);
-      expect(messages[0], `contents=${contents}`).toContain("qoder-warm-approval.json");
-    };
-
-    // invented: one fixture per rejection branch the validator declares.
-    rejected("{not json", "warm approval unreadable");
-    rejected("[1,2]", "not a JSON object");
-    rejected(`{"version":"1","providers":{"qoder":true}}`, 'version "1" is not a number');
-    rejected(`{"providers":{"qoder":true}}`, "version undefined is not a number");
-    rejected(`{"version":1,"providers":{"qoder":"yes"}}`, "providers is not a map of booleans");
-    rejected(`{"version":1}`, "providers is not a map of booleans");
-    rejected(`{"version":1,"providers":["qoder"]}`, "providers is not a map of booleans");
-  });
-
-  it("does not salvage the valid keys of a half-approved file", () => {
-    // The SA's own example shape with one value hand-corrupted: qoder:true must
-    // NOT survive, because a salvaged key would arm a provider the operator
-    // never approved.
-    const sink = debugSink();
-    const dir = agentDir();
-    write(dir, "qoder-warm-approval.json", `{"version":1,"providers":{"qoder":true,"qoder-cn":"no"}}`);
-    expect(readWarmApproval(dir)).toBeUndefined();
-    expect(debugMessages(sink)).toHaveLength(1);
-    expect(resolveWarmGate("qoder", {}, dir).armed).toBe(false);
-  });
-
-  it("accepts an empty providers map, which simply approves nobody", () => {
-    const dir = agentDir();
-    write(dir, "qoder-warm-approval.json", `{"version":1,"providers":{}}`);
-    expect(readWarmApproval(dir)).toEqual({ version: 1, providers: {} });
-  });
-});
-
-describe("resolveWarmGate precedence (T-05/AC-01,AC-02,AC-03)", () => {
-  /** The four file-layer states the matrix crosses the env against. */
-  function fileLayer(state: "absent" | "true" | "false" | "malformed", piMode?: string): string {
-    const dir = agentDir();
-    if (piMode !== undefined) write(dir, "settings.json", JSON.stringify({ cacheWarming: piMode }));
-    if (state === "absent") return dir;
-    if (state === "malformed") {
-      write(dir, "qoder-warm-approval.json", "{not json");
-      return dir;
-    }
-    write(dir, "qoder-warm-approval.json", `{"version":1,"providers":{"qoder":${state}}}`);
-    return dir;
-  }
-
-  const fileStates = ["absent", "true", "false", "malformed"] as const;
-
-  it("arms env over approval file over off, across the full matrix", () => {
-    // Expected [env, file state, armed, layer] — the precedence table from
-    // SA §7.4: env wins in both directions, an unusable env falls through to the
-    // file, and only an approval of true arms from the file.
-    const rows: [string | undefined, (typeof fileStates)[number], boolean, "env" | "file" | "off"][] = [];
-    for (const file of fileStates) {
-      rows.push([undefined, file, file === "true", file === "true" ? "file" : "off"]);
-      rows.push(["1", file, true, "env"]);
-      rows.push(["0", file, false, "env"]);
-      rows.push(["garbage", file, file === "true", file === "true" ? "file" : "off"]);
-    }
-
-    for (const [envValue, file, armed, layer] of rows) {
-      const env = envValue === undefined ? {} : { QODER_CACHE_WARM: envValue };
-      const verdict = resolveWarmGate("qoder", env, fileLayer(file, "idle"));
-      expect(verdict, `env=${String(envValue)} file=${file}`).toEqual({
-        armed,
-        layer,
-        piMode: "idle",
-        envValue,
-      });
-    }
-    expect(rows).toHaveLength(16);
-  });
-
-  it("reports piMode in every verdict, including a pi-disarmed machine the extension would arm", () => {
-    // AC-01's falsifier: pi's OFF must surface even when the extension arms.
-    const armed = fileLayer("true", "off");
-    expect(resolveWarmGate("qoder", {}, armed)).toEqual({
-      armed: true,
-      layer: "file",
-      piMode: "off",
-      envValue: undefined,
-    });
-    // And the reverse: pi armed while the extension declines.
-    const unarmed = fileLayer("false", "idle");
-    expect(resolveWarmGate("qoder", {}, unarmed).piMode).toBe("idle");
-    expect(resolveWarmGate("qoder", {}, unarmed).armed).toBe(false);
-  });
-
-  it("resolves each provider independently from one approval map", () => {
-    const dir = agentDir();
-    write(dir, "qoder-warm-approval.json", APPROVAL_BOTH);
-    expect(resolveWarmGate("qoder", {}, dir)).toMatchObject({ armed: true, layer: "file" });
-    expect(resolveWarmGate("qoder-cn", {}, dir)).toMatchObject({ armed: false, layer: "off" });
-    // A provider the file omits entirely is not approved.
-    expect(resolveWarmGate("qoder-global", {}, dir)).toMatchObject({ armed: false, layer: "off" });
-  });
-
-  it("does not read an inherited Object.prototype member as an approval", () => {
-    const dir = agentDir();
-    write(dir, "qoder-warm-approval.json", `{"version":1,"providers":{}}`);
-    for (const key of ["toString", "constructor", "hasOwnProperty", "__proto__"]) {
-      expect(resolveWarmGate(key, {}, dir).armed, key).toBe(false);
-    }
-  });
-});
-
-describe("resolveWarmGate invalid env (T-06/AC-03,AC-06)", () => {
-  it("logs the raw value once and falls through to the file instead of arming on the env", () => {
-    const sink = debugSink();
-    const noFile = agentDir();
-    expect(resolveWarmGate("qoder", { QODER_CACHE_WARM: "yes-please" }, noFile)).toMatchObject({
-      armed: false,
-      layer: "off",
-    });
-    const messages = debugMessages(sink);
-    expect(messages).toHaveLength(1);
-    expect(messages[0]).toContain('QODER_CACHE_WARM "yes-please"');
-    expect(messages[0]).toContain("falling back to the approval file");
-
-    // A typo must not arm — but a genuinely approved machine still arms through
-    // the file layer, decided by the file and not by the env.
-    const approved = agentDir();
-    write(approved, "qoder-warm-approval.json", `{"version":1,"providers":{"qoder":true}}`);
-    expect(resolveWarmGate("qoder", { QODER_CACHE_WARM: "2" }, approved)).toMatchObject({
-      armed: true,
-      layer: "file",
-    });
-    expect(debugMessages(sink)).toHaveLength(2);
-  });
-
-  it("logs nothing when the env is never exported", () => {
-    const sink = debugSink();
-    const approved = agentDir();
-    write(approved, "qoder-warm-approval.json", `{"version":1,"providers":{"qoder":true}}`);
-    expect(resolveWarmGate("qoder", {}, approved).armed).toBe(true);
-    expect(debugMessages(sink)).toEqual([]);
   });
 });
