@@ -87,6 +87,16 @@ describe("repairJsonEscapes", () => {
 
     expect(repairJsonEscapes(argumentsText)).toBe(argumentsText);
   });
+
+  it("leaves legal newlines outside a string while escaping the one inside", () => {
+    // Raw newlines between tokens are legal JSON whitespace; only the control
+    // character inside the string literal is illegal. A blanket replacement
+    // would corrupt the document instead of repairing it.
+    const text = '{\n  "p": "a\nb"\n}';
+
+    expect(repairJsonEscapes(text)).toBe('{\n  "p": "a\\nb"\n}');
+    expect(JSON.parse(repairJsonEscapes(text))).toEqual({ p: "a\nb" });
+  });
 });
 
 describe("finished tool arguments", () => {
